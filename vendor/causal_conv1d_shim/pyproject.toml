@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "causal-conv1d-shim"
+version = "0.1.0"
+description = "Inference-oriented causal_conv1d compatibility shim backed by flash-linear-attention Triton kernels"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["causal_conv1d"]

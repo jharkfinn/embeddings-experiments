@@ -1,0 +1,12 @@
+torch
+transformers
+accelerate
+beir
+numpy
+scipy
+pandas
+matplotlib
+sentencepiece
+einops
+safetensors
+huggingface_hub
