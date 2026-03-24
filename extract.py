@@ -661,10 +661,7 @@ class AsyncPayloadWriter:
 
 def build_pending_batches(
     records: list[TextRecord],
-    causal_dir: Path,
-    rerouted_dir: Path,
-    paper_causal_dir: Path,
-    paper_rerouted_dir: Path,
+    output_dirs: list[Path],
     query_batch_size: int,
 ) -> list[RecordBatch]:
     batches: list[RecordBatch] = []
@@ -679,12 +676,7 @@ def build_pending_batches(
             query_positions = []
 
     for position, record in enumerate(records, start=1):
-        causal_path = causal_dir / record.filename
-        rerouted_path = rerouted_dir / record.filename
-        paper_causal_path = paper_causal_dir / record.filename
-        paper_rerouted_path = paper_rerouted_dir / record.filename
-
-        all_paths = [causal_path, rerouted_path, paper_causal_path, paper_rerouted_path]
+        all_paths = [output_dir / record.filename for output_dir in output_dirs]
         if all(path.exists() for path in all_paths):
             print(f"Skipping {record.text_id}, already extracted")
             continue
@@ -1125,10 +1117,7 @@ def main() -> None:
     write_manifest(selected_records, dirs["results"])
     pending_batches = build_pending_batches(
         selected_records,
-        dirs["causal"],
-        dirs["rerouted"],
-        dirs["paper_causal"],
-        dirs["paper_rerouted"],
+        [dirs["rerouted"], dirs["paper_rerouted"]],
         args.query_batch_size,
     )
 
@@ -1161,9 +1150,7 @@ def main() -> None:
 
     total_records = len(selected_records)
     pass_seconds = {
-        "causal": 0.0,
         "rerouted": 0.0,
-        "paper_causal": 0.0,
         "paper_rerouted": 0.0,
     }
     processed = 0
@@ -1176,32 +1163,17 @@ def main() -> None:
 
     pass_specs = [
         ExtractionPassSpec(
-            name="causal",
-            label="Causal",
-            output_dir_key="causal",
-            use_paper_prompt=False,
-            reroute_mode="none",
-            reroute_source=None,
-        ),
-        ExtractionPassSpec(
             name="rerouted",
-            label="Rerouted",
+            label="AllAttn-Rerouted",
             output_dir_key="rerouted",
-            use_paper_prompt=False,
-            reroute_mode="replay",
-            reroute_source="causal",
-        ),
-        ExtractionPassSpec(
-            name="paper_causal",
-            label="Paper-Causal",
-            output_dir_key="paper_causal",
             use_paper_prompt=True,
-            reroute_mode="none",
+            reroute_mode="self",
             reroute_source=None,
+            selected_layers=set(architecture["attn_layer_indices"]),
         ),
         ExtractionPassSpec(
             name="paper_rerouted",
-            label="Paper-Rerouted",
+            label="PaperLayers-Rerouted",
             output_dir_key="paper_rerouted",
             use_paper_prompt=True,
             reroute_mode="self",
@@ -1247,17 +1219,13 @@ def main() -> None:
                         f"(batch_size={len(batch.records)}, max_seq_len={max(seq_lens)})"
                     )
 
-                reroute_kv = None
-                if pass_spec.reroute_source is not None:
-                    reroute_kv = pass_runtimes[pass_spec.reroute_source].last_token_kv
-
                 runtime = PassRuntimeState(
                     name=pass_spec.name,
                     num_layers=architecture["num_layers"],
                     attn_layer_indices=architecture["attn_layer_indices"],
                     reroute_mode=pass_spec.reroute_mode,
                     reroute_bias=args.reroute_bias,
-                    reroute_kv=reroute_kv,
+                    reroute_kv=None,
                     reroute_layer_indices=pass_spec.selected_layers,
                 )
                 runtime.set_batch_inputs(model_inputs["input_ids"], attention_mask)
@@ -1301,13 +1269,9 @@ def main() -> None:
     total_elapsed = time.perf_counter() - started_at
     gpu_peak = torch.cuda.max_memory_reserved() if torch.cuda.is_available() else 0
     timing_lines = [
-        f"Total wall-clock time for causal pass extraction: {pass_seconds['causal']:.3f}s",
-        f"Total wall-clock time for rerouted pass extraction: {pass_seconds['rerouted']:.3f}s",
-        f"Total wall-clock time for paper causal pass extraction: {pass_seconds['paper_causal']:.3f}s",
+        f"Total wall-clock time for all-attention rerouted pass extraction: {pass_seconds['rerouted']:.3f}s",
         f"Total wall-clock time for paper rerouted pass extraction: {pass_seconds['paper_rerouted']:.3f}s",
-        f"Average seconds per text for causal pass: {pass_seconds['causal'] / max(processed, 1):.3f}s",
-        f"Average seconds per text for rerouted pass: {pass_seconds['rerouted'] / max(processed, 1):.3f}s",
-        f"Average seconds per text for paper causal pass: {pass_seconds['paper_causal'] / max(processed, 1):.3f}s",
+        f"Average seconds per text for all-attention rerouted pass: {pass_seconds['rerouted'] / max(processed, 1):.3f}s",
         f"Average seconds per text for paper rerouted pass: {pass_seconds['paper_rerouted'] / max(processed, 1):.3f}s",
         f"GPU memory peak during extraction: {human_bytes(gpu_peak)}",
         f"Total end-to-end elapsed time: {human_duration(total_elapsed)}",

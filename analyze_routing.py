@@ -25,7 +25,9 @@ from experiment_utils import (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Analyze routing deltas between causal and rerouted extraction passes.")
+    parser = argparse.ArgumentParser(
+        description="Analyze routing deltas between all-attention and paper-layer rerouted extraction passes."
+    )
     parser.add_argument("--project-root", type=Path, default=Path("/workspace/kv_moee_experiment"))
     parser.add_argument("--model-name", type=str, default=MODEL_NAME)
     parser.add_argument("--seed", type=int, default=0)
@@ -101,57 +103,57 @@ def main() -> None:
     _corpus, _queries, qrels = load_scifact(dirs["datasets"])
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
-    causal_rows = pass_doc_rows(args.project_root, "causal")
-    rerouted_rows = pass_doc_rows(args.project_root, "rerouted")
-    if len(causal_rows) != len(rerouted_rows):
-        raise RuntimeError("Causal and rerouted document counts do not match.")
+    allattn_rows = pass_doc_rows(args.project_root, "rerouted")
+    paper_rows = pass_doc_rows(args.project_root, "paper_rerouted")
+    if len(allattn_rows) != len(paper_rows):
+        raise RuntimeError("All-attention and paper-layer document counts do not match.")
 
     rng = np.random.default_rng(args.seed)
-    sample_indices = set(rng.choice(len(causal_rows), size=min(10, len(causal_rows)), replace=False).tolist())
+    sample_indices = set(rng.choice(len(allattn_rows), size=min(10, len(allattn_rows)), replace=False).tolist())
 
     kl_sum = np.zeros(architecture["num_layers"], dtype=np.float64)
     top1_sum = np.zeros(architecture["num_layers"], dtype=np.float64)
     topk_sum = np.zeros(architecture["num_layers"], dtype=np.float64)
-    rerouted_binary = np.zeros(
-        (len(rerouted_rows), architecture["num_layers"] * architecture["num_experts"]),
+    paper_binary = np.zeros(
+        (len(paper_rows), architecture["num_layers"] * architecture["num_experts"]),
         dtype=bool,
     )
     routing_examples: list[str] = []
 
-    for row_idx, (causal_row, rerouted_row) in enumerate(zip(causal_rows, rerouted_rows, strict=True)):
-        causal = load_npz_fields(
-            causal_row["path"],
+    for row_idx, (allattn_row, paper_row) in enumerate(zip(allattn_rows, paper_rows, strict=True)):
+        allattn = load_npz_fields(
+            allattn_row["path"],
             ["routing_indices", "routing_weights", "routing_full_last", "token_ids"],
         )
-        rerouted = load_npz_fields(
-            rerouted_row["path"],
+        paper = load_npz_fields(
+            paper_row["path"],
             ["routing_indices", "routing_weights", "routing_full_last", "token_ids"],
         )
 
-        causal_dist = routed_distributions(causal, architecture)
-        rerouted_dist = routed_distributions(rerouted, architecture)
+        allattn_dist = routed_distributions(allattn, architecture)
+        paper_dist = routed_distributions(paper, architecture)
 
         kl_per_token = np.sum(
-            causal_dist * (np.log(causal_dist + EPS) - np.log(rerouted_dist + EPS)),
+            allattn_dist * (np.log(allattn_dist + EPS) - np.log(paper_dist + EPS)),
             axis=-1,
         )
         kl_sum += kl_per_token.mean(axis=1)
 
-        causal_indices = causal["routing_indices"].astype(np.int64, copy=False)
-        rerouted_indices = rerouted["routing_indices"].astype(np.int64, copy=False)
-        top1_sum += (causal_indices[:, :, 0] != rerouted_indices[:, :, 0]).mean(axis=1)
-        topk_sum += topk_changed_fraction(causal_indices, rerouted_indices)
+        allattn_indices = allattn["routing_indices"].astype(np.int64, copy=False)
+        paper_indices = paper["routing_indices"].astype(np.int64, copy=False)
+        top1_sum += (allattn_indices[:, :, 0] != paper_indices[:, :, 0]).mean(axis=1)
+        topk_sum += topk_changed_fraction(allattn_indices, paper_indices)
 
         for layer_idx in range(architecture["num_layers"]):
-            active = np.unique(rerouted_indices[layer_idx, :, :8])
-            rerouted_binary[row_idx, layer_idx * architecture["num_experts"] + active] = True
+            active = np.unique(paper_indices[layer_idx, :, :8])
+            paper_binary[row_idx, layer_idx * architecture["num_experts"] + active] = True
 
         if row_idx in sample_indices:
-            token_ids = causal["token_ids"].astype(np.int32, copy=False)
+            token_ids = allattn["token_ids"].astype(np.int32, copy=False)
             token_strings = tokenizer.convert_ids_to_tokens(token_ids.tolist())
             mean_token_kl = kl_per_token.mean(axis=0)
             top_token_indices = np.argsort(-mean_token_kl)[:10]
-            routing_examples.append(f"Document {causal_row['text_id']}")
+            routing_examples.append(f"Document {allattn_row['text_id']}")
             for token_idx in top_token_indices.tolist():
                 left = max(0, token_idx - 5)
                 right = min(len(token_ids), token_idx + 6)
@@ -162,7 +164,7 @@ def main() -> None:
                 )
             routing_examples.append("")
 
-    doc_count = max(len(causal_rows), 1)
+    doc_count = max(len(allattn_rows), 1)
     kl_mean = kl_sum / doc_count
     top1_mean = top1_sum / doc_count
     topk_mean = topk_sum / doc_count
@@ -179,15 +181,15 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    doc_index = {row["text_id"]: idx for idx, row in enumerate(rerouted_rows)}
-    relevant_mask = np.zeros((len(rerouted_rows), len(rerouted_rows)), dtype=bool)
+    doc_index = {row["text_id"]: idx for idx, row in enumerate(paper_rows)}
+    relevant_mask = np.zeros((len(paper_rows), len(paper_rows)), dtype=bool)
     for relevant_docs in qrels.values():
         present = [doc_index[doc_id] for doc_id in relevant_docs if doc_id in doc_index]
         for left_idx, right_idx in itertools.combinations(present, 2):
             relevant_mask[left_idx, right_idx] = True
             relevant_mask[right_idx, left_idx] = True
 
-    jaccard = jaccard_from_binary_matrix(rerouted_binary)
+    jaccard = jaccard_from_binary_matrix(paper_binary)
     upper_mask = np.triu(np.ones_like(jaccard, dtype=bool), k=1)
     relevant_upper = upper_mask & relevant_mask
     nonrelevant_upper = upper_mask & ~relevant_mask

@@ -348,15 +348,6 @@ def main() -> None:
     stats_lines: list[str] = []
     score_cache: dict[str, np.ndarray] = {}
 
-    causal_doc_rows = pass_rows(args.project_root, "causal", "doc")
-    causal_query_rows = pass_rows(args.project_root, "causal", "query")
-    rerouted_doc_rows = pass_rows(args.project_root, "rerouted", "doc")
-    rerouted_query_rows = pass_rows(args.project_root, "rerouted", "query")
-    paper_causal_doc_rows = pass_rows(args.project_root, "paper_causal", "doc")
-    paper_causal_query_rows = pass_rows(args.project_root, "paper_causal", "query")
-    paper_rerouted_doc_rows = pass_rows(args.project_root, "paper_rerouted", "doc")
-    paper_rerouted_query_rows = pass_rows(args.project_root, "paper_rerouted", "query")
-
     def record_method(
         method: str,
         metrics: dict[str, float],
@@ -387,317 +378,140 @@ def main() -> None:
             line += f", avg_nonzero_dims={avg_nonzero_dims:.3f}"
         stats_lines.append(line)
 
-    dense_specs = [
+    pass_variants = [
+        {
+            "pass_name": "rerouted",
+            "suffix": "allattn",
+            "query_rows": pass_rows(args.project_root, "rerouted", "query"),
+            "doc_rows": pass_rows(args.project_root, "rerouted", "doc"),
+        },
+        {
+            "pass_name": "paper_rerouted",
+            "suffix": "paperlayers",
+            "query_rows": pass_rows(args.project_root, "paper_rerouted", "query"),
+            "doc_rows": pass_rows(args.project_root, "paper_rerouted", "doc"),
+        },
+    ]
+    for variant in pass_variants:
+        if not variant["query_rows"] or not variant["doc_rows"]:
+            raise RuntimeError(f"Missing embeddings for pass {variant['pass_name']} in {args.project_root}")
+
+    dense_bases = [
+        ("KV-Embedding", ["hs_last_token", "hs_mean"], final_hybrid_pool, architecture["hidden_size"]),
+        ("LastToken-HS", ["hs_last_token"], final_last_token, architecture["hidden_size"]),
+        ("MeanPool-HS", ["hs_mean"], final_mean_pool, architecture["hidden_size"]),
+        ("MoEE", ["routing_full_last"], moee_dense, architecture["num_layers"] * architecture["num_experts"]),
+        ("VA", ["va_mean"], lambda data: pool_va_mean(data, attn_second_half), architecture["value_dim"]),
+        ("VA-all-attn", ["va_mean"], lambda data: pool_va_mean(data, attn_all), architecture["value_dim"]),
+        ("VA-last-attn", ["va_mean"], lambda data: pool_va_mean(data, attn_last), architecture["value_dim"]),
         (
-            "LastToken-HS",
-            "causal",
-            causal_query_rows,
-            causal_doc_rows,
-            ["hs_last_token"],
-            final_last_token,
-            architecture["hidden_size"],
-        ),
-        (
-            "MeanPool-HS",
-            "causal",
-            causal_query_rows,
-            causal_doc_rows,
-            ["hs_mean"],
-            final_mean_pool,
-            architecture["hidden_size"],
-        ),
-        (
-            "MoEE-causal",
-            "causal",
-            causal_query_rows,
-            causal_doc_rows,
-            ["routing_full_last"],
-            moee_dense,
-            architecture["num_layers"] * architecture["num_experts"],
-        ),
-        (
-            "LastToken-HS-rerouted",
-            "rerouted",
-            rerouted_query_rows,
-            rerouted_doc_rows,
-            ["hs_last_token"],
-            final_last_token,
-            architecture["hidden_size"],
-        ),
-        (
-            "MeanPool-HS-rerouted",
-            "rerouted",
-            rerouted_query_rows,
-            rerouted_doc_rows,
-            ["hs_mean"],
-            final_mean_pool,
-            architecture["hidden_size"],
-        ),
-        (
-            "MoEE-rerouted",
-            "rerouted",
-            rerouted_query_rows,
-            rerouted_doc_rows,
-            ["routing_full_last"],
-            moee_dense,
-            architecture["num_layers"] * architecture["num_experts"],
-        ),
-        (
-            "VA-rerouted",
-            "rerouted",
-            rerouted_query_rows,
-            rerouted_doc_rows,
-            ["va_mean"],
-            lambda data: pool_va_mean(data, attn_second_half),
-            architecture["value_dim"],
-        ),
-        (
-            "VA-rerouted-all-attn",
-            "rerouted",
-            rerouted_query_rows,
-            rerouted_doc_rows,
-            ["va_mean"],
-            lambda data: pool_va_mean(data, attn_all),
-            architecture["value_dim"],
-        ),
-        (
-            "VA-rerouted-last-attn",
-            "rerouted",
-            rerouted_query_rows,
-            rerouted_doc_rows,
-            ["va_mean"],
-            lambda data: pool_va_mean(data, attn_last),
-            architecture["value_dim"],
-        ),
-        (
-            "AlignedWVA-rerouted",
-            "rerouted",
-            rerouted_query_rows,
-            rerouted_doc_rows,
+            "AlignedWVA",
             ["attn_weights_last", "va_all_tokens"],
             lambda data: build_aligned_wva(data, architecture, attn_second_half),
             architecture["value_dim"],
         ),
         (
-            "ExpertOut-mean-rerouted",
-            "rerouted",
-            rerouted_query_rows,
-            rerouted_doc_rows,
+            "ExpertOut-mean",
             ["expert_out_pool", "expert_out_counts"],
             lambda data: build_expert_out_mean(data, all_layers),
             architecture["hidden_size"],
         ),
         (
-            "ExpertOut-mean-rerouted-attn-only",
-            "rerouted",
-            rerouted_query_rows,
-            rerouted_doc_rows,
+            "ExpertOut-mean-attn-only",
             ["expert_out_pool", "expert_out_counts"],
             lambda data: build_expert_out_mean(data, attn_layers),
             architecture["hidden_size"],
         ),
         (
-            "ExpertOut-mean-rerouted-delta-only",
-            "rerouted",
-            rerouted_query_rows,
-            rerouted_doc_rows,
+            "ExpertOut-mean-delta-only",
             ["expert_out_pool", "expert_out_counts"],
             lambda data: build_expert_out_mean(data, delta_layers),
             architecture["hidden_size"],
         ),
     ]
 
-    paper_dense_specs = [
-        (
-            "KV-Embedding-paper-causal",
-            "paper_causal",
-            paper_causal_query_rows,
-            paper_causal_doc_rows,
-            ["hs_last_token", "hs_mean"],
-            final_hybrid_pool,
-            architecture["hidden_size"],
-        ),
-        (
-            "KV-Embedding-paper-rerouted",
-            "paper_rerouted",
-            paper_rerouted_query_rows,
-            paper_rerouted_doc_rows,
-            ["hs_last_token", "hs_mean"],
-            final_hybrid_pool,
-            architecture["hidden_size"],
-        ),
-    ]
-
-    for method, pass_name, _query_rows, _doc_rows, fields, builder, vec_dim in list(dense_specs):
-        if pass_name == "causal":
-            paper_pass_name = "paper_causal"
-            paper_query_rows = paper_causal_query_rows
-            paper_doc_rows = paper_causal_doc_rows
-        else:
-            paper_pass_name = "paper_rerouted"
-            paper_query_rows = paper_rerouted_query_rows
-            paper_doc_rows = paper_rerouted_doc_rows
-        paper_dense_specs.append(
-            (
-                f"{method}-papercond",
-                paper_pass_name,
-                paper_query_rows,
-                paper_doc_rows,
-                fields,
-                builder,
-                vec_dim,
-            )
-        )
-
-    dense_specs.extend(paper_dense_specs)
-
     dense_metadata: dict[str, dict[str, float]] = {}
-    for method, pass_name, query_rows, doc_rows, fields, builder, vec_dim in dense_specs:
-        query_ids, query_matrix, q_time, _ = load_dense_embeddings(query_rows, fields, builder)
-        doc_ids, doc_matrix, d_time, index_bytes = load_dense_embeddings(doc_rows, fields, builder)
-        scores = dense_cosine_scores(query_matrix, doc_matrix)
+    for variant in pass_variants:
+        suffix = variant["suffix"]
+        pass_name = variant["pass_name"]
+        for base_name, fields, builder, vec_dim in dense_bases:
+            method = f"{base_name}-{suffix}"
+            query_ids, query_matrix, q_time, _ = load_dense_embeddings(variant["query_rows"], fields, builder)
+            doc_ids, doc_matrix, d_time, index_bytes = load_dense_embeddings(variant["doc_rows"], fields, builder)
+            scores = dense_cosine_scores(query_matrix, doc_matrix)
+            metrics = evaluate_scores(evaluator, qrels, query_ids, doc_ids, scores)
+            score_cache[method] = scores
+            build_time = q_time + d_time
+            record_method(method, metrics, 1.0, vec_dim, pass_name, build_time, index_bytes, None)
+            dense_metadata[method] = {"build_time": build_time, "index_bytes": index_bytes, "vec_dim": vec_dim}
+            del query_matrix, doc_matrix, scores
+            gc.collect()
+
+    for variant in pass_variants:
+        suffix = variant["suffix"]
+        pass_name = variant["pass_name"]
+        query_ids, query_matrix, q_time, _, _ = load_sparse_embeddings(
+            variant["query_rows"], ["routing_indices", "routing_weights"], lambda data: moee_sparse(data, architecture)
+        )
+        doc_ids, doc_matrix, d_time, index_bytes, doc_nnz = load_sparse_embeddings(
+            variant["doc_rows"], ["routing_indices", "routing_weights"], lambda data: moee_sparse(data, architecture)
+        )
+        scores = sparse_cosine_scores(query_matrix, doc_matrix)
         metrics = evaluate_scores(evaluator, qrels, query_ids, doc_ids, scores)
-        score_cache[method] = scores
-        build_time = q_time + d_time
-        record_method(method, metrics, 1.0, vec_dim, pass_name, build_time, index_bytes, None)
-        dense_metadata[method] = {"build_time": build_time, "index_bytes": index_bytes, "vec_dim": vec_dim}
+        record_method(
+            f"MoEE-sparse-{suffix}",
+            metrics,
+            1.0,
+            architecture["num_layers"] * architecture["num_experts"],
+            pass_name,
+            q_time + d_time,
+            index_bytes,
+            doc_nnz,
+        )
         del query_matrix, doc_matrix, scores
         gc.collect()
 
-    sparse_query_ids, sparse_query_matrix, sparse_q_time, _, sparse_q_nnz = load_sparse_embeddings(
-        causal_query_rows, ["routing_indices", "routing_weights"], lambda data: moee_sparse(data, architecture)
-    )
-    sparse_doc_ids, sparse_doc_matrix, sparse_d_time, sparse_index_bytes, sparse_doc_nnz = load_sparse_embeddings(
-        causal_doc_rows, ["routing_indices", "routing_weights"], lambda data: moee_sparse(data, architecture)
-    )
-    sparse_scores = sparse_cosine_scores(sparse_query_matrix, sparse_doc_matrix)
-    sparse_metrics = evaluate_scores(evaluator, qrels, sparse_query_ids, sparse_doc_ids, sparse_scores)
-    record_method(
-        "MoEE-causal-sparse",
-        sparse_metrics,
-        1.0,
-        architecture["num_layers"] * architecture["num_experts"],
-        "causal",
-        sparse_q_time + sparse_d_time,
-        sparse_index_bytes,
-        sparse_doc_nnz,
-    )
-    del sparse_query_matrix, sparse_doc_matrix, sparse_scores
-    gc.collect()
-
-    paper_sparse_query_ids, paper_sparse_query_matrix, paper_sparse_q_time, _, _ = load_sparse_embeddings(
-        paper_causal_query_rows, ["routing_indices", "routing_weights"], lambda data: moee_sparse(data, architecture)
-    )
-    paper_sparse_doc_ids, paper_sparse_doc_matrix, paper_sparse_d_time, paper_sparse_index_bytes, paper_sparse_doc_nnz = load_sparse_embeddings(
-        paper_causal_doc_rows, ["routing_indices", "routing_weights"], lambda data: moee_sparse(data, architecture)
-    )
-    paper_sparse_scores = sparse_cosine_scores(paper_sparse_query_matrix, paper_sparse_doc_matrix)
-    paper_sparse_metrics = evaluate_scores(evaluator, qrels, paper_sparse_query_ids, paper_sparse_doc_ids, paper_sparse_scores)
-    record_method(
-        "MoEE-causal-sparse-papercond",
-        paper_sparse_metrics,
-        1.0,
-        architecture["num_layers"] * architecture["num_experts"],
-        "paper_causal",
-        paper_sparse_q_time + paper_sparse_d_time,
-        paper_sparse_index_bytes,
-        paper_sparse_doc_nnz,
-    )
-    del paper_sparse_query_matrix, paper_sparse_doc_matrix, paper_sparse_scores
-    gc.collect()
-
-    moee_scores = score_cache["MoEE-rerouted"]
-    va_scores = score_cache["VA-rerouted"]
-    expertout_scores = score_cache["ExpertOut-mean-rerouted"]
-    fusion_specs = [
-        (
-            "MoEE+VA-0.3",
-            0.3 * moee_scores + 0.7 * va_scores,
-            dense_metadata["MoEE-rerouted"]["build_time"] + dense_metadata["VA-rerouted"]["build_time"],
-            dense_metadata["MoEE-rerouted"]["index_bytes"] + dense_metadata["VA-rerouted"]["index_bytes"],
-            max(dense_metadata["MoEE-rerouted"]["vec_dim"], dense_metadata["VA-rerouted"]["vec_dim"]),
-        ),
-        (
-            "MoEE+VA-0.5",
-            0.5 * moee_scores + 0.5 * va_scores,
-            dense_metadata["MoEE-rerouted"]["build_time"] + dense_metadata["VA-rerouted"]["build_time"],
-            dense_metadata["MoEE-rerouted"]["index_bytes"] + dense_metadata["VA-rerouted"]["index_bytes"],
-            max(dense_metadata["MoEE-rerouted"]["vec_dim"], dense_metadata["VA-rerouted"]["vec_dim"]),
-        ),
-        (
-            "MoEE+VA-0.7",
-            0.7 * moee_scores + 0.3 * va_scores,
-            dense_metadata["MoEE-rerouted"]["build_time"] + dense_metadata["VA-rerouted"]["build_time"],
-            dense_metadata["MoEE-rerouted"]["index_bytes"] + dense_metadata["VA-rerouted"]["index_bytes"],
-            max(dense_metadata["MoEE-rerouted"]["vec_dim"], dense_metadata["VA-rerouted"]["vec_dim"]),
-        ),
-        (
-            "MoEE+ExpertOut-0.5",
-            0.5 * moee_scores + 0.5 * expertout_scores,
-            dense_metadata["MoEE-rerouted"]["build_time"] + dense_metadata["ExpertOut-mean-rerouted"]["build_time"],
-            dense_metadata["MoEE-rerouted"]["index_bytes"] + dense_metadata["ExpertOut-mean-rerouted"]["index_bytes"],
-            max(
-                dense_metadata["MoEE-rerouted"]["vec_dim"],
-                dense_metadata["ExpertOut-mean-rerouted"]["vec_dim"],
-            ),
-        ),
+    fusion_bases = [
+        ("MoEE+VA-0.3", 0.3, 0.7),
+        ("MoEE+VA-0.5", 0.5, 0.5),
+        ("MoEE+VA-0.7", 0.7, 0.3),
     ]
+    for variant in pass_variants:
+        suffix = variant["suffix"]
+        pass_name = variant["pass_name"]
+        moee_scores = score_cache[f"MoEE-{suffix}"]
+        va_scores = score_cache[f"VA-{suffix}"]
+        expertout_scores = score_cache[f"ExpertOut-mean-{suffix}"]
+        query_ids = [row["text_id"] for row in variant["query_rows"]]
+        doc_ids = [row["text_id"] for row in variant["doc_rows"]]
 
-    paper_moee_scores = score_cache["MoEE-rerouted-papercond"]
-    paper_va_scores = score_cache["VA-rerouted-papercond"]
-    paper_expertout_scores = score_cache["ExpertOut-mean-rerouted-papercond"]
-    fusion_specs.extend(
-        [
-            (
-                "MoEE+VA-0.3-papercond",
-                0.3 * paper_moee_scores + 0.7 * paper_va_scores,
-                dense_metadata["MoEE-rerouted-papercond"]["build_time"] + dense_metadata["VA-rerouted-papercond"]["build_time"],
-                dense_metadata["MoEE-rerouted-papercond"]["index_bytes"] + dense_metadata["VA-rerouted-papercond"]["index_bytes"],
-                max(dense_metadata["MoEE-rerouted-papercond"]["vec_dim"], dense_metadata["VA-rerouted-papercond"]["vec_dim"]),
-            ),
-            (
-                "MoEE+VA-0.5-papercond",
-                0.5 * paper_moee_scores + 0.5 * paper_va_scores,
-                dense_metadata["MoEE-rerouted-papercond"]["build_time"] + dense_metadata["VA-rerouted-papercond"]["build_time"],
-                dense_metadata["MoEE-rerouted-papercond"]["index_bytes"] + dense_metadata["VA-rerouted-papercond"]["index_bytes"],
-                max(dense_metadata["MoEE-rerouted-papercond"]["vec_dim"], dense_metadata["VA-rerouted-papercond"]["vec_dim"]),
-            ),
-            (
-                "MoEE+VA-0.7-papercond",
-                0.7 * paper_moee_scores + 0.3 * paper_va_scores,
-                dense_metadata["MoEE-rerouted-papercond"]["build_time"] + dense_metadata["VA-rerouted-papercond"]["build_time"],
-                dense_metadata["MoEE-rerouted-papercond"]["index_bytes"] + dense_metadata["VA-rerouted-papercond"]["index_bytes"],
-                max(dense_metadata["MoEE-rerouted-papercond"]["vec_dim"], dense_metadata["VA-rerouted-papercond"]["vec_dim"]),
-            ),
-            (
-                "MoEE+ExpertOut-0.5-papercond",
-                0.5 * paper_moee_scores + 0.5 * paper_expertout_scores,
-                dense_metadata["MoEE-rerouted-papercond"]["build_time"] + dense_metadata["ExpertOut-mean-rerouted-papercond"]["build_time"],
-                dense_metadata["MoEE-rerouted-papercond"]["index_bytes"] + dense_metadata["ExpertOut-mean-rerouted-papercond"]["index_bytes"],
-                max(
-                    dense_metadata["MoEE-rerouted-papercond"]["vec_dim"],
-                    dense_metadata["ExpertOut-mean-rerouted-papercond"]["vec_dim"],
-                ),
-            ),
-        ]
-    )
+        for base_name, moee_weight, va_weight in fusion_bases:
+            method = f"{base_name}-{suffix}"
+            scores = moee_weight * moee_scores + va_weight * va_scores
+            metrics = evaluate_scores(evaluator, qrels, query_ids, doc_ids, scores)
+            score_cache[method] = scores
+            build_time = dense_metadata[f"MoEE-{suffix}"]["build_time"] + dense_metadata[f"VA-{suffix}"]["build_time"]
+            index_bytes = dense_metadata[f"MoEE-{suffix}"]["index_bytes"] + dense_metadata[f"VA-{suffix}"]["index_bytes"]
+            vec_dim = max(dense_metadata[f"MoEE-{suffix}"]["vec_dim"], dense_metadata[f"VA-{suffix}"]["vec_dim"])
+            record_method(method, metrics, 1.0, int(vec_dim), pass_name, float(build_time), float(index_bytes), None)
 
-    rerouted_query_ids = [row["text_id"] for row in rerouted_query_rows]
-    rerouted_doc_ids = [row["text_id"] for row in rerouted_doc_rows]
-    for method, scores, build_time, index_bytes, vec_dim in fusion_specs:
-        if method.endswith("-papercond"):
-            query_ids = [row["text_id"] for row in paper_rerouted_query_rows]
-            doc_ids = [row["text_id"] for row in paper_rerouted_doc_rows]
-            pass_name = "paper_rerouted"
-        else:
-            query_ids = rerouted_query_ids
-            doc_ids = rerouted_doc_ids
-            pass_name = "rerouted"
+        method = f"MoEE+ExpertOut-0.5-{suffix}"
+        scores = 0.5 * moee_scores + 0.5 * expertout_scores
         metrics = evaluate_scores(evaluator, qrels, query_ids, doc_ids, scores)
         score_cache[method] = scores
+        build_time = (
+            dense_metadata[f"MoEE-{suffix}"]["build_time"] + dense_metadata[f"ExpertOut-mean-{suffix}"]["build_time"]
+        )
+        index_bytes = (
+            dense_metadata[f"MoEE-{suffix}"]["index_bytes"] + dense_metadata[f"ExpertOut-mean-{suffix}"]["index_bytes"]
+        )
+        vec_dim = max(
+            dense_metadata[f"MoEE-{suffix}"]["vec_dim"],
+            dense_metadata[f"ExpertOut-mean-{suffix}"]["vec_dim"],
+        )
         record_method(method, metrics, 1.0, int(vec_dim), pass_name, float(build_time), float(index_bytes), None)
 
-    multivector_specs = [
+    multivector_bases = [
         (
             "ExpertPool-Value-attn",
             ["va_expert_counts", "va_expert_pool"],
@@ -731,64 +545,44 @@ def main() -> None:
         ("TokenLevel-HS-final", ["hs_final_all_tokens"], build_token_level_final, architecture["hidden_size"]),
     ]
 
-    paper_multivector_specs = []
-    for method, fields, builder, vec_dim in multivector_specs:
-        paper_multivector_specs.append((f"{method}-papercond", fields, builder, vec_dim))
-    multivector_specs.extend(paper_multivector_specs)
-
     multivector_cache: dict[str, tuple[list[str], list[np.ndarray], list[str], list[np.ndarray]]] = {}
-    cache_methods = {
-        "ExpertPool-Value-attn",
-        "ExpertPool-ExpertOut-all",
-        "TokenLevel-HS-final",
-        "ExpertPool-Value-attn-papercond",
-        "ExpertPool-ExpertOut-all-papercond",
-        "TokenLevel-HS-final-papercond",
-    }
-    for method, fields, builder, vec_dim in multivector_specs:
-        if method.endswith("-papercond"):
-            source_query_rows = paper_rerouted_query_rows
-            source_doc_rows = paper_rerouted_doc_rows
-            pass_name = "paper_rerouted"
-        else:
-            source_query_rows = rerouted_query_rows
-            source_doc_rows = rerouted_doc_rows
-            pass_name = "rerouted"
-        query_ids, query_vectors, q_time, _, _ = load_multivectors(source_query_rows, fields, builder)
-        doc_ids, doc_vectors, d_time, index_bytes, avg_vectors = load_multivectors(source_doc_rows, fields, builder)
-        scores = compute_maxsim_scores(query_vectors, doc_vectors, device=device, batch_size=args.maxsim_batch_size)
-        metrics = evaluate_scores(evaluator, qrels, query_ids, doc_ids, scores)
-        if method in cache_methods:
-            multivector_cache[method] = (query_ids, query_vectors, doc_ids, doc_vectors)
-        score_cache[method] = scores
-        record_method(method, metrics, avg_vectors, vec_dim, pass_name, q_time + d_time, index_bytes, None)
-        if method not in cache_methods:
-            del query_vectors, doc_vectors
-        del scores
-        gc.collect()
+    cache_base_names = {"ExpertPool-Value-attn", "ExpertPool-ExpertOut-all", "TokenLevel-HS-final"}
+    for variant in pass_variants:
+        suffix = variant["suffix"]
+        pass_name = variant["pass_name"]
+        for base_name, fields, builder, vec_dim in multivector_bases:
+            method = f"{base_name}-{suffix}"
+            query_ids, query_vectors, q_time, _, _ = load_multivectors(variant["query_rows"], fields, builder)
+            doc_ids, doc_vectors, d_time, index_bytes, avg_vectors = load_multivectors(variant["doc_rows"], fields, builder)
+            scores = compute_maxsim_scores(query_vectors, doc_vectors, device=device, batch_size=args.maxsim_batch_size)
+            metrics = evaluate_scores(evaluator, qrels, query_ids, doc_ids, scores)
+            if base_name in cache_base_names:
+                multivector_cache[method] = (query_ids, query_vectors, doc_ids, doc_vectors)
+            score_cache[method] = scores
+            record_method(method, metrics, avg_vectors, vec_dim, pass_name, q_time + d_time, index_bytes, None)
+            if base_name not in cache_base_names:
+                del query_vectors, doc_vectors
+            del scores
+            gc.collect()
 
-    top100_candidates = np.argsort(-moee_scores, axis=1)[:, :100]
-    rerank_specs = [
+    rerank_bases = [
         ("RouteSig-then-ExpertPool-Value", "ExpertPool-Value-attn"),
         ("RouteSig-then-ExpertPool-ExpertOut", "ExpertPool-ExpertOut-all"),
         ("RouteSig-then-TokenLevel-HS", "TokenLevel-HS-final"),
-        ("RouteSig-then-ExpertPool-Value-papercond", "ExpertPool-Value-attn-papercond"),
-        ("RouteSig-then-ExpertPool-ExpertOut-papercond", "ExpertPool-ExpertOut-all-papercond"),
-        ("RouteSig-then-TokenLevel-HS-papercond", "TokenLevel-HS-final-papercond"),
     ]
-    for method, base_method in rerank_specs:
-        if method.endswith("-papercond"):
-            candidate_scores = np.argsort(-score_cache["MoEE-rerouted-papercond"], axis=1)[:, :100]
-            pass_name = "paper_rerouted"
-        else:
-            candidate_scores = top100_candidates
-            pass_name = "rerouted"
-        query_ids, query_vectors, doc_ids, doc_vectors = multivector_cache[base_method]
-        reranked = compute_maxsim_rerank(query_vectors, doc_vectors, candidate_scores, device=device)
-        metrics = evaluate_reranked(evaluator, qrels, query_ids, doc_ids, reranked)
-        avg_vectors = float(np.mean([rep.shape[0] for rep in doc_vectors]))
-        vec_dim = int(doc_vectors[0].shape[1])
-        record_method(method, metrics, avg_vectors, vec_dim, pass_name, 0.0, 0.0, None)
+    for variant in pass_variants:
+        suffix = variant["suffix"]
+        pass_name = variant["pass_name"]
+        candidate_indices = np.argsort(-score_cache[f"MoEE-{suffix}"], axis=1)[:, :100]
+        for rerank_name, base_name in rerank_bases:
+            method = f"{rerank_name}-{suffix}"
+            base_method = f"{base_name}-{suffix}"
+            query_ids, query_vectors, doc_ids, doc_vectors = multivector_cache[base_method]
+            reranked = compute_maxsim_rerank(query_vectors, doc_vectors, candidate_indices, device=device)
+            metrics = evaluate_reranked(evaluator, qrels, query_ids, doc_ids, reranked)
+            avg_vectors = float(np.mean([rep.shape[0] for rep in doc_vectors]))
+            vec_dim = int(doc_vectors[0].shape[1])
+            record_method(method, metrics, avg_vectors, vec_dim, pass_name, 0.0, 0.0, None)
 
     results_df = pd.DataFrame(results_rows)
     results_df.to_csv(dirs["results"] / "results.csv", index=False)
