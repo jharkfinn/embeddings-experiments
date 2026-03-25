@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import gc
+import hashlib
+import json
+import os
 import time
 from pathlib import Path
 from typing import Callable
@@ -38,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--maxsim-batch-size", type=int, default=48)
     parser.add_argument("--maxsim-query-batch-size", type=int, default=16)
+    parser.add_argument("--load-workers", type=int, default=min(8, os.cpu_count() or 8))
+    parser.add_argument("--rebuild-cache", action="store_true")
     return parser.parse_args()
 
 
@@ -195,9 +201,138 @@ def load_dense_embeddings(
     return ids, matrix, build_time, index_bytes
 
 
+def flatten_multivectors_with_offsets(vectors: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    if not vectors:
+        raise ValueError("Cannot flatten an empty multivector set.")
+    counts = np.asarray([item.shape[0] for item in vectors], dtype=np.int32)
+    offsets = np.zeros(len(vectors) + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum(counts, dtype=np.int64)
+    flat = np.concatenate(vectors, axis=0).astype(np.float32, copy=False)
+    return flat, offsets
+
+
+def inflate_multivectors_from_offsets(flat: np.ndarray, offsets: np.ndarray) -> list[np.ndarray]:
+    return [flat[offsets[idx] : offsets[idx + 1]] for idx in range(len(offsets) - 1)]
+
+
+def cache_root(project_root: Path) -> Path:
+    return project_root / "results" / "eval_cache"
+
+
+def cache_file_path(
+    project_root: Path,
+    cache_type: str,
+    pass_name: str,
+    kind: str,
+    fields: tuple[str, ...],
+    method_names: list[str],
+) -> Path:
+    payload = {
+        "cache_type": cache_type,
+        "pass_name": pass_name,
+        "kind": kind,
+        "fields": list(fields),
+        "method_names": method_names,
+    }
+    digest = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    base_dir = cache_root(project_root) / cache_type / pass_name / kind
+    base_dir.mkdir(parents=True, exist_ok=True)
+    return base_dir / f"{digest}.npz"
+
+
+def save_dense_group_cache(
+    path: Path,
+    ids: list[str],
+    matrices: dict[str, np.ndarray],
+    metadata: dict[str, dict[str, float]],
+) -> None:
+    method_names = list(matrices.keys())
+    payload: dict[str, np.ndarray] = {
+        "ids": np.asarray(ids),
+        "method_names": np.asarray(method_names),
+        "build_times": np.asarray([metadata[name]["build_time"] for name in method_names], dtype=np.float64),
+        "index_bytes": np.asarray([metadata[name]["index_bytes"] for name in method_names], dtype=np.float64),
+        "vec_dims": np.asarray([metadata[name]["vec_dim"] for name in method_names], dtype=np.float64),
+    }
+    for idx, name in enumerate(method_names):
+        payload[f"matrix_{idx}"] = matrices[name].astype(np.float32, copy=False)
+    np.savez(path, **payload)
+
+
+def load_dense_group_cache(path: Path) -> tuple[list[str], dict[str, np.ndarray], dict[str, dict[str, float]]]:
+    with np.load(path, allow_pickle=False) as data:
+        ids = data["ids"].astype(str).tolist()
+        method_names = data["method_names"].astype(str).tolist()
+        build_times = data["build_times"].astype(np.float64, copy=False)
+        index_bytes = data["index_bytes"].astype(np.float64, copy=False)
+        vec_dims = data["vec_dims"].astype(np.float64, copy=False)
+        matrices = {
+            name: data[f"matrix_{idx}"].astype(np.float32, copy=False) for idx, name in enumerate(method_names)
+        }
+    metadata = {
+        name: {
+            "build_time": float(build_times[idx]),
+            "index_bytes": float(index_bytes[idx]),
+            "vec_dim": float(vec_dims[idx]),
+        }
+        for idx, name in enumerate(method_names)
+    }
+    return ids, matrices, metadata
+
+
+def save_multivector_group_cache(
+    path: Path,
+    ids: list[str],
+    representations: dict[str, list[np.ndarray]],
+    metadata: dict[str, dict[str, float]],
+) -> None:
+    method_names = list(representations.keys())
+    payload: dict[str, np.ndarray] = {
+        "ids": np.asarray(ids),
+        "method_names": np.asarray(method_names),
+        "build_times": np.asarray([metadata[name]["build_time"] for name in method_names], dtype=np.float64),
+        "index_bytes": np.asarray([metadata[name]["index_bytes"] for name in method_names], dtype=np.float64),
+        "avg_vectors": np.asarray([metadata[name]["avg_vectors"] for name in method_names], dtype=np.float64),
+        "vec_dims": np.asarray([metadata[name]["vec_dim"] for name in method_names], dtype=np.float64),
+    }
+    for idx, name in enumerate(method_names):
+        flat, offsets = flatten_multivectors_with_offsets(representations[name])
+        payload[f"flat_{idx}"] = flat
+        payload[f"offsets_{idx}"] = offsets
+    np.savez(path, **payload)
+
+
+def load_multivector_group_cache(path: Path) -> tuple[list[str], dict[str, list[np.ndarray]], dict[str, dict[str, float]]]:
+    with np.load(path, allow_pickle=False) as data:
+        ids = data["ids"].astype(str).tolist()
+        method_names = data["method_names"].astype(str).tolist()
+        build_times = data["build_times"].astype(np.float64, copy=False)
+        index_bytes = data["index_bytes"].astype(np.float64, copy=False)
+        avg_vectors = data["avg_vectors"].astype(np.float64, copy=False)
+        vec_dims = data["vec_dims"].astype(np.float64, copy=False)
+        representations = {
+            name: inflate_multivectors_from_offsets(
+                data[f"flat_{idx}"].astype(np.float32, copy=False),
+                data[f"offsets_{idx}"].astype(np.int64, copy=False),
+            )
+            for idx, name in enumerate(method_names)
+        }
+    metadata = {
+        name: {
+            "build_time": float(build_times[idx]),
+            "index_bytes": float(index_bytes[idx]),
+            "avg_vectors": float(avg_vectors[idx]),
+            "vec_dim": float(vec_dims[idx]),
+        }
+        for idx, name in enumerate(method_names)
+    }
+    return ids, representations, metadata
+
+
 def load_dense_group_embeddings(
     rows: list[dict],
     specs: list[tuple[str, list[str], Callable[[dict[str, np.ndarray]], np.ndarray], int]],
+    load_workers: int = 1,
 ) -> tuple[list[str], dict[str, np.ndarray], dict[str, dict[str, float]]]:
     ids: list[str] = []
     embeddings: dict[str, list[np.ndarray]] = {name: [] for name, *_ in specs}
@@ -205,18 +340,38 @@ def load_dense_group_embeddings(
     all_fields = sorted({field for _, fields, _, _ in specs for field in fields})
     load_time = 0.0
 
-    for row in rows:
+    def process_row(row: dict):
         load_started = time.perf_counter()
         data = load_npz_fields(row["path"], all_fields)
-        load_time += time.perf_counter() - load_started
-        ids.append(str(row["text_id"]))
-
+        row_load_time = time.perf_counter() - load_started
+        row_embeddings: dict[str, np.ndarray] = {}
+        row_method_times: dict[str, float] = {}
         for name, _fields, builder, _vec_dim in specs:
             build_started = time.perf_counter()
             vec = builder(data)
             vec = l2_normalize_array(vec.astype(np.float32, copy=False), axis=-1)
-            embeddings[name].append(vec)
-            method_times[name] += time.perf_counter() - build_started
+            row_embeddings[name] = vec
+            row_method_times[name] = time.perf_counter() - build_started
+        return str(row["text_id"]), row_embeddings, row_method_times, row_load_time
+
+    iterator = rows
+    if load_workers > 1:
+        with ThreadPoolExecutor(max_workers=load_workers) as executor:
+            iterator = executor.map(process_row, rows)
+            for text_id, row_embeddings, row_method_times, row_load_time in iterator:
+                ids.append(text_id)
+                load_time += row_load_time
+                for name in embeddings:
+                    embeddings[name].append(row_embeddings[name])
+                    method_times[name] += row_method_times[name]
+    else:
+        for row in rows:
+            text_id, row_embeddings, row_method_times, row_load_time = process_row(row)
+            ids.append(text_id)
+            load_time += row_load_time
+            for name in embeddings:
+                embeddings[name].append(row_embeddings[name])
+                method_times[name] += row_method_times[name]
 
     matrices = {
         name: np.stack(vectors, axis=0).astype(np.float32, copy=False) for name, vectors in embeddings.items()
@@ -255,6 +410,7 @@ def load_multivectors(
 def load_multivector_group(
     rows: list[dict],
     specs: list[tuple[str, list[str], Callable[[dict[str, np.ndarray]], np.ndarray], int]],
+    load_workers: int = 1,
 ) -> tuple[list[str], dict[str, list[np.ndarray]], dict[str, dict[str, float]]]:
     ids: list[str] = []
     representations: dict[str, list[np.ndarray]] = {name: [] for name, *_ in specs}
@@ -262,16 +418,37 @@ def load_multivector_group(
     all_fields = sorted({field for _, fields, _, _ in specs for field in fields})
     load_time = 0.0
 
-    for row in rows:
+    def process_row(row: dict):
         load_started = time.perf_counter()
         data = load_npz_fields(row["path"], all_fields)
-        load_time += time.perf_counter() - load_started
-        ids.append(str(row["text_id"]))
+        row_load_time = time.perf_counter() - load_started
+        row_reps: dict[str, np.ndarray] = {}
+        row_method_times: dict[str, float] = {}
         for name, _fields, builder, _vec_dim in specs:
             build_started = time.perf_counter()
             rep = normalize_multivector(builder(data)).astype(np.float32, copy=False)
-            representations[name].append(rep)
-            method_times[name] += time.perf_counter() - build_started
+            row_reps[name] = rep
+            row_method_times[name] = time.perf_counter() - build_started
+        return str(row["text_id"]), row_reps, row_method_times, row_load_time
+
+    iterator = rows
+    if load_workers > 1:
+        with ThreadPoolExecutor(max_workers=load_workers) as executor:
+            iterator = executor.map(process_row, rows)
+            for text_id, row_reps, row_method_times, row_load_time in iterator:
+                ids.append(text_id)
+                load_time += row_load_time
+                for name in representations:
+                    representations[name].append(row_reps[name])
+                    method_times[name] += row_method_times[name]
+    else:
+        for row in rows:
+            text_id, row_reps, row_method_times, row_load_time = process_row(row)
+            ids.append(text_id)
+            load_time += row_load_time
+            for name in representations:
+                representations[name].append(row_reps[name])
+                method_times[name] += row_method_times[name]
 
     load_share = load_time / max(len(specs), 1)
     metadata = {
@@ -284,6 +461,48 @@ def load_multivector_group(
         for name, _fields, _builder, vec_dim in specs
     }
     return ids, representations, metadata
+
+
+def get_dense_group_embeddings(
+    project_root: Path,
+    pass_name: str,
+    kind: str,
+    rows: list[dict],
+    specs: list[tuple[str, list[str], Callable[[dict[str, np.ndarray]], np.ndarray], int]],
+    load_workers: int,
+    rebuild_cache: bool,
+) -> tuple[list[str], dict[str, np.ndarray], dict[str, dict[str, float]]]:
+    fields = tuple(sorted({field for _, spec_fields, _, _ in specs for field in spec_fields}))
+    method_names = [name for name, *_ in specs]
+    path = cache_file_path(project_root, "dense", pass_name, kind, fields, method_names)
+    if path.exists() and not rebuild_cache:
+        print(f"[Evaluate] Loading dense cache {path}")
+        return load_dense_group_cache(path)
+    print(f"[Evaluate] Building dense cache {path}")
+    ids, matrices, metadata = load_dense_group_embeddings(rows, specs, load_workers=load_workers)
+    save_dense_group_cache(path, ids, matrices, metadata)
+    return ids, matrices, metadata
+
+
+def get_multivector_group_embeddings(
+    project_root: Path,
+    pass_name: str,
+    kind: str,
+    rows: list[dict],
+    specs: list[tuple[str, list[str], Callable[[dict[str, np.ndarray]], np.ndarray], int]],
+    load_workers: int,
+    rebuild_cache: bool,
+) -> tuple[list[str], dict[str, list[np.ndarray]], dict[str, dict[str, float]]]:
+    fields = tuple(sorted({field for _, spec_fields, _, _ in specs for field in spec_fields}))
+    method_names = [name for name, *_ in specs]
+    path = cache_file_path(project_root, "multivector", pass_name, kind, fields, method_names)
+    if path.exists() and not rebuild_cache:
+        print(f"[Evaluate] Loading multivector cache {path}")
+        return load_multivector_group_cache(path)
+    print(f"[Evaluate] Building multivector cache {path}")
+    ids, reps, metadata = load_multivector_group(rows, specs, load_workers=load_workers)
+    save_multivector_group_cache(path, ids, reps, metadata)
+    return ids, reps, metadata
 
 
 def prepare_doc_batches(doc_vectors: list[np.ndarray], batch_size: int):
@@ -338,13 +557,21 @@ def compute_maxsim_scores(
     scores = np.zeros((len(query_vectors), len(doc_vectors)), dtype=np.float32)
     doc_batches = prepare_doc_batches(doc_vectors, batch_size)
     query_batches = prepare_query_batches(query_vectors, query_batch_size)
+    query_tensors = []
     with torch.no_grad():
+        for q_start, q_end, q_packed, q_mask in query_batches:
+            query_tensors.append(
+                (
+                    q_start,
+                    q_end,
+                    torch.from_numpy(q_packed).to(device=device, dtype=torch.float32),
+                    torch.from_numpy(q_mask).to(device=device),
+                )
+            )
         for start, end, packed, mask in doc_batches:
             doc_tensor = torch.from_numpy(packed).to(device=device, dtype=torch.float32)
             mask_tensor = torch.from_numpy(mask).to(device=device)
-            for q_start, q_end, q_packed, q_mask in query_batches:
-                query_tensor = torch.from_numpy(q_packed).to(device=device, dtype=torch.float32)
-                query_mask = torch.from_numpy(q_mask).to(device=device)
+            for q_start, q_end, query_tensor, query_mask in query_tensors:
                 sims = torch.einsum("aqd,bkd->abqk", query_tensor, doc_tensor)
                 sims = sims.masked_fill(~mask_tensor[None, :, None, :], -1e30)
                 batch_scores = sims.max(dim=-1).values
@@ -535,45 +762,150 @@ def main() -> None:
     for variant in pass_variants:
         suffix = variant["suffix"]
         pass_name = variant["pass_name"]
-        dense_specs = [(f"{base_name}-{suffix}", fields, builder, vec_dim) for base_name, fields, builder, vec_dim in dense_bases]
-        print(f"[Evaluate] Building dense representations for {pass_name} ({len(dense_specs)} methods)")
-        query_ids, query_matrices, query_metadata = load_dense_group_embeddings(variant["query_rows"], dense_specs)
-        doc_ids, doc_matrices, doc_metadata = load_dense_group_embeddings(variant["doc_rows"], dense_specs)
-        for method, _fields, _builder, vec_dim in dense_specs:
-            query_matrix = query_matrices[method]
-            doc_matrix = doc_matrices[method]
-            scores = dense_cosine_scores_torch(query_matrix, doc_matrix, device)
-            metrics = evaluate_scores(evaluator, qrels, query_ids, doc_ids, scores)
-            score_cache[method] = scores
-            build_time = query_metadata[method]["build_time"] + doc_metadata[method]["build_time"]
-            index_bytes = doc_metadata[method]["index_bytes"]
-            record_method(method, metrics, 1.0, vec_dim, pass_name, build_time, index_bytes, None)
-            dense_metadata[method] = {"build_time": build_time, "index_bytes": index_bytes, "vec_dim": vec_dim}
-            del query_matrix, doc_matrix, scores
+        dense_groups: list[tuple[tuple[str, ...], list[tuple[str, list[str], Callable[[dict[str, np.ndarray]], np.ndarray], int]]]] = [
+            (
+                ("hs_last_token", "hs_mean"),
+                [
+                    (f"KV-Embedding-{suffix}", ["hs_last_token", "hs_mean"], final_hybrid_pool, architecture["hidden_size"]),
+                    (f"LastToken-HS-{suffix}", ["hs_last_token"], final_last_token, architecture["hidden_size"]),
+                    (f"MeanPool-HS-{suffix}", ["hs_mean"], final_mean_pool, architecture["hidden_size"]),
+                ],
+            ),
+            (
+                ("routing_full_last",),
+                [
+                    (
+                        f"MoEE-{suffix}",
+                        ["routing_full_last"],
+                        moee_dense,
+                        architecture["num_layers"] * architecture["num_experts"],
+                    )
+                ],
+            ),
+            (
+                ("va_mean",),
+                [
+                    (f"VA-{suffix}", ["va_mean"], lambda data: pool_va_mean(data, attn_second_half), architecture["value_dim"]),
+                    (f"VA-all-attn-{suffix}", ["va_mean"], lambda data: pool_va_mean(data, attn_all), architecture["value_dim"]),
+                    (f"VA-last-attn-{suffix}", ["va_mean"], lambda data: pool_va_mean(data, attn_last), architecture["value_dim"]),
+                ],
+            ),
+            (
+                ("attn_weights_last", "va_all_tokens"),
+                [
+                    (
+                        f"AlignedWVA-{suffix}",
+                        ["attn_weights_last", "va_all_tokens"],
+                        lambda data: build_aligned_wva(data, architecture, attn_second_half),
+                        architecture["value_dim"],
+                    )
+                ],
+            ),
+            (
+                ("expert_out_pool", "expert_out_counts"),
+                [
+                    (
+                        f"ExpertOut-mean-{suffix}",
+                        ["expert_out_pool", "expert_out_counts"],
+                        lambda data: build_expert_out_mean(data, all_layers),
+                        architecture["hidden_size"],
+                    ),
+                    (
+                        f"ExpertOut-mean-attn-only-{suffix}",
+                        ["expert_out_pool", "expert_out_counts"],
+                        lambda data: build_expert_out_mean(data, attn_layers),
+                        architecture["hidden_size"],
+                    ),
+                    (
+                        f"ExpertOut-mean-delta-only-{suffix}",
+                        ["expert_out_pool", "expert_out_counts"],
+                        lambda data: build_expert_out_mean(data, delta_layers),
+                        architecture["hidden_size"],
+                    ),
+                ],
+            ),
+        ]
+        for field_group, method_specs in dense_groups:
+            print(
+                f"[Evaluate] Building dense group for {pass_name} "
+                f"fields={list(field_group)} methods={len(method_specs)}"
+            )
+            query_ids, query_matrices, query_metadata = get_dense_group_embeddings(
+                args.project_root,
+                pass_name,
+                "query",
+                variant["query_rows"],
+                method_specs,
+                load_workers=args.load_workers,
+                rebuild_cache=args.rebuild_cache,
+            )
+            doc_ids, doc_matrices, doc_metadata = get_dense_group_embeddings(
+                args.project_root,
+                pass_name,
+                "doc",
+                variant["doc_rows"],
+                method_specs,
+                load_workers=args.load_workers,
+                rebuild_cache=args.rebuild_cache,
+            )
+            for method, _fields, _builder, vec_dim in method_specs:
+                query_matrix = query_matrices[method]
+                doc_matrix = doc_matrices[method]
+                scores = dense_cosine_scores_torch(query_matrix, doc_matrix, device)
+                metrics = evaluate_scores(evaluator, qrels, query_ids, doc_ids, scores)
+                score_cache[method] = scores
+                build_time = query_metadata[method]["build_time"] + doc_metadata[method]["build_time"]
+                index_bytes = doc_metadata[method]["index_bytes"]
+                record_method(method, metrics, 1.0, vec_dim, pass_name, build_time, index_bytes, None)
+                dense_metadata[method] = {"build_time": build_time, "index_bytes": index_bytes, "vec_dim": vec_dim}
+                del query_matrix, doc_matrix, scores
+                gc.collect()
+            del query_matrices, doc_matrices
             gc.collect()
-        del query_matrices, doc_matrices
-        gc.collect()
 
     for variant in pass_variants:
         suffix = variant["suffix"]
         pass_name = variant["pass_name"]
         print(f"[Evaluate] Building route-signature sparse proxy for {pass_name}")
-        query_ids, query_matrix, q_time, _ = load_dense_embeddings(
-            variant["query_rows"], ["routing_indices", "routing_weights"], lambda data: moee_sparse_dense(data, architecture)
+        sparse_method = f"MoEE-sparse-{suffix}"
+        method_specs = [
+            (
+                sparse_method,
+                ["routing_indices", "routing_weights"],
+                lambda data: moee_sparse_dense(data, architecture),
+                architecture["num_layers"] * architecture["num_experts"],
+            )
+        ]
+        query_ids, query_matrices, query_metadata = get_dense_group_embeddings(
+            args.project_root,
+            pass_name,
+            "query",
+            variant["query_rows"],
+            method_specs,
+            load_workers=args.load_workers,
+            rebuild_cache=args.rebuild_cache,
         )
-        doc_ids, doc_matrix, d_time, index_bytes = load_dense_embeddings(
-            variant["doc_rows"], ["routing_indices", "routing_weights"], lambda data: moee_sparse_dense(data, architecture)
+        doc_ids, doc_matrices, doc_metadata = get_dense_group_embeddings(
+            args.project_root,
+            pass_name,
+            "doc",
+            variant["doc_rows"],
+            method_specs,
+            load_workers=args.load_workers,
+            rebuild_cache=args.rebuild_cache,
         )
+        query_matrix = query_matrices[sparse_method]
+        doc_matrix = doc_matrices[sparse_method]
         scores = dense_cosine_scores_torch(query_matrix, doc_matrix, device)
         metrics = evaluate_scores(evaluator, qrels, query_ids, doc_ids, scores)
         record_method(
-            f"MoEE-sparse-{suffix}",
+            sparse_method,
             metrics,
             1.0,
             architecture["num_layers"] * architecture["num_experts"],
             pass_name,
-            q_time + d_time,
-            index_bytes,
+            query_metadata[sparse_method]["build_time"] + doc_metadata[sparse_method]["build_time"],
+            doc_metadata[sparse_method]["index_bytes"],
             float(architecture["num_layers"] * 8),
         )
         del query_matrix, doc_matrix, scores
@@ -666,8 +998,24 @@ def main() -> None:
                 f"[Evaluate] Building multivector group for {pass_name} "
                 f"fields={list(field_group)} methods={len(method_specs)}"
             )
-            query_ids, query_reps, query_metadata = load_multivector_group(variant["query_rows"], method_specs)
-            doc_ids, doc_reps, doc_metadata = load_multivector_group(variant["doc_rows"], method_specs)
+            query_ids, query_reps, query_metadata = get_multivector_group_embeddings(
+                args.project_root,
+                pass_name,
+                "query",
+                variant["query_rows"],
+                method_specs,
+                load_workers=args.load_workers,
+                rebuild_cache=args.rebuild_cache,
+            )
+            doc_ids, doc_reps, doc_metadata = get_multivector_group_embeddings(
+                args.project_root,
+                pass_name,
+                "doc",
+                variant["doc_rows"],
+                method_specs,
+                load_workers=args.load_workers,
+                rebuild_cache=args.rebuild_cache,
+            )
             for method, _fields, _builder, vec_dim in method_specs:
                 print(f"[Evaluate] Scoring multivector method {method}")
                 query_vectors = query_reps[method]
