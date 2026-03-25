@@ -150,6 +150,12 @@ class PassRuntimeState:
         self.expert_out_pool: list[torch.Tensor | None] = [None] * self.num_layers
         self.expert_out_mask: list[torch.Tensor | None] = [None] * self.num_layers
         self.expert_out_counts: list[torch.Tensor | None] = [None] * self.num_layers
+        self.expert_ffn_pool: list[torch.Tensor | None] = [None] * self.num_layers
+        self.expert_ffn_mask: list[torch.Tensor | None] = [None] * self.num_layers
+        self.expert_ffn_counts: list[torch.Tensor | None] = [None] * self.num_layers
+        self.expert_contrib_pool: list[torch.Tensor | None] = [None] * self.num_layers
+        self.expert_contrib_mask: list[torch.Tensor | None] = [None] * self.num_layers
+        self.expert_contrib_counts: list[torch.Tensor | None] = [None] * self.num_layers
         self.va_all_tokens: dict[int, torch.Tensor] = {}
         self.attn_weights_last: dict[int, torch.Tensor] = {}
         self.attn_weights_reroute: dict[int, torch.Tensor] = {}
@@ -190,6 +196,12 @@ class PassRuntimeState:
         expert_out_pool = torch.stack([tensor for tensor in self.expert_out_pool], dim=0).to(torch.float16)
         expert_out_mask = torch.stack([tensor for tensor in self.expert_out_mask], dim=0).to(torch.bool)
         expert_out_counts = torch.stack([tensor for tensor in self.expert_out_counts], dim=0).to(torch.int16)
+        expert_ffn_pool = torch.stack([tensor for tensor in self.expert_ffn_pool], dim=0).to(torch.float16)
+        expert_ffn_mask = torch.stack([tensor for tensor in self.expert_ffn_mask], dim=0).to(torch.bool)
+        expert_ffn_counts = torch.stack([tensor for tensor in self.expert_ffn_counts], dim=0).to(torch.int16)
+        expert_contrib_pool = torch.stack([tensor for tensor in self.expert_contrib_pool], dim=0).to(torch.float16)
+        expert_contrib_mask = torch.stack([tensor for tensor in self.expert_contrib_mask], dim=0).to(torch.bool)
+        expert_contrib_counts = torch.stack([tensor for tensor in self.expert_contrib_counts], dim=0).to(torch.int16)
 
         va_all_list = [self.va_all_tokens[layer_idx].to(torch.float16) for layer_idx in self.attn_layer_indices]
         va_all_tokens = torch.stack(va_all_list, dim=0)
@@ -254,6 +266,12 @@ class PassRuntimeState:
                     "expert_out_pool": expert_out_pool[:, batch_idx].cpu().numpy(),
                     "expert_out_mask": expert_out_mask[:, batch_idx].cpu().numpy(),
                     "expert_out_counts": expert_out_counts[:, batch_idx].cpu().numpy(),
+                    "expert_ffn_pool": expert_ffn_pool[:, batch_idx].cpu().numpy(),
+                    "expert_ffn_mask": expert_ffn_mask[:, batch_idx].cpu().numpy(),
+                    "expert_ffn_counts": expert_ffn_counts[:, batch_idx].cpu().numpy(),
+                    "expert_contrib_pool": expert_contrib_pool[:, batch_idx].cpu().numpy(),
+                    "expert_contrib_mask": expert_contrib_mask[:, batch_idx].cpu().numpy(),
+                    "expert_contrib_counts": expert_contrib_counts[:, batch_idx].cpu().numpy(),
                     "attn_weights_last": attn_last[:, batch_idx, :, :seq_len].cpu().numpy(),
                     "attn_weights_reroute": attn_reroute[:, batch_idx].cpu().numpy(),
                     "shared_expert_index": np.asarray(SHARED_EXPERT_INDEX, dtype=np.int16),
@@ -441,25 +459,48 @@ class InstrumentationContext:
 
             pool_sums = torch.zeros((batch_size, 9, hidden_dim), device=hidden_states.device, dtype=torch.float32)
             counts = torch.zeros((batch_size, 9), device=hidden_states.device, dtype=torch.int16)
+            expert_ffn_sums = torch.zeros((batch_size, 9, hidden_dim), device=hidden_states.device, dtype=torch.float32)
+            expert_ffn_counts = torch.zeros((batch_size, 9), device=hidden_states.device, dtype=torch.int16)
+            expert_contrib_sums = torch.zeros((batch_size, 9, hidden_dim), device=hidden_states.device, dtype=torch.float32)
+            expert_contrib_counts = torch.zeros((batch_size, 9), device=hidden_states.device, dtype=torch.int16)
 
             expert_output_tokens = expert_output.reshape(batch_size, sequence_length, hidden_dim)
             selected_experts_tokens = selected_experts.reshape(batch_size, sequence_length, -1)
+            routing_weights_tokens = routing_weights.reshape(batch_size, sequence_length, -1)
             shared_weighted_tokens = shared_weighted.reshape(batch_size, sequence_length, hidden_dim)
+            shared_expert_tokens = shared_expert_output.reshape(batch_size, sequence_length, hidden_dim)
             last_token_experts = selected_experts_tokens[batch_indices, last_positions]
 
             for sample_idx in range(batch_size):
                 sample_active_tokens = token_mask[sample_idx]
+                sample_hidden_states = hidden_states[sample_idx]
+                sample_selected = selected_experts_tokens[sample_idx]
+                sample_weights = routing_weights_tokens[sample_idx]
                 routed_slot_map = {
                     int(expert_id): slot for slot, expert_id in enumerate(last_token_experts[sample_idx].tolist())
                 }
                 for expert_idx, slot in routed_slot_map.items():
-                    sample_token_mask = sample_active_tokens & (selected_experts_tokens[sample_idx] == expert_idx).any(dim=-1)
+                    sample_token_mask = sample_active_tokens & (sample_selected == expert_idx).any(dim=-1)
                     token_count = int(sample_token_mask.sum().item())
                     counts[sample_idx, slot] = token_count
                     if token_count > 0:
                         pool_sums[sample_idx, slot] = expert_output_tokens[sample_idx, sample_token_mask].sum(dim=0).to(
                             pool_sums.dtype
                         )
+                        selected_hidden = sample_hidden_states[sample_token_mask]
+                        gate, up = F.linear(selected_hidden, module.experts.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+                        raw_expert_output = F.linear(module.experts.act_fn(gate) * up, module.experts.down_proj[expert_idx])
+                        expert_token_weights = (
+                            sample_weights[sample_token_mask]
+                            * (sample_selected[sample_token_mask] == expert_idx).to(sample_weights.dtype)
+                        ).sum(dim=-1)
+                        weighted_expert_output = raw_expert_output * expert_token_weights.unsqueeze(-1)
+                        expert_ffn_sums[sample_idx, slot] = raw_expert_output.sum(dim=0).to(expert_ffn_sums.dtype)
+                        expert_ffn_counts[sample_idx, slot] = token_count
+                        expert_contrib_sums[sample_idx, slot] = weighted_expert_output.sum(dim=0).to(
+                            expert_contrib_sums.dtype
+                        )
+                        expert_contrib_counts[sample_idx, slot] = token_count
 
             expert_output = expert_output + shared_weighted
             for sample_idx in range(batch_size):
@@ -468,11 +509,35 @@ class InstrumentationContext:
                     pool_sums.dtype
                 )
                 counts[sample_idx, 8] = int(sample_active_tokens.sum().item())
+                shared_token_count = int(sample_active_tokens.sum().item())
+                if shared_token_count > 0:
+                    expert_ffn_sums[sample_idx, 8] = shared_expert_tokens[sample_idx, sample_active_tokens].sum(dim=0).to(
+                        expert_ffn_sums.dtype
+                    )
+                    expert_ffn_counts[sample_idx, 8] = shared_token_count
+                    expert_contrib_sums[sample_idx, 8] = shared_weighted_tokens[sample_idx, sample_active_tokens].sum(
+                        dim=0
+                    ).to(expert_contrib_sums.dtype)
+                    expert_contrib_counts[sample_idx, 8] = shared_token_count
 
             pooled = torch.zeros_like(pool_sums, dtype=torch.float16)
             mask = counts > 0
             if mask.any():
                 pooled[mask] = (pool_sums[mask] / counts[mask].to(pool_sums.dtype).unsqueeze(-1)).to(torch.float16)
+            expert_ffn_pooled = torch.zeros_like(expert_ffn_sums, dtype=torch.float16)
+            expert_ffn_mask = expert_ffn_counts > 0
+            if expert_ffn_mask.any():
+                expert_ffn_pooled[expert_ffn_mask] = (
+                    expert_ffn_sums[expert_ffn_mask]
+                    / expert_ffn_counts[expert_ffn_mask].to(expert_ffn_sums.dtype).unsqueeze(-1)
+                ).to(torch.float16)
+            expert_contrib_pooled = torch.zeros_like(expert_contrib_sums, dtype=torch.float16)
+            expert_contrib_mask = expert_contrib_counts > 0
+            if expert_contrib_mask.any():
+                expert_contrib_pooled[expert_contrib_mask] = (
+                    expert_contrib_sums[expert_contrib_mask]
+                    / expert_contrib_counts[expert_contrib_mask].to(expert_contrib_sums.dtype).unsqueeze(-1)
+                ).to(torch.float16)
 
             selected_experts = selected_experts.reshape(batch_size, sequence_length, -1)
             routing_weights = routing_weights.reshape(batch_size, sequence_length, -1)
@@ -491,6 +556,12 @@ class InstrumentationContext:
             runtime.expert_out_pool[layer_idx] = pooled.detach()
             runtime.expert_out_mask[layer_idx] = mask.detach()
             runtime.expert_out_counts[layer_idx] = counts.detach()
+            runtime.expert_ffn_pool[layer_idx] = expert_ffn_pooled.detach()
+            runtime.expert_ffn_mask[layer_idx] = expert_ffn_mask.detach()
+            runtime.expert_ffn_counts[layer_idx] = expert_ffn_counts.detach()
+            runtime.expert_contrib_pool[layer_idx] = expert_contrib_pooled.detach()
+            runtime.expert_contrib_mask[layer_idx] = expert_contrib_mask.detach()
+            runtime.expert_contrib_counts[layer_idx] = expert_contrib_counts.detach()
 
             return expert_output.reshape(batch_size, sequence_length, hidden_dim)
 

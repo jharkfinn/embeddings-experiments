@@ -12,13 +12,11 @@ bootstrap_workspace_env()
 
 import numpy as np
 import pandas as pd
-import scipy.sparse as sp
 import torch
 from beir.retrieval.evaluation import EvaluateRetrieval
 
 from experiment_utils import (
     EPS,
-    dense_cosine_scores,
     ensure_project_dirs,
     human_bytes,
     load_architecture,
@@ -26,12 +24,12 @@ from experiment_utils import (
     load_npz_fields,
     load_scifact,
     l2_normalize_array,
-    make_results_dict,
     normalize_multivector,
     pack_multivectors,
-    sparse_cosine_scores,
-    sparse_stack,
 )
+
+
+EVAL_TOP_K = 100
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project-root", type=Path, default=Path("/workspace/kv_moee_experiment"))
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--maxsim-batch-size", type=int, default=48)
+    parser.add_argument("--maxsim-query-batch-size", type=int, default=16)
     return parser.parse_args()
 
 
@@ -66,19 +65,15 @@ def moee_dense(data: dict[str, np.ndarray]) -> np.ndarray:
     return data["routing_full_last"].astype(np.float32, copy=False).reshape(-1)
 
 
-def moee_sparse(data: dict[str, np.ndarray], architecture: dict) -> sp.csr_matrix:
+def moee_sparse_dense(data: dict[str, np.ndarray], architecture: dict) -> np.ndarray:
     num_layers = architecture["num_layers"]
     num_experts = architecture["num_experts"]
     last_indices = data["routing_indices"][:, -1, :8].astype(np.int64, copy=False)
     last_weights = data["routing_weights"][:, -1, :8].astype(np.float32, copy=False)
+    vec = np.zeros(num_layers * num_experts, dtype=np.float32)
     cols = np.repeat(np.arange(num_layers) * num_experts, 8) + last_indices.reshape(-1)
-    vals = last_weights.reshape(-1)
-    rows = np.zeros_like(cols)
-    mat = sp.csr_matrix((vals, (rows, cols)), shape=(1, num_layers * num_experts), dtype=np.float32)
-    norm = np.sqrt(mat.multiply(mat).sum())
-    if norm > 0:
-        mat = mat / norm
-    return mat
+    vec[cols] = last_weights.reshape(-1)
+    return vec
 
 
 def select_attn_offsets(architecture: dict, selector: str) -> list[int]:
@@ -200,25 +195,42 @@ def load_dense_embeddings(
     return ids, matrix, build_time, index_bytes
 
 
-def load_sparse_embeddings(
+def load_dense_group_embeddings(
     rows: list[dict],
-    fields: list[str],
-    builder: Callable[[dict[str, np.ndarray]], sp.csr_matrix],
-) -> tuple[list[str], sp.csr_matrix, float, float, float]:
-    ids = []
-    vectors = []
-    nnz = []
-    build_start = time.perf_counter()
+    specs: list[tuple[str, list[str], Callable[[dict[str, np.ndarray]], np.ndarray], int]],
+) -> tuple[list[str], dict[str, np.ndarray], dict[str, dict[str, float]]]:
+    ids: list[str] = []
+    embeddings: dict[str, list[np.ndarray]] = {name: [] for name, *_ in specs}
+    method_times: dict[str, float] = {name: 0.0 for name, *_ in specs}
+    all_fields = sorted({field for _, fields, _, _ in specs for field in fields})
+    load_time = 0.0
+
     for row in rows:
-        data = load_npz_fields(row["path"], fields)
-        vec = builder(data)
+        load_started = time.perf_counter()
+        data = load_npz_fields(row["path"], all_fields)
+        load_time += time.perf_counter() - load_started
         ids.append(str(row["text_id"]))
-        vectors.append(vec)
-        nnz.append(float(vec.nnz))
-    matrix = sparse_stack(vectors)
-    index_bytes = float(matrix.data.nbytes + matrix.indices.nbytes + matrix.indptr.nbytes)
-    build_time = time.perf_counter() - build_start
-    return ids, matrix, build_time, index_bytes, float(np.mean(nnz))
+
+        for name, _fields, builder, _vec_dim in specs:
+            build_started = time.perf_counter()
+            vec = builder(data)
+            vec = l2_normalize_array(vec.astype(np.float32, copy=False), axis=-1)
+            embeddings[name].append(vec)
+            method_times[name] += time.perf_counter() - build_started
+
+    matrices = {
+        name: np.stack(vectors, axis=0).astype(np.float32, copy=False) for name, vectors in embeddings.items()
+    }
+    load_share = load_time / max(len(specs), 1)
+    metadata = {
+        name: {
+            "build_time": method_times[name] + load_share,
+            "index_bytes": float(matrices[name].nbytes),
+            "vec_dim": float(vec_dim),
+        }
+        for name, _fields, _builder, vec_dim in specs
+    }
+    return ids, matrices, metadata
 
 
 def load_multivectors(
@@ -240,6 +252,40 @@ def load_multivectors(
     return ids, representations, build_time, index_bytes, avg_vectors
 
 
+def load_multivector_group(
+    rows: list[dict],
+    specs: list[tuple[str, list[str], Callable[[dict[str, np.ndarray]], np.ndarray], int]],
+) -> tuple[list[str], dict[str, list[np.ndarray]], dict[str, dict[str, float]]]:
+    ids: list[str] = []
+    representations: dict[str, list[np.ndarray]] = {name: [] for name, *_ in specs}
+    method_times: dict[str, float] = {name: 0.0 for name, *_ in specs}
+    all_fields = sorted({field for _, fields, _, _ in specs for field in fields})
+    load_time = 0.0
+
+    for row in rows:
+        load_started = time.perf_counter()
+        data = load_npz_fields(row["path"], all_fields)
+        load_time += time.perf_counter() - load_started
+        ids.append(str(row["text_id"]))
+        for name, _fields, builder, _vec_dim in specs:
+            build_started = time.perf_counter()
+            rep = normalize_multivector(builder(data)).astype(np.float32, copy=False)
+            representations[name].append(rep)
+            method_times[name] += time.perf_counter() - build_started
+
+    load_share = load_time / max(len(specs), 1)
+    metadata = {
+        name: {
+            "build_time": method_times[name] + load_share,
+            "index_bytes": float(sum(rep.nbytes for rep in representations[name])),
+            "avg_vectors": float(np.mean([rep.shape[0] for rep in representations[name]])),
+            "vec_dim": float(vec_dim),
+        }
+        for name, _fields, _builder, vec_dim in specs
+    }
+    return ids, representations, metadata
+
+
 def prepare_doc_batches(doc_vectors: list[np.ndarray], batch_size: int):
     batches = []
     for start in range(0, len(doc_vectors), batch_size):
@@ -249,46 +295,101 @@ def prepare_doc_batches(doc_vectors: list[np.ndarray], batch_size: int):
     return batches
 
 
+def prepare_query_batches(query_vectors: list[np.ndarray], batch_size: int):
+    batches = []
+    for start in range(0, len(query_vectors), batch_size):
+        end = min(len(query_vectors), start + batch_size)
+        packed, mask = pack_multivectors(query_vectors[start:end])
+        batches.append((start, end, packed, mask))
+    return batches
+
+
+def dense_cosine_scores_torch(query_matrix: np.ndarray, doc_matrix: np.ndarray, device: torch.device) -> np.ndarray:
+    if device.type == "cpu":
+        return query_matrix @ doc_matrix.T
+    with torch.no_grad():
+        query_tensor = torch.from_numpy(query_matrix).to(device=device, dtype=torch.float32)
+        doc_tensor = torch.from_numpy(doc_matrix).to(device=device, dtype=torch.float32)
+        scores = torch.matmul(query_tensor, doc_tensor.T)
+        return scores.cpu().numpy().astype(np.float32, copy=False)
+
+
+def topk_results_dict(query_ids: list[str], doc_ids: list[str], scores: np.ndarray, top_k: int = EVAL_TOP_K) -> dict[str, dict[str, float]]:
+    results: dict[str, dict[str, float]] = {}
+    limit = min(top_k, scores.shape[1])
+    for row_idx, query_id in enumerate(query_ids):
+        row = scores[row_idx]
+        if limit >= row.shape[0]:
+            order = np.argsort(-row)
+        else:
+            candidates = np.argpartition(-row, limit - 1)[:limit]
+            order = candidates[np.argsort(-row[candidates])]
+        results[query_id] = {doc_ids[col_idx]: float(row[col_idx]) for col_idx in order}
+    return results
+
+
 def compute_maxsim_scores(
     query_vectors: list[np.ndarray],
     doc_vectors: list[np.ndarray],
     device: torch.device,
     batch_size: int,
+    query_batch_size: int,
 ) -> np.ndarray:
     scores = np.zeros((len(query_vectors), len(doc_vectors)), dtype=np.float32)
     doc_batches = prepare_doc_batches(doc_vectors, batch_size)
+    query_batches = prepare_query_batches(query_vectors, query_batch_size)
     with torch.no_grad():
-        for q_idx, query in enumerate(query_vectors):
-            query_tensor = torch.from_numpy(query).to(device=device, dtype=torch.float32)
-            for start, end, packed, mask in doc_batches:
-                doc_tensor = torch.from_numpy(packed).to(device=device, dtype=torch.float32)
-                mask_tensor = torch.from_numpy(mask).to(device=device)
-                sims = torch.einsum("qd,bkd->bqk", query_tensor, doc_tensor)
-                sims = sims.masked_fill(~mask_tensor[:, None, :], -1e30)
-                batch_scores = sims.max(dim=-1).values.sum(dim=-1)
-                scores[q_idx, start:end] = batch_scores.cpu().numpy()
+        for start, end, packed, mask in doc_batches:
+            doc_tensor = torch.from_numpy(packed).to(device=device, dtype=torch.float32)
+            mask_tensor = torch.from_numpy(mask).to(device=device)
+            for q_start, q_end, q_packed, q_mask in query_batches:
+                query_tensor = torch.from_numpy(q_packed).to(device=device, dtype=torch.float32)
+                query_mask = torch.from_numpy(q_mask).to(device=device)
+                sims = torch.einsum("aqd,bkd->abqk", query_tensor, doc_tensor)
+                sims = sims.masked_fill(~mask_tensor[None, :, None, :], -1e30)
+                batch_scores = sims.max(dim=-1).values
+                batch_scores = batch_scores.masked_fill(~query_mask[:, None, :], 0.0).sum(dim=-1)
+                scores[q_start:q_end, start:end] = batch_scores.cpu().numpy()
     return scores
 
 
 def compute_maxsim_rerank(
     query_vectors: list[np.ndarray],
     doc_vectors: list[np.ndarray],
-    candidate_indices: list[np.ndarray],
+    candidate_indices: np.ndarray,
     device: torch.device,
+    query_batch_size: int,
 ) -> list[dict[int, float]]:
-    reranked: list[dict[int, float]] = []
+    reranked: list[dict[int, float]] = [{} for _ in range(len(query_vectors))]
     with torch.no_grad():
-        for q_idx, query in enumerate(query_vectors):
-            query_tensor = torch.from_numpy(query).to(device=device, dtype=torch.float32)
-            candidates = candidate_indices[q_idx]
-            subset = [doc_vectors[int(doc_idx)] for doc_idx in candidates.tolist()]
-            packed, mask = pack_multivectors(subset)
-            doc_tensor = torch.from_numpy(packed).to(device=device, dtype=torch.float32)
-            mask_tensor = torch.from_numpy(mask).to(device=device)
-            sims = torch.einsum("qd,bkd->bqk", query_tensor, doc_tensor)
-            sims = sims.masked_fill(~mask_tensor[:, None, :], -1e30)
-            batch_scores = sims.max(dim=-1).values.sum(dim=-1).cpu().numpy()
-            reranked.append({int(doc_idx): float(score) for doc_idx, score in zip(candidates, batch_scores, strict=True)})
+        for q_start in range(0, len(query_vectors), query_batch_size):
+            q_end = min(len(query_vectors), q_start + query_batch_size)
+            batch_queries = query_vectors[q_start:q_end]
+            batch_candidates = candidate_indices[q_start:q_end]
+            packed_queries, query_mask = pack_multivectors(batch_queries)
+            max_doc_len = max(doc_vectors[int(doc_idx)].shape[0] for row in batch_candidates for doc_idx in row.tolist())
+            doc_dim = batch_queries[0].shape[1]
+            packed_docs = np.zeros((len(batch_queries), batch_candidates.shape[1], max_doc_len, doc_dim), dtype=np.float32)
+            doc_mask = np.zeros((len(batch_queries), batch_candidates.shape[1], max_doc_len), dtype=bool)
+            for local_idx, candidate_row in enumerate(batch_candidates):
+                for cand_idx, doc_idx in enumerate(candidate_row.tolist()):
+                    rep = doc_vectors[int(doc_idx)]
+                    packed_docs[local_idx, cand_idx, : rep.shape[0]] = rep
+                    doc_mask[local_idx, cand_idx, : rep.shape[0]] = True
+
+            query_tensor = torch.from_numpy(packed_queries).to(device=device, dtype=torch.float32)
+            query_mask_tensor = torch.from_numpy(query_mask).to(device=device)
+            doc_tensor = torch.from_numpy(packed_docs).to(device=device, dtype=torch.float32)
+            doc_mask_tensor = torch.from_numpy(doc_mask).to(device=device)
+            sims = torch.einsum("aqd,abkd->abqk", query_tensor, doc_tensor)
+            sims = sims.masked_fill(~doc_mask_tensor[:, :, None, :], -1e30)
+            batch_scores = sims.max(dim=-1).values
+            batch_scores = batch_scores.masked_fill(~query_mask_tensor[:, None, :], 0.0).sum(dim=-1).cpu().numpy()
+            for local_idx, candidate_row in enumerate(batch_candidates):
+                reranked[q_start + local_idx] = {
+                    int(doc_idx): float(score)
+                    for doc_idx, score in zip(candidate_row.tolist(), batch_scores[local_idx].tolist(), strict=True)
+                }
     return reranked
 
 
@@ -299,7 +400,7 @@ def evaluate_scores(
     doc_ids: list[str],
     scores: np.ndarray,
 ) -> dict[str, float]:
-    results = make_results_dict(query_ids, doc_ids, scores)
+    results = topk_results_dict(query_ids, doc_ids, scores, top_k=EVAL_TOP_K)
     ndcg, _map, recall, _precision = evaluator.evaluate(qrels, results, [10, 100])
     return {
         "nDCG@10": float(ndcg["NDCG@10"]),
@@ -434,29 +535,36 @@ def main() -> None:
     for variant in pass_variants:
         suffix = variant["suffix"]
         pass_name = variant["pass_name"]
-        for base_name, fields, builder, vec_dim in dense_bases:
-            method = f"{base_name}-{suffix}"
-            query_ids, query_matrix, q_time, _ = load_dense_embeddings(variant["query_rows"], fields, builder)
-            doc_ids, doc_matrix, d_time, index_bytes = load_dense_embeddings(variant["doc_rows"], fields, builder)
-            scores = dense_cosine_scores(query_matrix, doc_matrix)
+        dense_specs = [(f"{base_name}-{suffix}", fields, builder, vec_dim) for base_name, fields, builder, vec_dim in dense_bases]
+        print(f"[Evaluate] Building dense representations for {pass_name} ({len(dense_specs)} methods)")
+        query_ids, query_matrices, query_metadata = load_dense_group_embeddings(variant["query_rows"], dense_specs)
+        doc_ids, doc_matrices, doc_metadata = load_dense_group_embeddings(variant["doc_rows"], dense_specs)
+        for method, _fields, _builder, vec_dim in dense_specs:
+            query_matrix = query_matrices[method]
+            doc_matrix = doc_matrices[method]
+            scores = dense_cosine_scores_torch(query_matrix, doc_matrix, device)
             metrics = evaluate_scores(evaluator, qrels, query_ids, doc_ids, scores)
             score_cache[method] = scores
-            build_time = q_time + d_time
+            build_time = query_metadata[method]["build_time"] + doc_metadata[method]["build_time"]
+            index_bytes = doc_metadata[method]["index_bytes"]
             record_method(method, metrics, 1.0, vec_dim, pass_name, build_time, index_bytes, None)
             dense_metadata[method] = {"build_time": build_time, "index_bytes": index_bytes, "vec_dim": vec_dim}
             del query_matrix, doc_matrix, scores
             gc.collect()
+        del query_matrices, doc_matrices
+        gc.collect()
 
     for variant in pass_variants:
         suffix = variant["suffix"]
         pass_name = variant["pass_name"]
-        query_ids, query_matrix, q_time, _, _ = load_sparse_embeddings(
-            variant["query_rows"], ["routing_indices", "routing_weights"], lambda data: moee_sparse(data, architecture)
+        print(f"[Evaluate] Building route-signature sparse proxy for {pass_name}")
+        query_ids, query_matrix, q_time, _ = load_dense_embeddings(
+            variant["query_rows"], ["routing_indices", "routing_weights"], lambda data: moee_sparse_dense(data, architecture)
         )
-        doc_ids, doc_matrix, d_time, index_bytes, doc_nnz = load_sparse_embeddings(
-            variant["doc_rows"], ["routing_indices", "routing_weights"], lambda data: moee_sparse(data, architecture)
+        doc_ids, doc_matrix, d_time, index_bytes = load_dense_embeddings(
+            variant["doc_rows"], ["routing_indices", "routing_weights"], lambda data: moee_sparse_dense(data, architecture)
         )
-        scores = sparse_cosine_scores(query_matrix, doc_matrix)
+        scores = dense_cosine_scores_torch(query_matrix, doc_matrix, device)
         metrics = evaluate_scores(evaluator, qrels, query_ids, doc_ids, scores)
         record_method(
             f"MoEE-sparse-{suffix}",
@@ -466,7 +574,7 @@ def main() -> None:
             pass_name,
             q_time + d_time,
             index_bytes,
-            doc_nnz,
+            float(architecture["num_layers"] * 8),
         )
         del query_matrix, doc_matrix, scores
         gc.collect()
@@ -550,19 +658,47 @@ def main() -> None:
     for variant in pass_variants:
         suffix = variant["suffix"]
         pass_name = variant["pass_name"]
+        grouped_specs: dict[tuple[str, ...], list[tuple[str, list[str], Callable[[dict[str, np.ndarray]], np.ndarray], int]]] = {}
         for base_name, fields, builder, vec_dim in multivector_bases:
-            method = f"{base_name}-{suffix}"
-            query_ids, query_vectors, q_time, _, _ = load_multivectors(variant["query_rows"], fields, builder)
-            doc_ids, doc_vectors, d_time, index_bytes, avg_vectors = load_multivectors(variant["doc_rows"], fields, builder)
-            scores = compute_maxsim_scores(query_vectors, doc_vectors, device=device, batch_size=args.maxsim_batch_size)
-            metrics = evaluate_scores(evaluator, qrels, query_ids, doc_ids, scores)
-            if base_name in cache_base_names:
-                multivector_cache[method] = (query_ids, query_vectors, doc_ids, doc_vectors)
-            score_cache[method] = scores
-            record_method(method, metrics, avg_vectors, vec_dim, pass_name, q_time + d_time, index_bytes, None)
-            if base_name not in cache_base_names:
-                del query_vectors, doc_vectors
-            del scores
+            grouped_specs.setdefault(tuple(fields), []).append((f"{base_name}-{suffix}", fields, builder, vec_dim))
+        for field_group, method_specs in grouped_specs.items():
+            print(
+                f"[Evaluate] Building multivector group for {pass_name} "
+                f"fields={list(field_group)} methods={len(method_specs)}"
+            )
+            query_ids, query_reps, query_metadata = load_multivector_group(variant["query_rows"], method_specs)
+            doc_ids, doc_reps, doc_metadata = load_multivector_group(variant["doc_rows"], method_specs)
+            for method, _fields, _builder, vec_dim in method_specs:
+                print(f"[Evaluate] Scoring multivector method {method}")
+                query_vectors = query_reps[method]
+                doc_vectors = doc_reps[method]
+                scores = compute_maxsim_scores(
+                    query_vectors,
+                    doc_vectors,
+                    device=device,
+                    batch_size=args.maxsim_batch_size,
+                    query_batch_size=args.maxsim_query_batch_size,
+                )
+                metrics = evaluate_scores(evaluator, qrels, query_ids, doc_ids, scores)
+                base_name = method[: -(len(suffix) + 1)]
+                if base_name in cache_base_names:
+                    multivector_cache[method] = (query_ids, query_vectors, doc_ids, doc_vectors)
+                score_cache[method] = scores
+                record_method(
+                    method,
+                    metrics,
+                    doc_metadata[method]["avg_vectors"],
+                    vec_dim,
+                    pass_name,
+                    query_metadata[method]["build_time"] + doc_metadata[method]["build_time"],
+                    doc_metadata[method]["index_bytes"],
+                    None,
+                )
+                if base_name not in cache_base_names:
+                    del query_vectors, doc_vectors
+                del scores
+                gc.collect()
+            del query_reps, doc_reps
             gc.collect()
 
     rerank_bases = [
@@ -578,7 +714,13 @@ def main() -> None:
             method = f"{rerank_name}-{suffix}"
             base_method = f"{base_name}-{suffix}"
             query_ids, query_vectors, doc_ids, doc_vectors = multivector_cache[base_method]
-            reranked = compute_maxsim_rerank(query_vectors, doc_vectors, candidate_indices, device=device)
+            reranked = compute_maxsim_rerank(
+                query_vectors,
+                doc_vectors,
+                candidate_indices,
+                device=device,
+                query_batch_size=args.maxsim_query_batch_size,
+            )
             metrics = evaluate_reranked(evaluator, qrels, query_ids, doc_ids, reranked)
             avg_vectors = float(np.mean([rep.shape[0] for rep in doc_vectors]))
             vec_dim = int(doc_vectors[0].shape[1])
