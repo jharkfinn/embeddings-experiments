@@ -36,6 +36,13 @@ from experiment_utils import (
 EVAL_TOP_K = 100
 
 
+def ensure_finite_array(name: str, array: np.ndarray) -> np.ndarray:
+    arr = np.asarray(array)
+    if arr.dtype.kind in {"f", "c"} and not np.isfinite(arr).all():
+        raise ValueError(f"Non-finite values detected in {name} with shape={arr.shape} dtype={arr.dtype}")
+    return arr
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate saved Qwen3.5 MoE extraction signals on SciFact.")
     parser.add_argument("--project-root", type=Path, default=Path("/workspace/kv_moee_experiment"))
@@ -192,6 +199,7 @@ def load_dense_embeddings(
     for row in rows:
         data = load_npz_fields(row["path"], fields)
         vec = builder(data)
+        ensure_finite_array(f"dense_builder:{row['path']}", vec)
         vec = l2_normalize_array(vec.astype(np.float32, copy=False), axis=-1)
         ids.append(str(row["text_id"]))
         embeddings.append(vec)
@@ -269,6 +277,8 @@ def load_dense_group_cache(path: Path) -> tuple[list[str], dict[str, np.ndarray]
         matrices = {
             name: data[f"matrix_{idx}"].astype(np.float32, copy=False) for idx, name in enumerate(method_names)
         }
+    for name, matrix in matrices.items():
+        ensure_finite_array(f"dense_cache:{path}:{name}", matrix)
     metadata = {
         name: {
             "build_time": float(build_times[idx]),
@@ -317,6 +327,9 @@ def load_multivector_group_cache(path: Path) -> tuple[list[str], dict[str, list[
             )
             for idx, name in enumerate(method_names)
         }
+    for name, reps in representations.items():
+        for idx, rep in enumerate(reps):
+            ensure_finite_array(f"multivector_cache:{path}:{name}:row{idx}", rep)
     metadata = {
         name: {
             "build_time": float(build_times[idx]),
@@ -349,6 +362,7 @@ def load_dense_group_embeddings(
         for name, _fields, builder, _vec_dim in specs:
             build_started = time.perf_counter()
             vec = builder(data)
+            ensure_finite_array(f"dense_group:{name}:{row['path']}", vec)
             vec = l2_normalize_array(vec.astype(np.float32, copy=False), axis=-1)
             row_embeddings[name] = vec
             row_method_times[name] = time.perf_counter() - build_started
@@ -376,6 +390,8 @@ def load_dense_group_embeddings(
     matrices = {
         name: np.stack(vectors, axis=0).astype(np.float32, copy=False) for name, vectors in embeddings.items()
     }
+    for name, matrix in matrices.items():
+        ensure_finite_array(f"dense_matrix:{name}", matrix)
     load_share = load_time / max(len(specs), 1)
     metadata = {
         name: {
@@ -399,6 +415,7 @@ def load_multivectors(
     for row in rows:
         data = load_npz_fields(row["path"], fields)
         rep = normalize_multivector(builder(data))
+        ensure_finite_array(f"multivector_builder:{row['path']}", rep)
         ids.append(str(row["text_id"]))
         representations.append(rep.astype(np.float32, copy=False))
     build_time = time.perf_counter() - build_start
@@ -427,6 +444,7 @@ def load_multivector_group(
         for name, _fields, builder, _vec_dim in specs:
             build_started = time.perf_counter()
             rep = normalize_multivector(builder(data)).astype(np.float32, copy=False)
+            ensure_finite_array(f"multivector_group:{name}:{row['path']}", rep)
             row_reps[name] = rep
             row_method_times[name] = time.perf_counter() - build_started
         return str(row["text_id"]), row_reps, row_method_times, row_load_time

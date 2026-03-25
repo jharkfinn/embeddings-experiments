@@ -102,6 +102,18 @@ def prepend_attention_mask(attention_mask: torch.Tensor | None) -> torch.Tensor 
     return torch.cat([zero_column, attention_mask], dim=-1)
 
 
+def validate_payload_finite(payload: dict[str, np.ndarray], text_id: str, pass_name: str) -> None:
+    for key, value in payload.items():
+        array = np.asarray(value)
+        if array.dtype.kind not in {"f", "c"}:
+            continue
+        if not np.isfinite(array).all():
+            raise RuntimeError(
+                f"Non-finite values detected in pass={pass_name} text_id={text_id} field={key} "
+                f"shape={array.shape} dtype={array.dtype}"
+            )
+
+
 def get_input_device(text_model: torch.nn.Module) -> torch.device:
     return text_model.embed_tokens.weight.device
 
@@ -1311,6 +1323,7 @@ def main() -> None:
                     architecture,
                 )
                 for record, payload in zip(batch.records, payloads, strict=True):
+                    validate_payload_finite(payload, record.text_id, pass_spec.name)
                     writer.submit(dirs[pass_spec.output_dir_key] / record.filename, payload)
                 pass_runtimes[pass_spec.name] = runtime
                 instrumentation.runtime = None
