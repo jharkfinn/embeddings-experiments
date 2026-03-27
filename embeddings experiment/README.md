@@ -61,6 +61,12 @@ python run_kv_prepend_experiment.py describe-run --run-name bridge_hf_3tasks
 
 ### Collect captures
 
+Build a reproducible 3-task records file first:
+
+```bash
+python build_nanobeir_records.py --output records_nanobeir_3tasks.json
+```
+
 ```bash
 python run_kv_prepend_experiment.py \
   --spec default_experiment.json \
@@ -77,8 +83,8 @@ For the lean Thunder main run, use the generated teacher-forced HF spec:
 python run_kv_prepend_experiment.py \
   --spec spec_main_hf_teacher_forcing_3tasks.json \
   collect \
-  --records-json records.json \
-  --dataset-name scifact
+  --records-json records_nanobeir_3tasks.json \
+  --dataset-name nanobeir_3tasks
 ```
 
 `records.json` is a list of objects with:
