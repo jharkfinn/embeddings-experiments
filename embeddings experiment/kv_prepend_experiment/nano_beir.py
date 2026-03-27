@@ -20,16 +20,32 @@ def _guess_column(row: dict[str, Any], candidates):
     raise KeyError(f"None of the candidate columns were found: {candidates}")
 
 
+def _load_section(datasets, repo_name: str, *, config_name: str | None, section: str):
+    attempts = []
+    if config_name is not None:
+        attempts.append({"name": config_name, "split": section})
+    attempts.append({"name": section, "split": "train"})
+    attempts.append({"name": section, "split": "test"})
+    attempts.append({"name": section, "split": "validation"})
+
+    last_error = None
+    for kwargs in attempts:
+        try:
+            return datasets.load_dataset(repo_name, **kwargs)
+        except Exception as exc:  # pragma: no cover - dataset API/version specific
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Failed to load {repo_name} section={section}")
+
+
 def load_nanobeir_task(repo_name: str, dataset_name: str) -> RetrievalTask:
     datasets = import_datasets()
     dataset_name = dataset_name.lower()
     repo_override, config_override = _TASK_REPO_OVERRIDES.get(dataset_name, (repo_name, dataset_name))
-    load_kwargs = {}
-    if config_override is not None:
-        load_kwargs["name"] = config_override
-    corpus_ds = datasets.load_dataset(repo_override, split="corpus", **load_kwargs)
-    query_ds = datasets.load_dataset(repo_override, split="queries", **load_kwargs)
-    qrels_ds = datasets.load_dataset(repo_override, split="qrels", **load_kwargs)
+    corpus_ds = _load_section(datasets, repo_override, config_name=config_override, section="corpus")
+    query_ds = _load_section(datasets, repo_override, config_name=config_override, section="queries")
+    qrels_ds = _load_section(datasets, repo_override, config_name=config_override, section="qrels")
 
     corpus = {}
     for row in corpus_ds:
