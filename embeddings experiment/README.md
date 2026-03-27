@@ -21,20 +21,26 @@ The local machine does not currently have the runtime stack installed.
 
 ## Expected Python dependencies
 
-Install from `requirements_thunder.txt`, then add any GPU-specific wheels needed by
-your CUDA / PyTorch build.
+Use the pinned Thunder installer:
 
-Minimum expected packages:
+```bash
+./install_thunder_env.sh
+```
 
-- `torch`
-- `transformers`
-- `datasets`
-- `accelerate`
-- `sentencepiece`
-- `safetensors`
+That script creates `.venv` and installs the exact working stack we validated on
+Thunder:
 
-For FP8 loading, use a Transformers build that exposes an FP8 quantization config.
-The loader checks this at runtime and fails fast if the build does not support it.
+- `torch==2.10.0+cu126`
+- `fbgemm-gpu==1.5.0+cu126`
+- `fbgemm-gpu-genai==1.5.0+cu126`
+- `transformers==5.4.0`
+- `datasets==4.8.4`
+- `accelerate==1.13.0`
+
+The pinned requirements live in `requirements_thunder.txt`. This is the supported
+FP8 + FlexAttention stack for the active teacher-forcing path; do not substitute
+older Transformers builds or unpinned CUDA wheels unless you are prepared to
+revalidate the runtime contract.
 
 ## CLI
 
