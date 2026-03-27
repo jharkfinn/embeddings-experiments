@@ -1,7 +1,7 @@
 torch
-transformers
-datasets
-accelerate
+transformers==4.57.6
+datasets==4.8.4
+accelerate==1.13.0
 sentencepiece
 safetensors
 numpy
