@@ -94,9 +94,11 @@ def _signal_percentile(signal_name: str, quantization_spec) -> float:
         return float(quantization_spec.router_percentile)
     if signal_name in ("attention_output", "delta_attention"):
         return float(quantization_spec.attention_percentile)
+    if signal_name in {"summary_key_rot", "summary_key_raw", "summary_memory"}:
+        return float(quantization_spec.attention_percentile)
     if signal_name == "pre_moe":
         return float(quantization_spec.hidden_percentile)
-    if signal_name == "value_vectors":
+    if signal_name in {"value_vectors", "summary_value"}:
         return float(quantization_spec.value_percentile)
     return float(quantization_spec.default_percentile)
 
@@ -110,6 +112,7 @@ def _raw_signal_tokens(
     layer_indices: list[int],
 ):
     tokens = []
+    summary_signal_names = {"summary_value", "summary_key_rot", "summary_key_raw", "summary_memory"}
     for layer_idx in layer_indices:
         capture = _find_layer_capture(bundle, pass_name, condition, layer_idx)
         if signal_name == "attention_output":
@@ -123,6 +126,20 @@ def _raw_signal_tokens(
         elif signal_name == "value_vectors":
             raw = _tensor_to_numpy(capture.v_raw, dtype=np.float32)[0]
             tensor = raw.transpose(1, 0, 2).reshape(raw.shape[1], -1)
+        elif signal_name == "summary_value":
+            tensor = _tensor_to_numpy(capture.final_token_v, dtype=np.float32)[0]
+        elif signal_name == "summary_key_rot":
+            tensor = _tensor_to_numpy(capture.final_token_k_rot, dtype=np.float32)[0]
+        elif signal_name == "summary_key_raw":
+            tensor = _tensor_to_numpy(capture.final_token_k_raw, dtype=np.float32)[0]
+        elif signal_name == "summary_memory":
+            tensor = np.concatenate(
+                [
+                    _tensor_to_numpy(capture.final_token_k_rot, dtype=np.float32)[0],
+                    _tensor_to_numpy(capture.final_token_v, dtype=np.float32)[0],
+                ],
+                axis=-1,
+            )
         elif signal_name == "delta_attention":
             if condition == CaptureCondition.CAUSAL.value:
                 treated = _find_layer_capture(bundle, pass_name, CaptureCondition.LOCAL_PREPEND_CAUSAL_BASE.value, layer_idx)
@@ -131,10 +148,15 @@ def _raw_signal_tokens(
             tensor = _tensor_to_numpy(treated.z_attn, dtype=np.float32)[0] - _tensor_to_numpy(capture.z_attn, dtype=np.float32)[0]
         else:
             raise ValueError(f"Unsupported signal: {signal_name}")
-        mask = _content_row_mask(bundle, tensor.shape[0])
-        tensor = tensor[mask]
+        if signal_name not in summary_signal_names:
+            mask = _content_row_mask(bundle, tensor.shape[0])
+            tensor = tensor[mask]
         tokens.append(tensor)
-    return np.concatenate(tokens, axis=1) if tokens else np.zeros((0, 0), dtype=np.float32)
+    if not tokens:
+        return np.zeros((0, 0), dtype=np.float32)
+    if signal_name in summary_signal_names:
+        return np.concatenate(tokens, axis=1)
+    return np.concatenate(tokens, axis=1)
 
 
 def extract_signal_tokens(
@@ -320,6 +342,7 @@ def evaluate_signal_family(
     condition: str,
     signal_name: str,
     selected_layers: list[int],
+    topn_layers_for_grouping: int,
     quantization_spec,
 ):
     bundle_lookup = {bundle.text_id: bundle for bundle in iter_bundles(capture_dir)}
@@ -348,11 +371,16 @@ def evaluate_signal_family(
         per_layer.append(layer_result)
     ranked_single = sorted(per_layer, key=lambda item: item["single_vector_ndcg_at_10"], reverse=True)
     ranked_multi = sorted(per_layer, key=lambda item: item["multivector_ndcg_at_10"], reverse=True)
-    top3_single_layers = [entry["layer_indices"][0] for entry in ranked_single[:3]]
-    top3_multi_layers = [entry["layer_indices"][0] for entry in ranked_multi[:3]]
+    topn = max(1, int(topn_layers_for_grouping))
+    top3_single_layers = [entry["layer_indices"][0] for entry in ranked_single[:topn]]
+    top3_multi_layers = [entry["layer_indices"][0] for entry in ranked_multi[:topn]]
     grouped = {
         "per_layer": per_layer,
-        "top3_single": evaluate_signal(
+        "layer_grouping_topn": topn,
+        "layer_selection_policy": "in_task_topn_from_per_layer_scores",
+        "grouped_single_layers": top3_single_layers,
+        "grouped_multi_layers": top3_multi_layers,
+        "grouped_single": evaluate_signal(
             capture_dir=capture_dir,
             task_name=task_name,
             repo_name=repo_name,
@@ -362,7 +390,7 @@ def evaluate_signal_family(
             layer_indices=top3_single_layers,
             quantization_spec=quantization_spec,
         ),
-        "top3_multi": evaluate_signal(
+        "grouped_multi": evaluate_signal(
             capture_dir=capture_dir,
             task_name=task_name,
             repo_name=repo_name,
@@ -498,19 +526,36 @@ def evaluate_task_suite(
     fusion_weights: list[float],
     rrf_k: int,
     candidate_pool_k: int,
+    topn_layers_for_grouping: int,
 ):
     signals = [
         ("attention_output", "pass1", CaptureCondition.CAUSAL.value),
+        ("attention_output", "pass2", CaptureCondition.PROPAGATED.value),
         ("pre_moe", "pass1", CaptureCondition.CAUSAL.value),
+        ("pre_moe", "pass2", CaptureCondition.PROPAGATED.value),
         ("router_logits", "pass1", CaptureCondition.CAUSAL.value),
+        ("router_logits", "pass2", CaptureCondition.PROPAGATED.value),
         ("router_logits_positive", "pass1", CaptureCondition.CAUSAL.value),
+        ("router_logits_positive", "pass2", CaptureCondition.PROPAGATED.value),
         ("top_k_binary", "pass1", CaptureCondition.CAUSAL.value),
+        ("top_k_binary", "pass2", CaptureCondition.PROPAGATED.value),
         ("value_vectors", "pass1", CaptureCondition.CAUSAL.value),
+        ("value_vectors", "pass2", CaptureCondition.PROPAGATED.value),
+        ("summary_value", "pass1", CaptureCondition.CAUSAL.value),
+        ("summary_value", "pass2", CaptureCondition.PROPAGATED.value),
+        ("summary_key_rot", "pass1", CaptureCondition.CAUSAL.value),
+        ("summary_key_rot", "pass2", CaptureCondition.PROPAGATED.value),
+        ("summary_key_raw", "pass1", CaptureCondition.CAUSAL.value),
+        ("summary_key_raw", "pass2", CaptureCondition.PROPAGATED.value),
+        ("summary_memory", "pass1", CaptureCondition.CAUSAL.value),
+        ("summary_memory", "pass2", CaptureCondition.PROPAGATED.value),
         ("delta_attention", "pass1", CaptureCondition.CAUSAL.value),
+        ("delta_attention", "pass2", CaptureCondition.LOCAL_NOPREPEND_PROPAGATED_BASE.value),
     ]
     suite = {"task_name": task_name, "signals": {}, "pairwise_fusions": {}}
     for signal_name, pass_name, condition in signals:
-        suite["signals"][signal_name] = evaluate_signal_family(
+        signal_key = f"{signal_name}__{pass_name}__{condition}"
+        suite["signals"][signal_key] = evaluate_signal_family(
             capture_dir=capture_dir,
             task_name=task_name,
             repo_name=repo_name,
@@ -518,14 +563,15 @@ def evaluate_task_suite(
             condition=condition,
             signal_name=signal_name,
             selected_layers=selected_layers,
+            topn_layers_for_grouping=topn_layers_for_grouping,
             quantization_spec=quantization_spec,
         )
     task = load_nanobeir_task(repo_name, task_name)
     keys = list(suite["signals"].keys())
     for left_index, left_signal in enumerate(keys):
-        left_scores = suite["signals"][left_signal]["top3_multi"]["multivector_scores"]
+        left_scores = suite["signals"][left_signal]["grouped_multi"]["multivector_scores"]
         for right_signal in keys[left_index + 1 :]:
-            right_scores = suite["signals"][right_signal]["top3_multi"]["multivector_scores"]
+            right_scores = suite["signals"][right_signal]["grouped_multi"]["multivector_scores"]
             suite["pairwise_fusions"][f"{left_signal}__{right_signal}"] = evaluate_pairwise_fusion(
                 left_scores,
                 right_scores,

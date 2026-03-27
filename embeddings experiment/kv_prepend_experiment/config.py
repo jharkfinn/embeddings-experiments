@@ -30,19 +30,19 @@ class PromptSpec:
 @dataclass
 class CollectionSpec:
     propagate_from_layer: int = 16
-    calibration_subset_size: int = 64
-    runtime_backend: str = "hf"
-    capture_q_vectors: bool = True
+    calibration_subset_size: int = 0
+    runtime_backend: str = "hf_teacher_forcing"
+    capture_q_vectors: bool = False
     capture_attention_weights_for_all_layers: bool = False
     attention_weight_layers: list[int] = field(default_factory=lambda: [15, 23, 31, 39, 47])
     rope_modes: list[str] = field(default_factory=lambda: ["reuse_rotated", "rerotate_zero", "derotate"])
     default_rope_mode: str = "reuse_rotated"
     multi_slot_decode_steps: int = 3
-    streaming_batch_size: int = 2
-    max_batch_tokens: int = 4096
+    streaming_batch_size: int = 16
+    max_batch_tokens: int = 8192
     sequence_length_buckets: list[int] = field(default_factory=lambda: [128, 256, 384, 512, 768, 1024, 1536, 2048])
     pad_main_batches_to_streaming_size: bool = True
-    attention_backend: str = "sdpa"
+    attention_backend: str = "flex_packed"
     enable_attention_compile: bool = True
     attention_compile_mode: str = "default"
     attention_compile_fullgraph: bool = False
@@ -50,8 +50,8 @@ class CollectionSpec:
     writer_queue_size: int = 4
     random_seed: int = 0
     save_every_batch: bool = True
-    run_controls: bool = True
-    run_bridge: bool = True
+    run_controls: bool = False
+    run_bridge: bool = False
     controls_storage_mode: str = "summary_only"
     bridge_storage_mode: str = "summary_only"
     bias_sweep_points: int = 51

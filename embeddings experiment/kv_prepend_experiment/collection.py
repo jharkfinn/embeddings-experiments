@@ -20,7 +20,7 @@ from .prepend import (
     make_prepend_summary_kv,
     matched_norm_random_like,
 )
-from .prompts import PromptExample, build_prompt_examples, calibration_manifest, sample_calibration_ids
+from .prompts import PromptExample, build_prompt_examples, calibration_manifest, prompt_affixes, sample_calibration_ids
 from .runtime import import_torch, load_model_and_tokenizer, runtime_stack_snapshot, verify_model_contract
 from .types import CaptureCondition, ExampleCaptureBundle, LayerCapture, PassCapture, RopeMode
 
@@ -190,12 +190,7 @@ class InstrumentedQwen3MoeExperiment:
         )["input_ids"]
         for example, text_ids in zip(examples, text_ids_batch):
             if example.kind not in self._prompt_affix_cache:
-                prefix = "Query: " if example.kind == "query" else "Context: "
-                suffix = (
-                    " Compress the Query in one word:"
-                    if example.kind == "query"
-                    else " Compress the Context in one word:"
-                )
+                prefix, suffix = prompt_affixes(example.kind, self.spec.prompts)
                 self._prompt_affix_cache[example.kind] = (
                     self.tokenizer(prefix, add_special_tokens=False)["input_ids"],
                     self.tokenizer(suffix, add_special_tokens=False)["input_ids"],

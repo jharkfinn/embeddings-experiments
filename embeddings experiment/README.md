@@ -42,6 +42,9 @@ FP8 + FlexAttention stack for the active teacher-forcing path; do not substitute
 older Transformers builds or unpinned CUDA wheels unless you are prepared to
 revalidate the runtime contract.
 
+`default_experiment.json` is now aligned with the active teacher-forcing main path.
+Use the explicit split specs when you want calibration, controls, or bridge runs.
+
 ## CLI
 
 ### Verify model contract
@@ -73,17 +76,8 @@ Build a reproducible 3-task records file first:
 python build_nanobeir_records.py --output records_nanobeir_3tasks.json
 ```
 
-```bash
-python run_kv_prepend_experiment.py \
-  --spec default_experiment.json \
-  collect \
-  --records-json records.json \
-  --dataset-name scifact_slice \
-  --run-controls \
-  --run-bridge
-```
-
-For the lean Thunder main run, use the generated teacher-forced HF spec:
+For the lean Thunder main run, use the default active spec or the generated
+teacher-forced HF spec:
 
 ```bash
 python run_kv_prepend_experiment.py \
@@ -92,6 +86,9 @@ python run_kv_prepend_experiment.py \
   --records-json records_nanobeir_3tasks.json \
   --dataset-name nanobeir_3tasks
 ```
+
+For calibration, controls, and bridge, use the generated split specs instead of
+the default main spec.
 
 `records.json` is a list of objects with:
 

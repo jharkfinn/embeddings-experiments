@@ -25,6 +25,15 @@ def format_compression_prompt(text: str, kind: str, prompt_spec) -> str:
     return prompt_spec.context_template.format(text=text)
 
 
+def prompt_affixes(kind: str, prompt_spec) -> tuple[str, str]:
+    template = prompt_spec.query_template if kind == "query" else prompt_spec.context_template
+    marker = "{text}"
+    if marker not in template:
+        raise ValueError(f"Prompt template for kind={kind} must contain {marker!r}")
+    prefix, suffix = template.split(marker, 1)
+    return prefix, suffix
+
+
 def build_prompt_examples(records, prompt_spec, calibration_ids=None):
     calibration_ids = set(calibration_ids or [])
     examples = []

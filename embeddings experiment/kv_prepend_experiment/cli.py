@@ -143,6 +143,7 @@ def cmd_evaluate_suite(spec: ExperimentSpec, root: Path, args):
         fusion_weights=spec.evaluation.fusion_weights,
         rrf_k=spec.evaluation.rrf_k,
         candidate_pool_k=spec.evaluation.candidate_pool_k,
+        topn_layers_for_grouping=spec.evaluation.topn_layers_for_grouping,
     )
     out_dir = root / spec.output.evaluation_dir
     out_dir.mkdir(parents=True, exist_ok=True)
