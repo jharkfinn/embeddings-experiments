@@ -44,7 +44,7 @@ class CollectionSpec:
     pad_main_batches_to_streaming_size: bool = True
     attention_backend: str = "sdpa"
     enable_attention_compile: bool = True
-    attention_compile_mode: str = "reduce-overhead"
+    attention_compile_mode: str = "default"
     attention_compile_fullgraph: bool = False
     sort_by_length: bool = True
     writer_queue_size: int = 4

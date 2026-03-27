@@ -15,7 +15,7 @@
     "attention_backend": "sdpa",
     "enable_attention_compile": true,
     "attention_compile_fullgraph": false,
-    "attention_compile_mode": "reduce-overhead",
+    "attention_compile_mode": "default",
     "capture_attention_weights_for_all_layers": false,
     "capture_q_vectors": true,
     "controls_storage_mode": "summary_only",

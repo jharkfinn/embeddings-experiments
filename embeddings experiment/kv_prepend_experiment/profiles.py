@@ -30,7 +30,7 @@ def build_main_hf_teacher_forcing_spec(base: ExperimentSpec) -> ExperimentSpec:
     spec.collection.sequence_length_buckets = [128, 256, 384, 512, 768, 1024, 1536, 2048]
     spec.collection.pad_main_batches_to_streaming_size = True
     spec.collection.enable_attention_compile = True
-    spec.collection.attention_compile_mode = "reduce-overhead"
+    spec.collection.attention_compile_mode = "default"
     spec.collection.attention_compile_fullgraph = False
     spec.collection.main_dense_layers = list(MAIN_DENSE_LAYERS)
     spec.collection.main_router_layers = list(MAIN_ROUTER_LAYERS)

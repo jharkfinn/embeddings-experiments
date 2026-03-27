@@ -2,7 +2,7 @@
   "collection": {
     "attention_backend": "sdpa",
     "attention_compile_fullgraph": false,
-    "attention_compile_mode": "reduce-overhead",
+    "attention_compile_mode": "default",
     "attention_weight_layers": [
       15,
       23,

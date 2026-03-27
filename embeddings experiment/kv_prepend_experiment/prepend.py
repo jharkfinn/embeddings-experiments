@@ -14,7 +14,7 @@ class PrependResult:
 
 
 _ATTENTION_COMPILE_ENABLED = False
-_ATTENTION_COMPILE_MODE = "reduce-overhead"
+_ATTENTION_COMPILE_MODE = "default"
 _ATTENTION_COMPILE_FULLGRAPH = False
 _ATTENTION_BACKEND = "sdpa"
 
@@ -22,7 +22,7 @@ _ATTENTION_BACKEND = "sdpa"
 def configure_attention_runtime(
     *,
     enabled: bool,
-    mode: str = "reduce-overhead",
+    mode: str = "default",
     fullgraph: bool = False,
     backend: str = "sdpa",
 ):
@@ -35,7 +35,7 @@ def configure_attention_runtime(
     _get_prepend_sdpa_kernel.cache_clear()
 
 
-def configure_attention_compile(*, enabled: bool, mode: str = "reduce-overhead", fullgraph: bool = False):
+def configure_attention_compile(*, enabled: bool, mode: str = "default", fullgraph: bool = False):
     configure_attention_runtime(enabled=enabled, mode=mode, fullgraph=fullgraph, backend=_ATTENTION_BACKEND)
 
 

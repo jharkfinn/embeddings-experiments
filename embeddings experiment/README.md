@@ -142,8 +142,9 @@ python run_kv_prepend_experiment.py \
 - The active main fast path uses a strict `flex_packed` attention backend for
   no-weight collection, with packed per-document attention segments and no
   eager/CPU fallback path.
-- `torch.compile` is applied to the packed no-weight attention kernel, and the
-  main run also uses fixed sequence-length buckets for compile stability.
+- `torch.compile` is applied to the packed no-weight attention kernel in the
+  standard default mode, and the main run also uses fixed sequence-length
+  buckets for compile stability.
 - Calibration, controls, and bridge runs stay on the exact `sdpa` path because
   they need dense attention weights and richer exact captures.
 - The collector runs decoder layers directly so it can compute causal and prepend
