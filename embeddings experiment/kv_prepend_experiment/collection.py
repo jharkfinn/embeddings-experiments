@@ -895,6 +895,8 @@ class InstrumentedQwen3MoeExperiment:
     ):
         torch = import_torch()
         with torch.inference_mode():
+            if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                torch.compiler.cudagraph_mark_step_begin()
             batch_size, seq_len = input_ids.shape
             model_core = self.model.model
             if initial_hidden_states is None:
@@ -978,6 +980,8 @@ class InstrumentedQwen3MoeExperiment:
     def _forward_summary_only(self, input_ids, attention_mask):
         torch = import_torch()
         with torch.inference_mode():
+            if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                torch.compiler.cudagraph_mark_step_begin()
             batch_size, seq_len = input_ids.shape
             model_core = self.model.model
             hidden_states = model_core.embed_tokens(input_ids.to(self._model_input_device()))

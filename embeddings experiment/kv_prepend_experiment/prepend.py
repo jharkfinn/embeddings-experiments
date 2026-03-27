@@ -203,7 +203,7 @@ def _cached_flex_block_mask(
         Q_LEN=total_q,
         KV_LEN=total_k,
         device=device,
-        _compile=True,
+        _compile=False,
     )
 
 
