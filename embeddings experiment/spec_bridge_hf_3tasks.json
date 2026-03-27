@@ -118,6 +118,7 @@
       "fiqa2018",
       "quoraretrieval"
     ],
+    "fixed_group_layers": [],
     "fusion_weights": [
       0.0,
       0.01,
@@ -128,6 +129,7 @@
       0.5,
       1.0
     ],
+    "layer_grouping_policy": "all_selected_layers",
     "long_context_dataset": "scifact",
     "nanobeir_repo": "zeta-alpha-ai/NanoBEIR",
     "rrf_k": 60,

@@ -102,6 +102,8 @@ class EvaluationSpec:
     candidate_pool_k: int = 100
     selected_layers: list[int] = field(default_factory=lambda: list(range(48)))
     topn_layers_for_grouping: int = 3
+    layer_grouping_policy: str = "all_selected_layers"
+    fixed_group_layers: list[int] = field(default_factory=list)
 
 
 @dataclass

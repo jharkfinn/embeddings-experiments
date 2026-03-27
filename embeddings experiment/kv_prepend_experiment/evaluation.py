@@ -343,6 +343,8 @@ def evaluate_signal_family(
     signal_name: str,
     selected_layers: list[int],
     topn_layers_for_grouping: int,
+    layer_grouping_policy: str,
+    fixed_group_layers: list[int],
     quantization_spec,
 ):
     bundle_lookup = {bundle.text_id: bundle for bundle in iter_bundles(capture_dir)}
@@ -372,14 +374,30 @@ def evaluate_signal_family(
     ranked_single = sorted(per_layer, key=lambda item: item["single_vector_ndcg_at_10"], reverse=True)
     ranked_multi = sorted(per_layer, key=lambda item: item["multivector_ndcg_at_10"], reverse=True)
     topn = max(1, int(topn_layers_for_grouping))
-    top3_single_layers = [entry["layer_indices"][0] for entry in ranked_single[:topn]]
-    top3_multi_layers = [entry["layer_indices"][0] for entry in ranked_multi[:topn]]
+    topn_single_layers = [entry["layer_indices"][0] for entry in ranked_single[:topn]]
+    topn_multi_layers = [entry["layer_indices"][0] for entry in ranked_multi[:topn]]
+    if layer_grouping_policy == "in_task_topn_from_per_layer_scores":
+        grouped_single_layers = topn_single_layers
+        grouped_multi_layers = topn_multi_layers
+    elif layer_grouping_policy == "fixed_group_layers":
+        fixed_layers = [layer for layer in fixed_group_layers if layer in available_layers]
+        if not fixed_layers:
+            raise ValueError("layer_grouping_policy=fixed_group_layers requires at least one available fixed_group_layer")
+        grouped_single_layers = fixed_layers
+        grouped_multi_layers = fixed_layers
+    elif layer_grouping_policy == "all_selected_layers":
+        grouped_single_layers = available_layers
+        grouped_multi_layers = available_layers
+    else:
+        raise ValueError(f"Unknown layer_grouping_policy: {layer_grouping_policy}")
     grouped = {
         "per_layer": per_layer,
         "layer_grouping_topn": topn,
-        "layer_selection_policy": "in_task_topn_from_per_layer_scores",
-        "grouped_single_layers": top3_single_layers,
-        "grouped_multi_layers": top3_multi_layers,
+        "layer_selection_policy": layer_grouping_policy,
+        "diagnostic_in_task_topn_single_layers": topn_single_layers,
+        "diagnostic_in_task_topn_multi_layers": topn_multi_layers,
+        "grouped_single_layers": grouped_single_layers,
+        "grouped_multi_layers": grouped_multi_layers,
         "grouped_single": evaluate_signal(
             capture_dir=capture_dir,
             task_name=task_name,
@@ -387,7 +405,7 @@ def evaluate_signal_family(
             pass_name=pass_name,
             condition=condition,
             signal_name=signal_name,
-            layer_indices=top3_single_layers,
+            layer_indices=grouped_single_layers,
             quantization_spec=quantization_spec,
         ),
         "grouped_multi": evaluate_signal(
@@ -397,7 +415,7 @@ def evaluate_signal_family(
             pass_name=pass_name,
             condition=condition,
             signal_name=signal_name,
-            layer_indices=top3_multi_layers,
+            layer_indices=grouped_multi_layers,
             quantization_spec=quantization_spec,
         ),
         "all_layers": evaluate_signal(
@@ -527,6 +545,8 @@ def evaluate_task_suite(
     rrf_k: int,
     candidate_pool_k: int,
     topn_layers_for_grouping: int,
+    layer_grouping_policy: str,
+    fixed_group_layers: list[int],
 ):
     signals = [
         ("attention_output", "pass1", CaptureCondition.CAUSAL.value),
@@ -564,6 +584,8 @@ def evaluate_task_suite(
             signal_name=signal_name,
             selected_layers=selected_layers,
             topn_layers_for_grouping=topn_layers_for_grouping,
+            layer_grouping_policy=layer_grouping_policy,
+            fixed_group_layers=fixed_group_layers,
             quantization_spec=quantization_spec,
         )
     task = load_nanobeir_task(repo_name, task_name)

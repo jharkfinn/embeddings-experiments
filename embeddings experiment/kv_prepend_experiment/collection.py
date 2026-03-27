@@ -85,6 +85,23 @@ def _causal_attention_mask(attention_mask, batch_size: int, seq_len: int, device
     return mask
 
 
+def _last_token_positions(attention_mask):
+    torch = import_torch()
+    token_counts = attention_mask.sum(dim=1).to(dtype=torch.long)
+    return torch.clamp(token_counts - 1, min=0)
+
+
+def _gather_last_hidden(hidden_states, last_positions):
+    torch = import_torch()
+    batch_index = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+    return hidden_states[batch_index, last_positions, :]
+
+
+def _gather_last_kv(seq_tensor, last_positions):
+    index = last_positions.view(-1, 1, 1, 1).expand(-1, seq_tensor.shape[1], 1, seq_tensor.shape[3])
+    return seq_tensor.gather(2, index).squeeze(2)
+
+
 class CollectionWriter:
     def __init__(self, root: str | Path, queue_size: int = 4):
         self.root = Path(root)
@@ -355,13 +372,10 @@ class InstrumentedQwen3MoeExperiment:
         current: list[PromptExample] = []
         current_max = 0
         for example in ordered:
-            if example.calibration:
-                if current:
-                    yield current
-                    current = []
-                    current_max = 0
-                yield [example]
-                continue
+            if current and bool(current[0].calibration) != bool(example.calibration):
+                yield current
+                current = []
+                current_max = 0
             proposed_max = max(current_max, int(example.token_count or 0))
             proposed_size = len(current) + 1
             exceeds_size = proposed_size > self.spec.collection.streaming_batch_size
@@ -984,15 +998,25 @@ class InstrumentedQwen3MoeExperiment:
             causal_mask = _causal_attention_mask(attention_mask, batch_size, seq_len, hidden_states.device, hidden_states.dtype)
             position_embeddings = model_core.rotary_emb(hidden_states, position_ids=position_ids)
             summaries = {}
-            token_counts = attention_mask.sum(dim=1).to(device=hidden_states.device, dtype=torch.int32)
+            last_positions = _last_token_positions(attention_mask.to(device=hidden_states.device))
+            token_counts = (last_positions + 1).to(dtype=torch.int32)
             for layer_idx, layer in enumerate(model_core.layers):
                 residual = hidden_states
                 normed_hidden = layer.input_layernorm(hidden_states)
                 q_pre, k_pre, q_rot, k_rot, v_raw, _, _ = self._project_qkv(layer.self_attn, normed_hidden, position_embeddings)
                 summaries[layer_idx] = {
-                    "final_token_k_rot": _to_cpu(k_rot[..., -1, :], dtype=_storage_dtype("final_token_k_rot", calibration=False)),
-                    "final_token_k_raw": _to_cpu(k_pre[..., -1, :], dtype=_storage_dtype("final_token_k_raw", calibration=False)),
-                    "final_token_v": _to_cpu(v_raw[..., -1, :], dtype=_storage_dtype("final_token_v", calibration=False)),
+                    "final_token_k_rot": _to_cpu(
+                        _gather_last_kv(k_rot, last_positions),
+                        dtype=_storage_dtype("final_token_k_rot", calibration=False),
+                    ),
+                    "final_token_k_raw": _to_cpu(
+                        _gather_last_kv(k_pre, last_positions),
+                        dtype=_storage_dtype("final_token_k_raw", calibration=False),
+                    ),
+                    "final_token_v": _to_cpu(
+                        _gather_last_kv(v_raw, last_positions),
+                        dtype=_storage_dtype("final_token_v", calibration=False),
+                    ),
                 }
                 causal = attention_forward(
                     layer.self_attn,
@@ -1009,28 +1033,45 @@ class InstrumentedQwen3MoeExperiment:
                 mlp_out, _, _ = self._run_moe(layer.mlp, layer.post_attention_layernorm(post))
                 hidden_states = post + mlp_out
             hidden_states = model_core.norm(hidden_states)
-            return summaries, hidden_states
+            return summaries, _gather_last_hidden(hidden_states, last_positions)
 
-    def collect_multi_slot_summaries(self, example: PromptExample):
+    def collect_multi_slot_summaries_batch(self, batch_examples: list[PromptExample]):
         self._ensure_loaded()
         torch = import_torch()
-        if example.prompt_token_ids is None:
-            self.annotate_examples([example])
-        input_ids = torch.tensor([list(example.prompt_token_ids or [])], device=self._model_input_device(), dtype=torch.long)
-        attention_mask = torch.ones_like(input_ids)
-        all_slots = {}
+        if not batch_examples:
+            return []
+        for example in batch_examples:
+            if example.prompt_token_ids is None:
+                self.annotate_examples([example])
+        sequences = [list(example.prompt_token_ids or []) for example in batch_examples]
+        pad_token_id = int(self.tokenizer.pad_token_id)
+        all_slots = [dict() for _ in batch_examples]
         for _ in range(1 + self.spec.collection.multi_slot_decode_steps):
-            summaries, hidden_states = self._forward_summary_only(input_ids, attention_mask)
-            for layer_idx, layer_summary in summaries.items():
-                all_slots.setdefault(layer_idx, {"k": [], "k_pre": [], "v": []})
-                all_slots[layer_idx]["k"].append(layer_summary["final_token_k_rot"])
-                all_slots[layer_idx]["k_pre"].append(layer_summary["final_token_k_raw"])
-                all_slots[layer_idx]["v"].append(layer_summary["final_token_v"])
-            next_logits = self.model.lm_head(hidden_states[:, -1, :])
-            next_token = next_logits.argmax(dim=-1, keepdim=True)
-            input_ids = torch.cat([input_ids, next_token], dim=1)
-            attention_mask = torch.cat([attention_mask, torch.ones_like(next_token)], dim=1)
+            max_len = max(len(tokens) for tokens in sequences)
+            input_ids = torch.full((len(sequences), max_len), pad_token_id, device=self._model_input_device(), dtype=torch.long)
+            attention_mask = torch.zeros_like(input_ids)
+            for row_idx, token_ids in enumerate(sequences):
+                if token_ids:
+                    length = len(token_ids)
+                    input_ids[row_idx, :length] = torch.tensor(token_ids, device=input_ids.device, dtype=torch.long)
+                    attention_mask[row_idx, :length] = 1
+            summaries, last_hidden = self._forward_summary_only(input_ids, attention_mask)
+            split_summaries = self._split_summary_batch(summaries, batch_examples)
+            for row_idx, per_example_summary in enumerate(split_summaries):
+                for layer_idx, layer_summary in per_example_summary.items():
+                    all_slots[row_idx].setdefault(layer_idx, {"k": [], "k_pre": [], "v": []})
+                    all_slots[row_idx][layer_idx]["k"].append(layer_summary["final_token_k_rot"])
+                    all_slots[row_idx][layer_idx]["k_pre"].append(layer_summary["final_token_k_raw"])
+                    all_slots[row_idx][layer_idx]["v"].append(layer_summary["final_token_v"])
+            next_logits = self.model.lm_head(last_hidden)
+            next_tokens = next_logits.argmax(dim=-1).tolist()
+            for token_ids, next_token in zip(sequences, next_tokens):
+                token_ids.append(int(next_token))
         return all_slots
+
+    def collect_multi_slot_summaries(self, example: PromptExample):
+        batch_outputs = self.collect_multi_slot_summaries_batch([example])
+        return batch_outputs[0] if batch_outputs else {}
 
     def _shuffle_text(self, text: str) -> str:
         words = text.split()
@@ -1077,9 +1118,11 @@ class InstrumentedQwen3MoeExperiment:
         external_summaries: list[dict[int, dict[str, Any]]] | None = None,
         target_subdir: str | None = None,
         write_batches: bool = True,
+        retain_bundles: bool = True,
     ):
         self._ensure_loaded()
         examples = self.prepare_examples(records)
+        self._write_calibration_manifest(dataset_name)
         self.annotate_examples(examples)
         path_list: list[Path] = []
         all_bundles: list[ExampleCaptureBundle] = []
@@ -1139,6 +1182,11 @@ class InstrumentedQwen3MoeExperiment:
             )
             pass1_split = self._split_pass_capture(pass1_batched, batch_examples)
             pass2_split = self._split_pass_capture(pass2_batched, batch_examples)
+            batch_multi_slot = {}
+            calibration_examples = [example for example in batch_examples if example.calibration]
+            if calibration_examples:
+                for example, multi_slot in zip(calibration_examples, self.collect_multi_slot_summaries_batch(calibration_examples)):
+                    batch_multi_slot[example.text_id] = multi_slot
             batch_bundles: list[ExampleCaptureBundle] = []
             for row_idx, example in enumerate(batch_examples):
                 bundle = ExampleCaptureBundle(
@@ -1152,7 +1200,7 @@ class InstrumentedQwen3MoeExperiment:
                     metadata={"calibration": example.calibration, "tags": list(example.tags)},
                 )
                 if example.calibration:
-                    bundle.metadata["multi_slot_summaries"] = self.collect_multi_slot_summaries(example)
+                    bundle.metadata["multi_slot_summaries"] = batch_multi_slot[example.text_id]
                 batch_bundles.append(bundle)
             batch_id = f"{dataset_name}_{control_summary_mode or 'main'}_{batch_index}_{len(batch_bundles)}_{uuid.uuid4().hex[:8]}"
             if write_batches:
@@ -1170,7 +1218,8 @@ class InstrumentedQwen3MoeExperiment:
                     target_subdir=target,
                 )
                 path_list.append(path)
-            all_bundles.extend(batch_bundles)
+            if retain_bundles:
+                all_bundles.extend(batch_bundles)
         return path_list, all_bundles
 
     def run_controls(self, records: list[dict[str, Any]], dataset_name: str = "custom_controls"):

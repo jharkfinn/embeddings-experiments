@@ -97,7 +97,8 @@ def cmd_collect(spec: ExperimentSpec, root: Path, args):
     experiment = InstrumentedQwen3MoeExperiment(spec, root)
     experiment.load()
     spec_path = experiment.save_spec_snapshot()
-    paths, _ = experiment.collect_examples(records, dataset_name=args.dataset_name)
+    need_bundles = bool(args.run_controls or args.run_bridge)
+    paths, _ = experiment.collect_examples(records, dataset_name=args.dataset_name, retain_bundles=need_bundles)
     payload = {"main_captures": [str(path) for path in paths], "spec_snapshot": str(spec_path)}
     if args.run_controls:
         payload["controls"] = experiment.run_controls(records, dataset_name=f"{args.dataset_name}_controls")
@@ -144,6 +145,8 @@ def cmd_evaluate_suite(spec: ExperimentSpec, root: Path, args):
         rrf_k=spec.evaluation.rrf_k,
         candidate_pool_k=spec.evaluation.candidate_pool_k,
         topn_layers_for_grouping=spec.evaluation.topn_layers_for_grouping,
+        layer_grouping_policy=spec.evaluation.layer_grouping_policy,
+        fixed_group_layers=spec.evaluation.fixed_group_layers,
     )
     out_dir = root / spec.output.evaluation_dir
     out_dir.mkdir(parents=True, exist_ok=True)

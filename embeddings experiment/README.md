@@ -158,6 +158,11 @@ python run_kv_prepend_experiment.py \
 - The bridge experiment reuses the same collector with echo-formatted prompts.
 - Controls and bridge default to summary-only storage, so they keep comparative
   analysis outputs without writing full capture bundles.
+- Evaluation now includes summary-memory signal families:
+  `summary_value`, `summary_key_rot`, `summary_key_raw`, and `summary_memory`.
+- Grouped layer reporting defaults to `all_selected_layers`; in-task top-N layer
+  selection is kept as diagnostic output and is labeled explicitly in the saved
+  evaluation results.
 - Calibration subset selection is now deterministic and order-invariant: a
   stable hash keyed by `seed + dataset_name + kind + text_id + text`, stratified
   by dataset and doc/query kind. The selected IDs are written under

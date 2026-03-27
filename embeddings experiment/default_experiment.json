@@ -131,6 +131,8 @@
     "long_context_dataset": "scifact",
     "nanobeir_repo": "zeta-alpha-ai/NanoBEIR",
     "rrf_k": 60,
+    "layer_grouping_policy": "all_selected_layers",
+    "fixed_group_layers": [],
     "selected_layers": [
       0,
       1,
