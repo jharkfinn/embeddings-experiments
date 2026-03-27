@@ -1,0 +1,22 @@
+[
+  {
+    "text_id": "doc-1",
+    "kind": "doc",
+    "text": "SciFact studies often compare scientific claims against short evidence abstracts."
+  },
+  {
+    "text_id": "doc-2",
+    "kind": "doc",
+    "text": "Financial question answering needs precise phrase alignment for entity and number mentions."
+  },
+  {
+    "text_id": "query-1",
+    "kind": "query",
+    "text": "Which document mentions scientific claims and evidence abstracts?"
+  },
+  {
+    "text_id": "query-2",
+    "kind": "query",
+    "text": "Which text talks about financial question answering and entity mentions?"
+  }
+]
