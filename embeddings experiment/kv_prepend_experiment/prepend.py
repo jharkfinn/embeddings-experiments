@@ -136,7 +136,19 @@ def attention_forward(
         query_f = query_states.contiguous().float()
         key_f = key_repeated.contiguous().float()
         value_f = value_repeated.contiguous().float()
-        attn_scores = torch.matmul(query_f, key_f.transpose(2, 3)) * float(module.scaling)
+        try:
+            attn_scores = torch.matmul(query_f, key_f.transpose(2, 3)) * float(module.scaling)
+        except Exception as exc:  # pragma: no cover - debug path
+            raise RuntimeError(
+                "Replay attention matmul failed with "
+                f"q={tuple(query_f.shape)}/{query_f.dtype}/{query_f.device}, "
+                f"k={tuple(key_f.shape)}/{key_f.dtype}/{key_f.device}, "
+                f"v={tuple(value_f.shape)}/{value_f.dtype}/{value_f.device}, "
+                f"mask={None if used_mask is None else (tuple(used_mask.shape), used_mask.dtype, used_mask.device)}, "
+                f"num_kv_groups={getattr(module, 'num_key_value_groups', None)}, "
+                f"num_heads={getattr(module, 'num_heads', None)}, "
+                f"num_kv_heads={getattr(module, 'num_kv_heads', None)}"
+            ) from exc
         if used_mask is not None:
             attn_scores = attn_scores + used_mask.to(device=attn_scores.device, dtype=attn_scores.dtype)
         attn_probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32)
