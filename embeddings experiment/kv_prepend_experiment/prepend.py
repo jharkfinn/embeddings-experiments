@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from functools import lru_cache
 
 
 @dataclass
@@ -11,6 +12,20 @@ class PrependResult:
     beta: "torch.Tensor | None"
     summary_key: "torch.Tensor"
     summary_value: "torch.Tensor"
+
+
+_ATTENTION_COMPILE_ENABLED = False
+_ATTENTION_COMPILE_MODE = "reduce-overhead"
+_ATTENTION_COMPILE_FULLGRAPH = False
+
+
+def configure_attention_compile(*, enabled: bool, mode: str = "reduce-overhead", fullgraph: bool = False):
+    global _ATTENTION_COMPILE_ENABLED, _ATTENTION_COMPILE_MODE, _ATTENTION_COMPILE_FULLGRAPH
+    _ATTENTION_COMPILE_ENABLED = bool(enabled)
+    _ATTENTION_COMPILE_MODE = str(mode)
+    _ATTENTION_COMPILE_FULLGRAPH = bool(fullgraph)
+    _get_plain_sdpa_kernel.cache_clear()
+    _get_prepend_sdpa_kernel.cache_clear()
 
 
 def rotate_half(x):
@@ -27,6 +42,59 @@ def repeat_kv(hidden_states, n_rep: int):
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def _plain_sdpa_no_weights(query_states, key_repeated, value_repeated, attn_mask):
+    import torch.nn.functional as F
+
+    return F.scaled_dot_product_attention(
+        query_states,
+        key_repeated,
+        value_repeated,
+        attn_mask=attn_mask,
+        dropout_p=0.0,
+    )
+
+
+def _prepend_sdpa_no_weights(query_states, key_states, value_states, summary_key, summary_value, attn_mask, num_key_value_groups: int):
+    import torch
+    import torch.nn.functional as F
+
+    used_key = torch.cat([summary_key, key_states], dim=2)
+    used_value = torch.cat([summary_value, value_states], dim=2)
+    key_repeated = repeat_kv(used_key, num_key_value_groups)
+    value_repeated = repeat_kv(used_value, num_key_value_groups)
+    return F.scaled_dot_product_attention(
+        query_states,
+        key_repeated,
+        value_repeated,
+        attn_mask=attn_mask,
+        dropout_p=0.0,
+    )
+
+
+@lru_cache(maxsize=8)
+def _get_plain_sdpa_kernel(enabled: bool, mode: str, fullgraph: bool):
+    import torch
+
+    if enabled and hasattr(torch, "compile"):
+        try:
+            return torch.compile(_plain_sdpa_no_weights, mode=mode, fullgraph=fullgraph)
+        except Exception:  # pragma: no cover - compile availability varies by build
+            return _plain_sdpa_no_weights
+    return _plain_sdpa_no_weights
+
+
+@lru_cache(maxsize=8)
+def _get_prepend_sdpa_kernel(enabled: bool, mode: str, fullgraph: bool):
+    import torch
+
+    if enabled and hasattr(torch, "compile"):
+        try:
+            return torch.compile(_prepend_sdpa_no_weights, mode=mode, fullgraph=fullgraph)
+        except Exception:  # pragma: no cover - compile availability varies by build
+            return _prepend_sdpa_no_weights
+    return _prepend_sdpa_no_weights
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim: int = 1):
@@ -125,9 +193,9 @@ def attention_forward(
         used_value = torch.cat([summary_value, value_states], dim=2)
         used_mask = build_prepend_attention_mask(attention_mask, query_states.shape[2], num_slots=1)
 
-    key_repeated = repeat_kv(used_key, module.num_key_value_groups)
-    value_repeated = repeat_kv(used_value, module.num_key_value_groups)
     if return_weights:
+        key_repeated = repeat_kv(used_key, module.num_key_value_groups)
+        value_repeated = repeat_kv(used_value, module.num_key_value_groups)
         attn_weights = torch.matmul(query_states, key_repeated.transpose(2, 3)) * module.scaling
         if used_mask is not None:
             attn_weights = attn_weights + used_mask
@@ -135,19 +203,42 @@ def attention_forward(
         attn_output = torch.matmul(attn_weights, value_repeated)
     else:
         try:
-            attn_output = F.scaled_dot_product_attention(
-                query_states.contiguous(),
-                key_repeated.contiguous(),
-                value_repeated.contiguous(),
-                attn_mask=used_mask,
-                dropout_p=0.0,
-            )
+            compile_enabled = bool(_ATTENTION_COMPILE_ENABLED and query_states.is_cuda)
+            if prepend_mode is None:
+                key_repeated = repeat_kv(used_key, module.num_key_value_groups)
+                value_repeated = repeat_kv(used_value, module.num_key_value_groups)
+                kernel = _get_plain_sdpa_kernel(
+                    compile_enabled,
+                    _ATTENTION_COMPILE_MODE,
+                    _ATTENTION_COMPILE_FULLGRAPH,
+                )
+                attn_output = kernel(
+                    query_states.contiguous(),
+                    key_repeated.contiguous(),
+                    value_repeated.contiguous(),
+                    used_mask,
+                )
+            else:
+                kernel = _get_prepend_sdpa_kernel(
+                    compile_enabled,
+                    _ATTENTION_COMPILE_MODE,
+                    _ATTENTION_COMPILE_FULLGRAPH,
+                )
+                attn_output = kernel(
+                    query_states.contiguous(),
+                    key_states.contiguous(),
+                    value_states.contiguous(),
+                    summary_key.contiguous(),
+                    summary_value.contiguous(),
+                    used_mask,
+                    int(module.num_key_value_groups),
+                )
         except Exception:
             use_cpu_fallback = os.environ.get("KV_PREPEND_REPLAY_ATTENTION_CPU", "0") == "1"
             target_device = query_states.device
             query_f = query_states.contiguous().float()
-            key_f = key_repeated.contiguous().float()
-            value_f = value_repeated.contiguous().float()
+            key_f = repeat_kv(used_key, module.num_key_value_groups).contiguous().float()
+            value_f = repeat_kv(used_value, module.num_key_value_groups).contiguous().float()
             mask_f = used_mask
             if use_cpu_fallback:
                 query_f = query_f.cpu()

@@ -1,5 +1,7 @@
 {
   "collection": {
+    "attention_compile_fullgraph": false,
+    "attention_compile_mode": "reduce-overhead",
     "attention_weight_layers": [
       15,
       23,
@@ -16,6 +18,7 @@
     "capture_q_vectors": true,
     "controls_storage_mode": "summary_only",
     "default_rope_mode": "reuse_rotated",
+    "enable_attention_compile": false,
     "main_capture_signals": [
       "attention_output",
       "pre_moe",
@@ -81,6 +84,7 @@
     ],
     "max_batch_tokens": 4096,
     "multi_slot_decode_steps": 3,
+    "pad_main_batches_to_streaming_size": true,
     "propagate_from_layer": 16,
     "random_seed": 0,
     "rope_modes": [
@@ -92,6 +96,16 @@
     "run_controls": false,
     "runtime_backend": "hf",
     "save_every_batch": true,
+    "sequence_length_buckets": [
+      128,
+      256,
+      384,
+      512,
+      768,
+      1024,
+      1536,
+      2048
+    ],
     "sort_by_length": true,
     "streaming_batch_size": 2,
     "writer_queue_size": 4

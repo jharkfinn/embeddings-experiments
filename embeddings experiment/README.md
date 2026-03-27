@@ -127,6 +127,11 @@ python run_kv_prepend_experiment.py \
 - The main HF path is optimized around dynamic token-budget batching, manual
   padding of pretokenized prompts, pass-2 reuse of the pass-1 prefix states,
   and no attention-weight materialization on lean branches.
+- The active performance path uses `torch.compile` on the no-weight rerouted
+  attention kernels plus fixed sequence-length buckets for compile stability.
+- I did not add naive block-diagonal sequence packing to the dense SDPA path,
+  because on this kernel it would increase quadratic attention work instead of
+  reducing it. The safe performance substitute here is compile-stable bucketing.
 - The collector runs decoder layers directly so it can compute causal and prepend
   variants from the same Q/K/V projections and store fp8-first capture tensors.
 - Encoding stays an evaluation-time decision: signed trinary, positive-only router

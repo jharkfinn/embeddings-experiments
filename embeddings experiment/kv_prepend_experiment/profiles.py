@@ -26,6 +26,11 @@ def build_main_hf_teacher_forcing_spec(base: ExperimentSpec) -> ExperimentSpec:
     spec.collection.run_bridge = False
     spec.collection.streaming_batch_size = max(spec.collection.streaming_batch_size, 16)
     spec.collection.max_batch_tokens = max(spec.collection.max_batch_tokens, 8192)
+    spec.collection.sequence_length_buckets = [128, 256, 384, 512, 768, 1024, 1536, 2048]
+    spec.collection.pad_main_batches_to_streaming_size = True
+    spec.collection.enable_attention_compile = True
+    spec.collection.attention_compile_mode = "reduce-overhead"
+    spec.collection.attention_compile_fullgraph = False
     spec.collection.main_dense_layers = list(MAIN_DENSE_LAYERS)
     spec.collection.main_router_layers = list(MAIN_ROUTER_LAYERS)
     spec.collection.main_capture_signals = list(MAIN_SIGNALS)
@@ -44,6 +49,7 @@ def build_calibration_hf_spec(base: ExperimentSpec) -> ExperimentSpec:
     spec = _clone_spec(base)
     spec.collection.runtime_backend = "hf"
     spec.collection.calibration_subset_size = max(spec.collection.calibration_subset_size, 100)
+    spec.collection.enable_attention_compile = False
     spec.collection.capture_q_vectors = True
     spec.collection.capture_attention_weights_for_all_layers = False
     spec.collection.run_controls = False
@@ -126,6 +132,13 @@ def describe_run(spec: ExperimentSpec, run_name: str) -> dict[str, Any]:
                 "signals": list(spec.collection.main_capture_signals),
                 "execution_mode": "batched teacher-forced HF forward passes; no generation backend",
                 "storage_policy": "fp8-first lean corpus cache; no calibration-only tensors",
+                "performance": {
+                    "attention_compile": bool(spec.collection.enable_attention_compile),
+                    "attention_compile_mode": spec.collection.attention_compile_mode,
+                    "attention_compile_fullgraph": bool(spec.collection.attention_compile_fullgraph),
+                    "sequence_length_buckets": list(spec.collection.sequence_length_buckets),
+                    "pad_main_batches_to_streaming_size": bool(spec.collection.pad_main_batches_to_streaming_size),
+                },
                 "omits": [
                     "q_pre_rope",
                     "attention_weights",

@@ -40,6 +40,11 @@ class CollectionSpec:
     multi_slot_decode_steps: int = 3
     streaming_batch_size: int = 2
     max_batch_tokens: int = 4096
+    sequence_length_buckets: list[int] = field(default_factory=lambda: [128, 256, 384, 512, 768, 1024, 1536, 2048])
+    pad_main_batches_to_streaming_size: bool = True
+    enable_attention_compile: bool = True
+    attention_compile_mode: str = "reduce-overhead"
+    attention_compile_fullgraph: bool = False
     sort_by_length: bool = True
     writer_queue_size: int = 4
     random_seed: int = 0

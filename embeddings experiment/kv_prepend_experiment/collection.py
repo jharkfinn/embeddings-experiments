@@ -7,6 +7,7 @@ import random
 import threading
 import uuid
 from dataclasses import asdict
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -15,12 +16,25 @@ from .config import ExperimentSpec
 from .prepend import (
     apply_rotary_pos_emb,
     attention_forward,
+    configure_attention_compile,
     make_prepend_summary_kv,
     matched_norm_random_like,
 )
 from .prompts import PromptExample, build_prompt_examples, calibration_manifest, sample_calibration_ids
 from .runtime import import_torch, load_model_and_tokenizer, runtime_stack_snapshot, verify_model_contract
 from .types import CaptureCondition, ExampleCaptureBundle, LayerCapture, PassCapture, RopeMode
+
+
+@lru_cache(maxsize=64)
+def _cached_base_causal_mask(seq_len: int, dtype_name: str, device_type: str, device_index: int | None):
+    torch = import_torch()
+    dtype = getattr(torch, dtype_name.split(".")[-1], None)
+    if dtype is None:
+        dtype = getattr(torch, dtype_name.replace("torch.", ""))
+    device = torch.device(device_type, device_index) if device_index is not None else torch.device(device_type)
+    neg_inf = torch.finfo(dtype).min
+    mask = torch.full((1, 1, seq_len, seq_len), neg_inf, device=device, dtype=dtype)
+    return torch.triu(mask, diagonal=1)
 
 
 def _storage_dtype(role: str, calibration: bool):
@@ -61,10 +75,10 @@ def _storage_metadata(tensor, storage_dtype) -> dict[str, Any]:
 
 def _causal_attention_mask(attention_mask, batch_size: int, seq_len: int, device, dtype):
     torch = import_torch()
-    neg_inf = torch.finfo(dtype).min
-    mask = torch.full((batch_size, 1, seq_len, seq_len), neg_inf, device=device, dtype=dtype)
-    mask = torch.triu(mask, diagonal=1)
+    base = _cached_base_causal_mask(seq_len, str(dtype), device.type, device.index)
+    mask = base.expand(batch_size, -1, -1, -1).clone()
     if attention_mask is not None:
+        neg_inf = torch.finfo(dtype).min
         attention_mask = attention_mask.to(device=device)
         pad = (1.0 - attention_mask[:, None, None, :].to(dtype)) * neg_inf
         mask = mask + pad
@@ -141,11 +155,17 @@ class InstrumentedQwen3MoeExperiment:
         self._main_capture_signals = set(self.spec.collection.main_capture_signals)
         self._attention_weight_layers = set(int(layer) for layer in self.spec.collection.attention_weight_layers)
         self._prompt_affix_cache: dict[str, tuple[list[int], list[int]]] = {}
+        self._sequence_length_buckets = sorted(int(bucket) for bucket in self.spec.collection.sequence_length_buckets)
 
     def load(self):
         self.config, self.model, self.tokenizer = load_model_and_tokenizer(self.spec.model)
         self.contract = verify_model_contract(self.config, self.model)
         self.runtime_stack = runtime_stack_snapshot()
+        configure_attention_compile(
+            enabled=self.spec.collection.enable_attention_compile,
+            mode=self.spec.collection.attention_compile_mode,
+            fullgraph=self.spec.collection.attention_compile_fullgraph,
+        )
         return self
 
     def _ensure_loaded(self):
@@ -224,26 +244,41 @@ class InstrumentedQwen3MoeExperiment:
         return False
 
     def _should_store_attention(self, layer_idx: int, calibration: bool) -> bool:
+        if not calibration:
+            return False
         if self.spec.collection.capture_attention_weights_for_all_layers:
             return True
         if calibration and layer_idx in self._attention_weight_layers:
             return True
         return layer_idx in self._attention_weight_layers
 
-    def tokenize_examples(self, examples: list[PromptExample]):
+    def _bucket_sequence_length(self, seq_len: int) -> int:
+        for bucket in self._sequence_length_buckets:
+            if seq_len <= bucket:
+                return bucket
+        return seq_len
+
+    def tokenize_examples(self, examples: list[PromptExample], *, bucket_for_main: bool = False, pad_batch_for_main: bool = False):
         self._ensure_loaded()
         torch = import_torch()
         pad_token_id = int(self.tokenizer.pad_token_id)
+        real_batch_size = len(examples)
         max_len = max(int(example.token_count or 0) for example in examples)
-        input_ids = torch.full((len(examples), max_len), pad_token_id, dtype=torch.long)
-        attention_mask = torch.zeros((len(examples), max_len), dtype=torch.long)
+        target_len = self._bucket_sequence_length(max_len) if bucket_for_main else max_len
+        target_batch_size = (
+            max(real_batch_size, int(self.spec.collection.streaming_batch_size))
+            if pad_batch_for_main
+            else real_batch_size
+        )
+        input_ids = torch.full((target_batch_size, target_len), pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((target_batch_size, target_len), dtype=torch.long)
         for row_idx, example in enumerate(examples):
             token_ids = list(example.prompt_token_ids or [])
             length = len(token_ids)
             if length:
                 input_ids[row_idx, :length] = torch.tensor(token_ids, dtype=torch.long)
                 attention_mask[row_idx, :length] = 1
-        return {"input_ids": input_ids, "attention_mask": attention_mask}
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "real_batch_size": real_batch_size}
 
     def prepare_examples(self, records: list[dict[str, Any]]):
         provisional = build_prompt_examples(records, self.spec.prompts)
@@ -351,7 +386,7 @@ class InstrumentedQwen3MoeExperiment:
         try:
             import torch
 
-            if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == batch_size:
+            if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] >= batch_size and row_idx < value.shape[0]:
                 return value[row_idx : row_idx + 1]
         except ModuleNotFoundError:  # pragma: no cover
             pass
@@ -1044,7 +1079,17 @@ class InstrumentedQwen3MoeExperiment:
         )
 
         for batch_index, batch_examples in enumerate(batched_examples):
-            encoded = self.tokenize_examples(batch_examples)
+            is_lean_main_batch = (
+                external_lookup is None
+                and control_summary_mode is None
+                and not any(example.calibration for example in batch_examples)
+                and self.spec.collection.runtime_backend == "hf_teacher_forcing"
+            )
+            encoded = self.tokenize_examples(
+                batch_examples,
+                bucket_for_main=is_lean_main_batch,
+                pad_batch_for_main=is_lean_main_batch and self.spec.collection.pad_main_batches_to_streaming_size,
+            )
             input_ids = encoded["input_ids"].to(self._model_input_device())
             attention_mask = encoded["attention_mask"].to(self._model_input_device())
             example_external = None if external_lookup is None else external_lookup[batch_examples[0].text_id]
