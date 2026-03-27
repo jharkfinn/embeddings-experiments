@@ -137,7 +137,7 @@ def attention_forward(
         key_f = key_repeated.contiguous().float()
         value_f = value_repeated.contiguous().float()
         try:
-            attn_scores = torch.matmul(query_f, key_f.transpose(2, 3)) * float(module.scaling)
+            attn_scores = torch.einsum("bhqd,bhkd->bhqk", query_f, key_f) * float(module.scaling)
         except Exception as exc:  # pragma: no cover - debug path
             raise RuntimeError(
                 "Replay attention matmul failed with "
@@ -152,7 +152,7 @@ def attention_forward(
         if used_mask is not None:
             attn_scores = attn_scores + used_mask.to(device=attn_scores.device, dtype=attn_scores.dtype)
         attn_probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32)
-        attn_output = torch.matmul(attn_probs, value_f).to(query_states.dtype)
+        attn_output = torch.einsum("bhqk,bhkd->bhqd", attn_probs, value_f).to(query_states.dtype)
         attn_weights = None
     attn_output = attn_output.transpose(1, 2).contiguous()
 
