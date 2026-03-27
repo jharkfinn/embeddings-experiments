@@ -106,10 +106,19 @@ def load_model_and_tokenizer(model_spec):
     model_cls = getattr(module, "Qwen3MoeForCausalLM")
 
     config = AutoConfig.from_pretrained(model_spec.model_name, trust_remote_code=model_spec.trust_remote_code)
+    device_map = model_spec.device_map
+    if model_spec.quantization.lower() == "fp8":
+        if device_map == "auto":
+            raise ValueError(
+                "FP8 runs must use an explicit CUDA-only device_map for this experiment. "
+                "Set model.device_map to 'cuda:0'."
+            )
+        if device_map in {"cuda", "cuda:0"}:
+            device_map = {"": 0}
     model_kwargs: dict[str, Any] = {
         "trust_remote_code": model_spec.trust_remote_code,
         "attn_implementation": model_spec.attn_implementation,
-        "device_map": model_spec.device_map,
+        "device_map": device_map,
     }
     if model_spec.torch_dtype:
         model_kwargs["torch_dtype"] = getattr(torch, model_spec.torch_dtype)

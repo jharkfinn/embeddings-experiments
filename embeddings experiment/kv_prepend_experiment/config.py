@@ -13,7 +13,7 @@ class ModelSpec:
     torch_dtype: str = "bfloat16"
     quantization: str = "fp8"
     device: str = "cuda"
-    device_map: str = "auto"
+    device_map: str = "cuda:0"
     attn_implementation: str = "eager"
     max_length: int = 2048
     trust_remote_code: bool = True
