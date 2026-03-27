@@ -64,8 +64,12 @@ def load_nanobeir_task(repo_name: str, dataset_name: str) -> RetrievalTask:
     for row in qrels_ds:
         query_id_key = _guess_column(row, ("query-id", "query_id", "query"))
         doc_id_key = _guess_column(row, ("corpus-id", "doc_id", "doc"))
-        score_key = _guess_column(row, ("score", "relevance"))
-        qrels.setdefault(str(row[query_id_key]), {})[str(row[doc_id_key])] = int(row[score_key])
+        score = 1
+        for candidate in ("score", "relevance"):
+            if candidate in row:
+                score = int(row[candidate])
+                break
+        qrels.setdefault(str(row[query_id_key]), {})[str(row[doc_id_key])] = score
 
     return RetrievalTask(dataset_name=dataset_name, corpus=corpus, queries=queries, qrels=qrels)
 
