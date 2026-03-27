@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import inspect
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 
@@ -9,7 +11,24 @@ class MissingDependencyError(RuntimeError):
     pass
 
 
+def _ensure_libcuda_on_link_path() -> None:
+    candidates = [
+        Path("/usr/lib/x86_64-linux-gnu/libcuda.so.1"),
+        Path("/usr/lib/wsl/lib/libcuda.so.1"),
+        Path("/usr/local/nvidia/lib64/libcuda.so.1"),
+    ]
+    found = next((candidate for candidate in candidates if candidate.exists()), None)
+    if found is None:
+        return
+    lib_dir = str(found.parent)
+    current = [entry for entry in os.environ.get("LD_LIBRARY_PATH", "").split(":") if entry]
+    if lib_dir not in current:
+        os.environ["LD_LIBRARY_PATH"] = ":".join([lib_dir, *current]) if current else lib_dir
+    os.environ.setdefault("TRITON_LIBCUDA_PATH", lib_dir)
+
+
 def import_torch():
+    _ensure_libcuda_on_link_path()
     try:
         import torch  # type: ignore
     except ModuleNotFoundError as exc:  # pragma: no cover - environment specific
