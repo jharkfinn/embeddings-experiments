@@ -7,7 +7,7 @@ This folder contains a self-contained implementation of the reviewed
 Everything created for this experiment lives in this folder:
 
 - `default_experiment.json`: default runtime spec
-- `spec_main_vllm_3tasks.json`: lean 3-task main-run contract
+- `spec_main_hf_teacher_forcing_3tasks.json`: lean 3-task main-run contract
 - `spec_calibration_hf_3tasks.json`: exact calibration run
 - `spec_controls_hf_3tasks.json`: control-only calibration run
 - `spec_bridge_hf_3tasks.json`: bridge echo run
@@ -22,7 +22,8 @@ The local machine does not currently have the runtime stack installed.
 ## Expected Python dependencies
 
 Install from `requirements_thunder.txt`, then add any GPU-specific wheels needed by
-your CUDA / PyTorch build.
+your CUDA / PyTorch build. `vllm` is now optional and only needed if you explicitly
+want to revisit the legacy backend code.
 
 Minimum expected packages:
 
@@ -53,7 +54,7 @@ python run_kv_prepend_experiment.py write-split-specs
 ### Describe what a run collects
 
 ```bash
-python run_kv_prepend_experiment.py describe-run --run-name main_vllm_3tasks
+python run_kv_prepend_experiment.py describe-run --run-name main_hf_teacher_forcing_3tasks
 python run_kv_prepend_experiment.py describe-run --run-name calibration_hf_3tasks
 python run_kv_prepend_experiment.py describe-run --run-name controls_hf_3tasks
 python run_kv_prepend_experiment.py describe-run --run-name bridge_hf_3tasks
@@ -71,11 +72,11 @@ python run_kv_prepend_experiment.py \
   --run-bridge
 ```
 
-For the lean Thunder main run, use the generated vLLM spec instead:
+For the lean Thunder main run, use the generated teacher-forced HF spec:
 
 ```bash
 python run_kv_prepend_experiment.py \
-  --spec spec_main_vllm_3tasks.json \
+  --spec spec_main_hf_teacher_forcing_3tasks.json \
   collect \
   --records-json records.json \
   --dataset-name scifact
@@ -122,8 +123,8 @@ python run_kv_prepend_experiment.py \
 
 ## Notes
 
-- The CLI now routes `collect` to either the HF collector or the lean vLLM main
-  collector based on `collection.runtime_backend`.
+- The default main path is now a batched teacher-forced HF collector. The older
+  vLLM path remains in the tree only as an experimental legacy backend.
 - The collector runs decoder layers directly so it can compute causal and prepend
   variants from the same Q/K/V projections and store fp8-first capture tensors.
 - Encoding stays an evaluation-time decision: signed trinary, positive-only router

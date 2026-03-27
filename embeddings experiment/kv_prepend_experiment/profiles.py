@@ -16,16 +16,16 @@ def _clone_spec(spec: ExperimentSpec) -> ExperimentSpec:
     return copy.deepcopy(spec)
 
 
-def build_main_vllm_spec(base: ExperimentSpec) -> ExperimentSpec:
+def build_main_hf_teacher_forcing_spec(base: ExperimentSpec) -> ExperimentSpec:
     spec = _clone_spec(base)
-    spec.collection.runtime_backend = "vllm"
+    spec.collection.runtime_backend = "hf_teacher_forcing"
     spec.collection.calibration_subset_size = 0
     spec.collection.capture_q_vectors = False
     spec.collection.capture_attention_weights_for_all_layers = False
     spec.collection.run_controls = False
     spec.collection.run_bridge = False
-    spec.collection.streaming_batch_size = max(spec.collection.streaming_batch_size, 32)
-    spec.collection.max_batch_tokens = max(spec.collection.max_batch_tokens, 16384)
+    spec.collection.streaming_batch_size = max(spec.collection.streaming_batch_size, 16)
+    spec.collection.max_batch_tokens = max(spec.collection.max_batch_tokens, 8192)
     spec.collection.main_dense_layers = list(MAIN_DENSE_LAYERS)
     spec.collection.main_router_layers = list(MAIN_ROUTER_LAYERS)
     spec.collection.main_capture_signals = list(MAIN_SIGNALS)
@@ -90,8 +90,9 @@ def build_bridge_hf_spec(base: ExperimentSpec) -> ExperimentSpec:
 
 
 def named_run_specs(base: ExperimentSpec) -> dict[str, ExperimentSpec]:
+    main_spec = build_main_hf_teacher_forcing_spec(base)
     return {
-        "main_vllm_3tasks": build_main_vllm_spec(base),
+        "main_hf_teacher_forcing_3tasks": main_spec,
         "calibration_hf_3tasks": build_calibration_hf_spec(base),
         "controls_hf_3tasks": build_controls_hf_spec(base),
         "bridge_hf_3tasks": build_bridge_hf_spec(base),
@@ -113,7 +114,7 @@ def _common_collection_contract() -> dict[str, Any]:
 
 def describe_run(spec: ExperimentSpec, run_name: str) -> dict[str, Any]:
     common = _common_collection_contract()
-    if run_name == "main_vllm_3tasks":
+    if run_name == "main_hf_teacher_forcing_3tasks":
         return {
             "run_name": run_name,
             "runtime_backend": spec.collection.runtime_backend,
@@ -123,6 +124,7 @@ def describe_run(spec: ExperimentSpec, run_name: str) -> dict[str, Any]:
                 "dense_layers": list(spec.collection.main_dense_layers),
                 "router_layers": list(spec.collection.main_router_layers),
                 "signals": list(spec.collection.main_capture_signals),
+                "execution_mode": "batched teacher-forced HF forward passes; no generation backend",
                 "storage_policy": "fp8-first lean corpus cache; no calibration-only tensors",
                 "omits": [
                     "q_pre_rope",

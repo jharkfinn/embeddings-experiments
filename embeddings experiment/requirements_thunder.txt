@@ -4,5 +4,6 @@ datasets
 accelerate
 sentencepiece
 safetensors
-vllm
 numpy
+# Optional legacy backend:
+# vllm

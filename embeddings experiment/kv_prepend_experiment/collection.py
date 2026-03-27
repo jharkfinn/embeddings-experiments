@@ -941,7 +941,7 @@ class InstrumentedQwen3MoeExperiment:
         rng.shuffle(words)
         return " ".join(words)
 
-    def _compute_external_summaries(self, records: list[dict[str, Any]]):
+    def _compute_external_summaries(self, records: list[dict[str, Any]], dataset_name: str = "control_summaries"):
         self._ensure_loaded()
         examples = self.prepare_examples(records)
         self._write_calibration_manifest(dataset_name)
@@ -1080,7 +1080,10 @@ class InstrumentedQwen3MoeExperiment:
             )
             _emit_control_result(control_mode, paths, bundles)
         shuffled_records = [{**record, "text": self._shuffle_text(str(record["text"]))} for record in records]
-        shuffled_summaries = self._compute_external_summaries(shuffled_records)
+        shuffled_summaries = self._compute_external_summaries(
+            shuffled_records,
+            dataset_name=f"{dataset_name}_shuffled_sentence_source",
+        )
         paths, bundles = self.collect_examples(
             records,
             dataset_name=f"{dataset_name}_shuffled_sentence",
@@ -1090,7 +1093,10 @@ class InstrumentedQwen3MoeExperiment:
             write_batches=not summary_mode,
         )
         _emit_control_result("shuffled_sentence", paths, bundles)
-        base_summaries = self._compute_external_summaries(records)
+        base_summaries = self._compute_external_summaries(
+            records,
+            dataset_name=f"{dataset_name}_cross_example_source",
+        )
         cross_example_summaries = base_summaries[1:] + base_summaries[:1] if base_summaries else []
         paths, bundles = self.collect_examples(
             records,

@@ -79,7 +79,7 @@
       46,
       47
     ],
-    "max_batch_tokens": 16384,
+    "max_batch_tokens": 8192,
     "multi_slot_decode_steps": 3,
     "propagate_from_layer": 16,
     "random_seed": 0,
@@ -90,10 +90,10 @@
     ],
     "run_bridge": false,
     "run_controls": false,
-    "runtime_backend": "vllm",
+    "runtime_backend": "hf_teacher_forcing",
     "save_every_batch": true,
     "sort_by_length": true,
-    "streaming_batch_size": 32,
+    "streaming_batch_size": 16,
     "vllm_gpu_memory_utilization": 0.9,
     "vllm_max_num_batched_tokens": 16384,
     "writer_queue_size": 4

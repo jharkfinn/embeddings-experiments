@@ -10,7 +10,6 @@ from .config import ExperimentSpec, load_experiment_spec
 from .evaluation import evaluate_signal, evaluate_task_suite, save_json
 from .profiles import describe_run, named_run_specs, write_named_specs
 from .runtime import import_torch
-from .vllm_main import collect_main_vllm
 
 
 def parse_args():
@@ -27,7 +26,12 @@ def parse_args():
         "--run-name",
         type=str,
         required=True,
-        choices=["main_vllm_3tasks", "calibration_hf_3tasks", "controls_hf_3tasks", "bridge_hf_3tasks"],
+        choices=[
+            "main_hf_teacher_forcing_3tasks",
+            "calibration_hf_3tasks",
+            "controls_hf_3tasks",
+            "bridge_hf_3tasks",
+        ],
     )
 
     collect = subparsers.add_parser("collect")
@@ -61,7 +65,7 @@ def _load_records(path: Path):
 
 
 def cmd_verify_model(spec: ExperimentSpec, root: Path):
-    if spec.collection.runtime_backend != "hf":
+    if spec.collection.runtime_backend not in {"hf", "hf_teacher_forcing"}:
         raise NotImplementedError(
             "verify-model currently runs against the HF collector path only. "
             "Use an HF-backed spec for contract verification."
@@ -86,6 +90,8 @@ def cmd_describe_run(spec: ExperimentSpec, args):
 def cmd_collect(spec: ExperimentSpec, root: Path, args):
     records = _load_records(args.records_json)
     if spec.collection.runtime_backend == "vllm":
+        from .vllm_main import collect_main_vllm
+
         if args.run_controls or args.run_bridge:
             raise ValueError("Controls and bridge are HF-only runs; use the dedicated HF specs.")
         output_paths = collect_main_vllm(spec, root, records, dataset_name=args.dataset_name)
