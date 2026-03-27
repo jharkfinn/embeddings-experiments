@@ -405,7 +405,15 @@ class VLLMMainCaptureExtension:
             attention_mask = causal_inputs["attention_mask"]
             layer.self_attn.num_key_value_groups = self._num_key_value_groups(layer.self_attn)
             q_pre, k_pre, q_rot, k_rot, v_raw = self._project_qkv(layer.self_attn, layer.input_layernorm(hidden_states), position_embeddings)
-            causal = attention_forward(layer.self_attn, q_rot, k_rot, v_raw, attention_mask, key_pre_rope=k_pre)
+            causal = attention_forward(
+                layer.self_attn,
+                q_rot,
+                k_rot,
+                v_raw,
+                attention_mask,
+                key_pre_rope=k_pre,
+                return_weights=False,
+            )
             causal_z = self._o_proj(layer.self_attn, causal.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())
             causal_hidden = hidden_states + causal_z
             causal_pre_moe = layer.post_attention_layernorm(causal_hidden)
@@ -430,6 +438,7 @@ class VLLMMainCaptureExtension:
                     attention_mask,
                     prepend_mode=config["default_rope_mode"],
                     key_pre_rope=k_pre,
+                    return_weights=False,
                 )
                 prepend_z = self._o_proj(layer.self_attn, prepend.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())
                 prepend_hidden = hidden_states + prepend_z
@@ -465,6 +474,7 @@ class VLLMMainCaptureExtension:
                 attention_mask,
                 prepend_mode=config["default_rope_mode"],
                 key_pre_rope=k_pre,
+                return_weights=False,
             )
             prepend_z = self._o_proj(layer.self_attn, prepend.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())
             prepend_hidden = hidden_states + prepend_z
@@ -472,7 +482,15 @@ class VLLMMainCaptureExtension:
             prepend_mlp_out, prepend_router_logits, prepend_topk = self._run_moe(layer.mlp, prepend_pre_moe)
             propagated_next = prepend_hidden + prepend_mlp_out
 
-            causal = attention_forward(layer.self_attn, q_rot, k_rot, v_raw, attention_mask, key_pre_rope=k_pre)
+            causal = attention_forward(
+                layer.self_attn,
+                q_rot,
+                k_rot,
+                v_raw,
+                attention_mask,
+                key_pre_rope=k_pre,
+                return_weights=False,
+            )
             causal_z = self._o_proj(layer.self_attn, causal.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())
             causal_hidden = hidden_states + causal_z
             causal_pre_moe = layer.post_attention_layernorm(causal_hidden)

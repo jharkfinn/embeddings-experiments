@@ -96,6 +96,7 @@ def attention_forward(
     key_pre_rope=None,
     summary_key=None,
     summary_value=None,
+    return_weights: bool = True,
 ):
     import torch
     import torch.nn.functional as F
@@ -125,14 +126,26 @@ def attention_forward(
 
     key_repeated = repeat_kv(used_key, module.num_key_value_groups)
     value_repeated = repeat_kv(used_value, module.num_key_value_groups)
-    attn_weights = torch.matmul(query_states, key_repeated.transpose(2, 3)) * module.scaling
-    if used_mask is not None:
-        attn_weights = attn_weights + used_mask
-    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    attn_output = torch.matmul(attn_weights, value_repeated)
+    if return_weights:
+        attn_weights = torch.matmul(query_states, key_repeated.transpose(2, 3)) * module.scaling
+        if used_mask is not None:
+            attn_weights = attn_weights + used_mask
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_repeated)
+    else:
+        attn_output = F.scaled_dot_product_attention(
+            query_states,
+            key_repeated,
+            value_repeated,
+            attn_mask=used_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=module.scaling,
+        )
+        attn_weights = None
     attn_output = attn_output.transpose(1, 2).contiguous()
 
-    if prepend_mode is not None:
+    if prepend_mode is not None and attn_weights is not None:
         beta = attn_weights[..., :1]
 
     return PrependResult(
