@@ -98,6 +98,7 @@ class VLLMMainCaptureExtension:
         self._cached_segments = None
         self._cached_segment_signature = None
         self._handles = []
+        self._hooks_enabled = True
         self._writer = _AsyncWriter()
 
         model = self.model_runner.model
@@ -108,9 +109,12 @@ class VLLMMainCaptureExtension:
         for layer_idx, layer in enumerate(layers):
             def _resid_pre_hook(li):
                 def hook(_mod, inp):
+                    if not getattr(self, "_hooks_enabled", True):
+                        return None
                     hidden = inp[0]
                     segments = self._get_prompt_segments(hidden)
                     self._append_segments(segments, f"resid_{li}", hidden)
+                    return None
                 return hook
 
             self._handles.append(layer.input_layernorm.register_forward_pre_hook(_resid_pre_hook(layer_idx)))
@@ -140,6 +144,7 @@ class VLLMMainCaptureExtension:
         self._active_batch_payload = None
         self._cached_segments = None
         self._cached_segment_signature = None
+        self._hooks_enabled = True
         return True
 
     @staticmethod
@@ -525,9 +530,14 @@ class VLLMMainCaptureExtension:
             batch_hidden, _, _ = self._pad_hidden_batch(residual_batches[layer_idx])
             causal_inputs[layer_idx] = batch_hidden
 
-        pass1_outputs = self._compute_pass1(layers, position_ids, causal_inputs, config)
-        propagated_seed = causal_inputs[int(config["propagate_from_layer"])]
-        pass2_outputs = self._compute_pass2(layers, position_ids, propagated_seed, causal_mask, config)
+        prev_hooks_enabled = getattr(self, "_hooks_enabled", True)
+        self._hooks_enabled = False
+        try:
+            pass1_outputs = self._compute_pass1(layers, position_ids, causal_inputs, config)
+            propagated_seed = causal_inputs[int(config["propagate_from_layer"])]
+            pass2_outputs = self._compute_pass2(layers, position_ids, propagated_seed, causal_mask, config)
+        finally:
+            self._hooks_enabled = prev_hooks_enabled
 
         bundles = []
         for row_idx, info in enumerate(infos):
@@ -592,6 +602,7 @@ class VLLMMainCaptureExtension:
         return True
 
     def remove_hooks(self):
+        self._hooks_enabled = False
         for handle in self._handles:
             handle.remove()
         self._handles = []
