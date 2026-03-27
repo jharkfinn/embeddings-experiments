@@ -119,6 +119,29 @@ class VLLMMainCaptureExtension:
 
             self._handles.append(layer.input_layernorm.register_forward_pre_hook(_resid_pre_hook(layer_idx)))
 
+            def _post_attn_in_hook(li):
+                def hook(_mod, inp):
+                    if not getattr(self, "_hooks_enabled", True):
+                        return None
+                    hidden = inp[0]
+                    segments = self._get_prompt_segments(hidden)
+                    self._append_segments(segments, f"post_attn_in_{li}", hidden)
+                    return None
+                return hook
+
+            def _post_attn_out_hook(li):
+                def hook(_mod, inp, out):
+                    if not getattr(self, "_hooks_enabled", True):
+                        return None
+                    hidden = out[0] if isinstance(out, tuple) else out
+                    segments = self._get_prompt_segments(hidden)
+                    self._append_segments(segments, f"post_attn_out_{li}", hidden)
+                    return None
+                return hook
+
+            self._handles.append(layer.post_attention_layernorm.register_forward_pre_hook(_post_attn_in_hook(layer_idx)))
+            self._handles.append(layer.post_attention_layernorm.register_forward_hook(_post_attn_out_hook(layer_idx)))
+
         return f"Installed {len(self._handles)} vLLM main-run hooks"
 
     def get_architecture(self):
@@ -409,23 +432,7 @@ class VLLMMainCaptureExtension:
                 layer.input_layernorm(hidden_states),
                 position_embeddings,
             )
-            causal_attn = layer.self_attn.attn(q_rot_flat, k_rot_flat, v_flat)
-            causal_z = self._o_proj(layer.self_attn, causal_attn)
-            causal_hidden = hidden_states + causal_z
-            causal_pre_moe = layer.post_attention_layernorm(causal_hidden)
-            causal_router_logits, causal_topk = self._run_router_only(layer.mlp, causal_pre_moe)
             if any(self._signal_enabled_for_layer(sig, layer_idx, config) for sig in config["main_capture_signals"]):
-                outputs[CaptureCondition.CAUSAL.value].append(
-                    self._build_layer_capture(
-                        layer_idx,
-                        CaptureCondition.CAUSAL.value,
-                        config,
-                        z_attn=causal_z,
-                        h_pre_moe=causal_pre_moe,
-                        router_logits=causal_router_logits,
-                        top_k_indices=causal_topk,
-                    )
-                )
                 prepend = attention_forward(
                     layer.self_attn,
                     q_rot,
@@ -451,6 +458,38 @@ class VLLMMainCaptureExtension:
                         top_k_indices=prepend_topk,
                     )
                 )
+        return outputs
+
+    def _build_live_causal_captures(self, layers, snapshot, matched, seq_lens, config):
+        outputs = []
+        req_ids = [req_id for req_id, _ in matched]
+        for layer_idx, layer in enumerate(layers):
+            if not any(self._signal_enabled_for_layer(sig, layer_idx, config) for sig in config["main_capture_signals"]):
+                continue
+            residual_tensors = []
+            post_attn_in_tensors = []
+            post_attn_out_tensors = []
+            for req_id in req_ids:
+                req_capture = snapshot["capture"][req_id]
+                residual_tensors.append(req_capture[f"resid_{layer_idx}"]["tensor"])
+                post_attn_in_tensors.append(req_capture[f"post_attn_in_{layer_idx}"]["tensor"])
+                post_attn_out_tensors.append(req_capture[f"post_attn_out_{layer_idx}"]["tensor"])
+            residual_batch, _, _ = self._pad_hidden_batch(residual_tensors)
+            post_attn_in_batch, _, _ = self._pad_hidden_batch(post_attn_in_tensors)
+            post_attn_out_batch, _, _ = self._pad_hidden_batch(post_attn_out_tensors)
+            z_attn = post_attn_in_batch - residual_batch
+            router_logits, top_k_indices = self._run_router_only(layer.mlp, post_attn_out_batch)
+            outputs.append(
+                self._build_layer_capture(
+                    layer_idx,
+                    CaptureCondition.CAUSAL.value,
+                    config,
+                    z_attn=z_attn,
+                    h_pre_moe=post_attn_out_batch,
+                    router_logits=router_logits,
+                    top_k_indices=top_k_indices,
+                )
+            )
         return outputs
 
     def _compute_pass2(self, layers, position_embeddings, hidden_states, attention_mask, config):
@@ -548,6 +587,14 @@ class VLLMMainCaptureExtension:
             pass2_outputs = self._compute_pass2(layers, position_ids, propagated_seed, causal_mask, config)
         finally:
             self._hooks_enabled = prev_hooks_enabled
+
+        pass1_outputs[CaptureCondition.CAUSAL.value] = self._build_live_causal_captures(
+            layers,
+            snapshot,
+            matched,
+            seq_lens,
+            config,
+        )
 
         bundles = []
         for row_idx, info in enumerate(infos):
