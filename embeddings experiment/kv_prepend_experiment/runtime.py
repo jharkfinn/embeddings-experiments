@@ -139,8 +139,28 @@ def verify_model_contract(config, model) -> VerifiedModelContract:
 
     _assert_source_contains(
         attention_source,
-        "repeat_kv(",
-        "Qwen3MoeAttention no longer uses repeat_kv; the prepend implementation must be updated.",
+        "self.q_norm(",
+        "Qwen3MoeAttention no longer applies q_norm before RoPE; prepend projections must be updated.",
+    )
+    _assert_source_contains(
+        attention_source,
+        "self.k_norm(",
+        "Qwen3MoeAttention no longer applies k_norm before RoPE; prepend projections must be updated.",
+    )
+    _assert_source_contains(
+        attention_source,
+        "apply_rotary_pos_emb(",
+        "Qwen3MoeAttention no longer applies RoPE at the expected site; prepend summary construction is invalid.",
+    )
+    _assert_source_contains(
+        attention_source,
+        "ALL_ATTENTION_FUNCTIONS.get_interface(",
+        "Qwen3MoeAttention no longer dispatches through ALL_ATTENTION_FUNCTIONS; GQA/attention assumptions changed.",
+    )
+    _assert_source_contains(
+        attention_source,
+        "self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads",
+        "Qwen3MoeAttention no longer exposes the expected GQA grouping; prepend attention must be updated.",
     )
     _assert_source_contains(
         decoder_source,
