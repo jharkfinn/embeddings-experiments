@@ -11,8 +11,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .prepend import attention_forward
-from .types import CaptureCondition, ExampleCaptureBundle, LayerCapture, PassCapture
+from kv_prepend_experiment.prepend import attention_forward
+from kv_prepend_experiment.types import CaptureCondition, ExampleCaptureBundle, LayerCapture, PassCapture
 
 
 def _storage_dtype(role: str):

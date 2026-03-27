@@ -90,14 +90,10 @@ def cmd_describe_run(spec: ExperimentSpec, args):
 def cmd_collect(spec: ExperimentSpec, root: Path, args):
     records = _load_records(args.records_json)
     if spec.collection.runtime_backend == "vllm":
-        from .vllm_main import collect_main_vllm
-
-        if args.run_controls or args.run_bridge:
-            raise ValueError("Controls and bridge are HF-only runs; use the dedicated HF specs.")
-        output_paths = collect_main_vllm(spec, root, records, dataset_name=args.dataset_name)
-        payload = {"main_captures": [str(path) for path in output_paths], "runtime_backend": "vllm"}
-        print(json.dumps(payload, indent=2, sort_keys=True))
-        return
+        raise NotImplementedError(
+            "The vLLM backend has been moved to embeddings experiment/legacy/vllm_backend. "
+            "Use the HF teacher-forcing specs for active runs."
+        )
     experiment = InstrumentedQwen3MoeExperiment(spec, root)
     experiment.load()
     spec_path = experiment.save_spec_snapshot()

@@ -4,9 +4,14 @@ import json
 import os
 from pathlib import Path
 
-from .config import ExperimentSpec
-from .prompts import build_prompt_examples
-from .runtime import import_vllm
+from kv_prepend_experiment.config import ExperimentSpec
+from kv_prepend_experiment.prompts import build_prompt_examples
+
+
+def import_vllm():
+    import vllm  # type: ignore
+
+    return vllm
 
 
 def _annotate_examples(examples, tokenizer, spec: ExperimentSpec):
@@ -74,10 +79,10 @@ def collect_main_vllm(spec: ExperimentSpec, root: str | Path, records: list[dict
         "model": spec.model.model_name,
         "trust_remote_code": spec.model.trust_remote_code,
         "enforce_eager": True,
-        "gpu_memory_utilization": spec.collection.vllm_gpu_memory_utilization,
+        "gpu_memory_utilization": getattr(spec.collection, "vllm_gpu_memory_utilization", 0.9),
         "max_model_len": spec.model.max_length,
         "enable_chunked_prefill": True,
-        "max_num_batched_tokens": spec.collection.vllm_max_num_batched_tokens,
+        "max_num_batched_tokens": getattr(spec.collection, "vllm_max_num_batched_tokens", 16384),
         "worker_extension_cls": "kv_prepend_experiment.worker_extension_main.VLLMMainCaptureExtension",
     }
     if spec.model.quantization:

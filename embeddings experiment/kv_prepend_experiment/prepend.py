@@ -134,38 +134,47 @@ def attention_forward(
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_repeated)
     else:
-        use_cpu_fallback = os.environ.get("KV_PREPEND_REPLAY_ATTENTION_CPU", "0") == "1"
-        target_device = query_states.device
-        query_f = query_states.contiguous().float()
-        key_f = key_repeated.contiguous().float()
-        value_f = value_repeated.contiguous().float()
-        mask_f = used_mask
-        if use_cpu_fallback:
-            query_f = query_f.cpu()
-            key_f = key_f.cpu()
-            value_f = value_f.cpu()
-            if mask_f is not None:
-                mask_f = mask_f.to(device="cpu", dtype=torch.float32)
         try:
-            attn_scores = torch.einsum("bhqd,bhkd->bhqk", query_f, key_f) * float(module.scaling)
-        except Exception as exc:  # pragma: no cover - debug path
-            raise RuntimeError(
-                "Replay attention matmul failed with "
-                f"q={tuple(query_f.shape)}/{query_f.dtype}/{query_f.device}, "
-                f"k={tuple(key_f.shape)}/{key_f.dtype}/{key_f.device}, "
-                f"v={tuple(value_f.shape)}/{value_f.dtype}/{value_f.device}, "
-                f"mask={None if mask_f is None else (tuple(mask_f.shape), mask_f.dtype, mask_f.device)}, "
-                f"num_kv_groups={getattr(module, 'num_key_value_groups', None)}, "
-                f"num_heads={getattr(module, 'num_heads', None)}, "
-                f"num_kv_heads={getattr(module, 'num_kv_heads', None)}"
-            ) from exc
-        if mask_f is not None:
-            attn_scores = attn_scores + mask_f.to(device=attn_scores.device, dtype=attn_scores.dtype)
-        attn_probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32)
-        attn_output = torch.einsum("bhqk,bhkd->bhqd", attn_probs, value_f)
-        if use_cpu_fallback:
-            attn_output = attn_output.to(device=target_device)
-        attn_output = attn_output.to(query_states.dtype)
+            attn_output = F.scaled_dot_product_attention(
+                query_states.contiguous(),
+                key_repeated.contiguous(),
+                value_repeated.contiguous(),
+                attn_mask=used_mask,
+                dropout_p=0.0,
+            )
+        except Exception:
+            use_cpu_fallback = os.environ.get("KV_PREPEND_REPLAY_ATTENTION_CPU", "0") == "1"
+            target_device = query_states.device
+            query_f = query_states.contiguous().float()
+            key_f = key_repeated.contiguous().float()
+            value_f = value_repeated.contiguous().float()
+            mask_f = used_mask
+            if use_cpu_fallback:
+                query_f = query_f.cpu()
+                key_f = key_f.cpu()
+                value_f = value_f.cpu()
+                if mask_f is not None:
+                    mask_f = mask_f.to(device="cpu", dtype=torch.float32)
+            try:
+                attn_scores = torch.einsum("bhqd,bhkd->bhqk", query_f, key_f) * float(module.scaling)
+            except Exception as exc:  # pragma: no cover - debug path
+                raise RuntimeError(
+                    "Replay attention matmul failed with "
+                    f"q={tuple(query_f.shape)}/{query_f.dtype}/{query_f.device}, "
+                    f"k={tuple(key_f.shape)}/{key_f.dtype}/{key_f.device}, "
+                    f"v={tuple(value_f.shape)}/{value_f.dtype}/{value_f.device}, "
+                    f"mask={None if mask_f is None else (tuple(mask_f.shape), mask_f.dtype, mask_f.device)}, "
+                    f"num_kv_groups={getattr(module, 'num_key_value_groups', None)}, "
+                    f"num_heads={getattr(module, 'num_heads', None)}, "
+                    f"num_kv_heads={getattr(module, 'num_kv_heads', None)}"
+                ) from exc
+            if mask_f is not None:
+                attn_scores = attn_scores + mask_f.to(device=attn_scores.device, dtype=attn_scores.dtype)
+            attn_probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32)
+            attn_output = torch.einsum("bhqk,bhkd->bhqd", attn_probs, value_f)
+            if use_cpu_fallback:
+                attn_output = attn_output.to(device=target_device)
+            attn_output = attn_output.to(query_states.dtype)
         attn_weights = None
     attn_output = attn_output.transpose(1, 2).contiguous()
 

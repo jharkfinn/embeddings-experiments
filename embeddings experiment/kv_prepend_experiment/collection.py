@@ -71,14 +71,6 @@ def _causal_attention_mask(attention_mask, batch_size: int, seq_len: int, device
     return mask
 
 
-def _should_store_attention(layer_idx: int, calibration: bool, spec: ExperimentSpec) -> bool:
-    if spec.collection.capture_attention_weights_for_all_layers:
-        return True
-    if calibration and layer_idx in set(spec.collection.attention_weight_layers):
-        return True
-    return layer_idx in set(spec.collection.attention_weight_layers)
-
-
 class CollectionWriter:
     def __init__(self, root: str | Path, queue_size: int = 4):
         self.root = Path(root)
@@ -144,6 +136,11 @@ class InstrumentedQwen3MoeExperiment:
         self.config = None
         self.contract = None
         self.writer = CollectionWriter(self.root, queue_size=self.spec.collection.writer_queue_size)
+        self._main_dense_layers = set(int(layer) for layer in self.spec.collection.main_dense_layers)
+        self._main_router_layers = set(int(layer) for layer in self.spec.collection.main_router_layers)
+        self._main_capture_signals = set(self.spec.collection.main_capture_signals)
+        self._attention_weight_layers = set(int(layer) for layer in self.spec.collection.attention_weight_layers)
+        self._prompt_affix_cache: dict[str, tuple[list[int], list[int]]] = {}
 
     def load(self):
         self.config, self.model, self.tokenizer = load_model_and_tokenizer(self.spec.model)
@@ -164,12 +161,27 @@ class InstrumentedQwen3MoeExperiment:
 
     def annotate_examples(self, examples: list[PromptExample]):
         self._ensure_loaded()
-        for example in examples:
-            prefix = "Query: " if example.kind == "query" else "Context: "
-            suffix = " Compress the Query in one word:" if example.kind == "query" else " Compress the Context in one word:"
-            prefix_ids = self.tokenizer(prefix, add_special_tokens=False)["input_ids"]
-            text_ids = self.tokenizer(example.text, add_special_tokens=False)["input_ids"]
-            suffix_ids = self.tokenizer(suffix, add_special_tokens=False)["input_ids"]
+        if not examples:
+            return examples
+        text_ids_batch = self.tokenizer(
+            [example.text for example in examples],
+            add_special_tokens=False,
+        )["input_ids"]
+        for example, text_ids in zip(examples, text_ids_batch):
+            if example.kind not in self._prompt_affix_cache:
+                prefix = "Query: " if example.kind == "query" else "Context: "
+                suffix = (
+                    " Compress the Query in one word:"
+                    if example.kind == "query"
+                    else " Compress the Context in one word:"
+                )
+                self._prompt_affix_cache[example.kind] = (
+                    self.tokenizer(prefix, add_special_tokens=False)["input_ids"],
+                    self.tokenizer(suffix, add_special_tokens=False)["input_ids"],
+                )
+            prefix_ids, suffix_ids = self._prompt_affix_cache[example.kind]
+            max_text_tokens = max(0, self.spec.model.max_length - len(prefix_ids) - len(suffix_ids))
+            text_ids = list(text_ids[:max_text_tokens])
             full_ids = prefix_ids + text_ids + suffix_ids
             full_ids = full_ids[: self.spec.model.max_length]
             example.content_token_mask = [0] * len(prefix_ids) + [1] * len(text_ids) + [0] * len(suffix_ids)
@@ -184,13 +196,13 @@ class InstrumentedQwen3MoeExperiment:
         return examples
 
     def _main_dense_layer_set(self) -> set[int]:
-        return set(int(layer) for layer in self.spec.collection.main_dense_layers)
+        return self._main_dense_layers
 
     def _main_router_layer_set(self) -> set[int]:
-        return set(int(layer) for layer in self.spec.collection.main_router_layers)
+        return self._main_router_layers
 
     def _main_capture_signal_set(self) -> set[str]:
-        return set(self.spec.collection.main_capture_signals)
+        return self._main_capture_signals
 
     def _signal_enabled_for_layer(self, signal_name: str, layer_idx: int, calibration: bool) -> bool:
         if calibration:
@@ -211,20 +223,27 @@ class InstrumentedQwen3MoeExperiment:
                 return True
         return False
 
+    def _should_store_attention(self, layer_idx: int, calibration: bool) -> bool:
+        if self.spec.collection.capture_attention_weights_for_all_layers:
+            return True
+        if calibration and layer_idx in self._attention_weight_layers:
+            return True
+        return layer_idx in self._attention_weight_layers
+
     def tokenize_examples(self, examples: list[PromptExample]):
         self._ensure_loaded()
-        padded = self.tokenizer.pad(
-            [
-                {
-                    "input_ids": list(example.prompt_token_ids or []),
-                    "attention_mask": [1] * int(example.token_count or 0),
-                }
-                for example in examples
-            ],
-            padding=True,
-            return_tensors="pt",
-        )
-        return padded
+        torch = import_torch()
+        pad_token_id = int(self.tokenizer.pad_token_id)
+        max_len = max(int(example.token_count or 0) for example in examples)
+        input_ids = torch.full((len(examples), max_len), pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((len(examples), max_len), dtype=torch.long)
+        for row_idx, example in enumerate(examples):
+            token_ids = list(example.prompt_token_ids or [])
+            length = len(token_ids)
+            if length:
+                input_ids[row_idx, :length] = torch.tensor(token_ids, dtype=torch.long)
+                attention_mask[row_idx, :length] = 1
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
 
     def prepare_examples(self, records: list[dict[str, Any]]):
         provisional = build_prompt_examples(records, self.spec.prompts)
@@ -540,7 +559,7 @@ class InstrumentedQwen3MoeExperiment:
             float(self.spec.collection.bias_sweep_min),
             float(self.spec.collection.bias_sweep_max),
             int(self.spec.collection.bias_sweep_points),
-            device=self.model.device,
+            device=self._model_input_device(),
             dtype=torch.float32,
         )
 
@@ -661,6 +680,9 @@ class InstrumentedQwen3MoeExperiment:
         q_pre, k_pre, q_rot, k_rot, v_raw, cos, sin = self._project_qkv(layer.self_attn, normed_hidden, position_embeddings)
         self._current_cos = cos
         self._current_sin = sin
+        store_attn = self._should_store_attention(layer_idx, calibration)
+        need_causal_weights = bool(store_attn or calibration)
+        need_prepend_weights = bool(calibration)
         final_token_k_rot = k_rot[..., -1, :]
         final_token_v = v_raw[..., -1, :]
         final_token_k_raw = k_pre[..., -1, :]
@@ -672,6 +694,7 @@ class InstrumentedQwen3MoeExperiment:
             v_raw,
             attention_mask,
             prepend_mode=None,
+            return_weights=need_causal_weights,
         )
         causal_z = layer.self_attn.o_proj(causal.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())
         causal_hidden = residual + causal_z
@@ -714,6 +737,7 @@ class InstrumentedQwen3MoeExperiment:
                 key_pre_rope=k_pre,
                 summary_key=summary_k,
                 summary_value=summary_v,
+                return_weights=need_prepend_weights,
             )
             prepend_z = layer.self_attn.o_proj(prepend_result.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())
             prepend_hidden = residual + prepend_z
@@ -735,7 +759,6 @@ class InstrumentedQwen3MoeExperiment:
 
         captures: dict[str, LayerCapture] = {}
         should_capture = self._should_capture_layer(layer_idx, calibration)
-        store_attn = _should_store_attention(layer_idx, calibration, self.spec)
         if should_capture:
             captures[CaptureCondition.CAUSAL.value] = self._build_layer_capture(
                 layer_idx=layer_idx,
@@ -827,12 +850,18 @@ class InstrumentedQwen3MoeExperiment:
         pass_name: str,
         control_summary_mode: str | None = None,
         external_summary_by_layer: dict[int, dict[str, Any]] | None = None,
+        start_layer: int = 0,
+        initial_hidden_states=None,
+        initial_captures_by_condition: dict[str, list[LayerCapture]] | None = None,
     ):
         torch = import_torch()
         with torch.inference_mode():
             batch_size, seq_len = input_ids.shape
             model_core = self.model.model
-            hidden_states = model_core.embed_tokens(input_ids.to(self._model_input_device()))
+            if initial_hidden_states is None:
+                hidden_states = model_core.embed_tokens(input_ids.to(self._model_input_device()))
+            else:
+                hidden_states = initial_hidden_states
             position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1)
             causal_mask = _causal_attention_mask(
                 attention_mask=attention_mask,
@@ -843,9 +872,14 @@ class InstrumentedQwen3MoeExperiment:
             )
             position_embeddings = model_core.rotary_emb(hidden_states, position_ids=position_ids)
             batch_rng = random.Random(self.spec.collection.random_seed)
-            captures_by_condition: dict[str, list[LayerCapture]] = {}
+            captures_by_condition: dict[str, list[LayerCapture]] = {
+                condition: list(captures)
+                for condition, captures in (initial_captures_by_condition or {}).items()
+            }
+            propagate_start = int(self.spec.collection.propagate_from_layer)
+            propagate_hidden_states = hidden_states if start_layer >= propagate_start else None
 
-            for layer_idx, layer in enumerate(model_core.layers):
+            for layer_idx, layer in enumerate(model_core.layers[start_layer:], start=start_layer):
                 if pass_name == "pass1" or layer_idx < self.spec.collection.propagate_from_layer:
                     hidden_states, layer_captures = self._layer_forward_variants(
                         layer=layer,
@@ -880,11 +914,16 @@ class InstrumentedQwen3MoeExperiment:
                     )
                 for condition, capture in layer_captures.items():
                     captures_by_condition.setdefault(condition, []).append(capture)
+                if propagate_hidden_states is None and layer_idx + 1 == propagate_start:
+                    propagate_hidden_states = hidden_states
 
-            return PassCapture(
-                pass_name=pass_name,
-                rope_mode=self.spec.collection.default_rope_mode,
-                captures_by_condition=captures_by_condition,
+            return (
+                PassCapture(
+                    pass_name=pass_name,
+                    rope_mode=self.spec.collection.default_rope_mode,
+                    captures_by_condition=captures_by_condition,
+                ),
+                propagate_hidden_states,
             )
 
     def _forward_summary_only(self, input_ids, attention_mask):
@@ -906,7 +945,15 @@ class InstrumentedQwen3MoeExperiment:
                     "final_token_k_raw": _to_cpu(k_pre[..., -1, :], dtype=_storage_dtype("final_token_k_raw", calibration=False)),
                     "final_token_v": _to_cpu(v_raw[..., -1, :], dtype=_storage_dtype("final_token_v", calibration=False)),
                 }
-                causal = attention_forward(layer.self_attn, q_rot, k_rot, v_raw, causal_mask, key_pre_rope=k_pre)
+                causal = attention_forward(
+                    layer.self_attn,
+                    q_rot,
+                    k_rot,
+                    v_raw,
+                    causal_mask,
+                    key_pre_rope=k_pre,
+                    return_weights=False,
+                )
                 causal_z = layer.self_attn.o_proj(causal.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())
                 post = residual + causal_z
                 mlp_out, _, _ = self._run_moe(layer.mlp, layer.post_attention_layernorm(post))
@@ -1001,7 +1048,7 @@ class InstrumentedQwen3MoeExperiment:
             input_ids = encoded["input_ids"].to(self._model_input_device())
             attention_mask = encoded["attention_mask"].to(self._model_input_device())
             example_external = None if external_lookup is None else external_lookup[batch_examples[0].text_id]
-            pass1_batched = self._run_pass(
+            pass1_batched, propagate_hidden_states = self._run_pass(
                 input_ids,
                 attention_mask,
                 calibration=all(example.calibration for example in batch_examples),
@@ -1009,13 +1056,26 @@ class InstrumentedQwen3MoeExperiment:
                 control_summary_mode=control_summary_mode,
                 external_summary_by_layer=example_external,
             )
-            pass2_batched = self._run_pass(
+            propagate_from_layer = int(self.spec.collection.propagate_from_layer)
+            pass2_prefix_captures: dict[str, list[LayerCapture]] = {}
+            for condition in (CaptureCondition.CAUSAL.value, CaptureCondition.LOCAL_PREPEND_CAUSAL_BASE.value):
+                prefix_captures = [
+                    capture
+                    for capture in pass1_batched.captures_by_condition.get(condition, [])
+                    if capture.layer_idx < propagate_from_layer
+                ]
+                if prefix_captures:
+                    pass2_prefix_captures[condition] = prefix_captures
+            pass2_batched, _ = self._run_pass(
                 input_ids,
                 attention_mask,
                 calibration=all(example.calibration for example in batch_examples),
                 pass_name="pass2",
                 control_summary_mode=control_summary_mode,
                 external_summary_by_layer=example_external,
+                start_layer=propagate_from_layer,
+                initial_hidden_states=propagate_hidden_states,
+                initial_captures_by_condition=pass2_prefix_captures,
             )
             pass1_split = self._split_pass_capture(pass1_batched, batch_examples)
             pass2_split = self._split_pass_capture(pass2_batched, batch_examples)

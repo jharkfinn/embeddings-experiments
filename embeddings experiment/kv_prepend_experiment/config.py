@@ -40,8 +40,6 @@ class CollectionSpec:
     multi_slot_decode_steps: int = 3
     streaming_batch_size: int = 2
     max_batch_tokens: int = 4096
-    vllm_gpu_memory_utilization: float = 0.9
-    vllm_max_num_batched_tokens: int = 16384
     sort_by_length: bool = True
     writer_queue_size: int = 4
     random_seed: int = 0

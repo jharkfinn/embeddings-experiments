@@ -37,16 +37,6 @@ def import_datasets():
     return datasets
 
 
-def import_vllm():
-    try:
-        import vllm  # type: ignore
-    except ModuleNotFoundError as exc:  # pragma: no cover - environment specific
-        raise MissingDependencyError(
-            "vllm is required for the lean main-run backend on Thunder."
-        ) from exc
-    return vllm
-
-
 @dataclass
 class VerifiedModelContract:
     num_hidden_layers: int

@@ -22,8 +22,7 @@ The local machine does not currently have the runtime stack installed.
 ## Expected Python dependencies
 
 Install from `requirements_thunder.txt`, then add any GPU-specific wheels needed by
-your CUDA / PyTorch build. `vllm` is now optional and only needed if you explicitly
-want to revisit the legacy backend code.
+your CUDA / PyTorch build.
 
 Minimum expected packages:
 
@@ -123,8 +122,11 @@ python run_kv_prepend_experiment.py \
 
 ## Notes
 
-- The default main path is now a batched teacher-forced HF collector. The older
-  vLLM path remains in the tree only as an experimental legacy backend.
+- The default main path is now a batched teacher-forced HF collector.
+- The older vLLM backend has been moved under `legacy/vllm_backend/`.
+- The main HF path is optimized around dynamic token-budget batching, manual
+  padding of pretokenized prompts, pass-2 reuse of the pass-1 prefix states,
+  and no attention-weight materialization on lean branches.
 - The collector runs decoder layers directly so it can compute causal and prepend
   variants from the same Q/K/V projections and store fp8-first capture tensors.
 - Encoding stays an evaluation-time decision: signed trinary, positive-only router

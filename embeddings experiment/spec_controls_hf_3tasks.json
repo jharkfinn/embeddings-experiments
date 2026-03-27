@@ -94,8 +94,6 @@
     "save_every_batch": true,
     "sort_by_length": true,
     "streaming_batch_size": 2,
-    "vllm_gpu_memory_utilization": 0.9,
-    "vllm_max_num_batched_tokens": 16384,
     "writer_queue_size": 4
   },
   "evaluation": {

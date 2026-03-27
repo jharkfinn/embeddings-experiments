@@ -5,5 +5,3 @@ accelerate
 sentencepiece
 safetensors
 numpy
-# Optional legacy backend:
-# vllm
