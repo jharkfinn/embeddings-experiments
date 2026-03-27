@@ -68,6 +68,7 @@ def collect_main_vllm(spec: ExperimentSpec, root: str | Path, records: list[dict
     output_dir.mkdir(parents=True, exist_ok=True)
 
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
     model_kwargs = {
         "model": spec.model.model_name,

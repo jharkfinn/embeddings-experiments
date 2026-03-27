@@ -13,7 +13,42 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from runtime_bootstrap import bootstrap_workspace_env
+try:
+    from .runtime_bootstrap import bootstrap_workspace_env
+    from .experiment_utils import (
+        EPS,
+        MAX_LENGTH,
+        MODEL_NAME,
+        SHARED_EXPERT_INDEX,
+        TextRecord,
+        architecture_path,
+        build_records,
+        ensure_project_dirs,
+        human_bytes,
+        human_duration,
+        load_scifact,
+        make_filename,
+        write_json,
+        write_manifest,
+    )
+except ImportError:
+    from runtime_bootstrap import bootstrap_workspace_env
+    from experiment_utils import (
+        EPS,
+        MAX_LENGTH,
+        MODEL_NAME,
+        SHARED_EXPERT_INDEX,
+        TextRecord,
+        architecture_path,
+        build_records,
+        ensure_project_dirs,
+        human_bytes,
+        human_duration,
+        load_scifact,
+        make_filename,
+        write_json,
+        write_manifest,
+    )
 
 bootstrap_workspace_env()
 
@@ -23,23 +58,6 @@ import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer
-
-from experiment_utils import (
-    EPS,
-    MAX_LENGTH,
-    MODEL_NAME,
-    SHARED_EXPERT_INDEX,
-    TextRecord,
-    architecture_path,
-    build_records,
-    ensure_project_dirs,
-    human_bytes,
-    human_duration,
-    load_scifact,
-    make_filename,
-    write_json,
-    write_manifest,
-)
 
 try:
     from transformers.models.bamba.modeling_bamba import apply_rotary_pos_emb
@@ -208,10 +226,10 @@ class PassRuntimeState:
         expert_out_pool = torch.stack([tensor for tensor in self.expert_out_pool], dim=0).to(torch.float16)
         expert_out_mask = torch.stack([tensor for tensor in self.expert_out_mask], dim=0).to(torch.bool)
         expert_out_counts = torch.stack([tensor for tensor in self.expert_out_counts], dim=0).to(torch.int16)
-        expert_ffn_pool = torch.stack([tensor for tensor in self.expert_ffn_pool], dim=0).to(torch.float16)
+        expert_ffn_pool = torch.stack([tensor for tensor in self.expert_ffn_pool], dim=0).to(torch.float32)
         expert_ffn_mask = torch.stack([tensor for tensor in self.expert_ffn_mask], dim=0).to(torch.bool)
         expert_ffn_counts = torch.stack([tensor for tensor in self.expert_ffn_counts], dim=0).to(torch.int16)
-        expert_contrib_pool = torch.stack([tensor for tensor in self.expert_contrib_pool], dim=0).to(torch.float16)
+        expert_contrib_pool = torch.stack([tensor for tensor in self.expert_contrib_pool], dim=0).to(torch.float32)
         expert_contrib_mask = torch.stack([tensor for tensor in self.expert_contrib_mask], dim=0).to(torch.bool)
         expert_contrib_counts = torch.stack([tensor for tensor in self.expert_contrib_counts], dim=0).to(torch.int16)
 
@@ -499,14 +517,16 @@ class InstrumentationContext:
                         pool_sums[sample_idx, slot] = expert_output_tokens[sample_idx, sample_token_mask].sum(dim=0).to(
                             pool_sums.dtype
                         )
-                        selected_hidden = sample_hidden_states[sample_token_mask]
-                        gate, up = F.linear(selected_hidden, module.experts.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-                        raw_expert_output = F.linear(module.experts.act_fn(gate) * up, module.experts.down_proj[expert_idx])
+                        selected_hidden = sample_hidden_states[sample_token_mask].to(torch.float32)
+                        gate_up_weight = module.experts.gate_up_proj[expert_idx].to(dtype=torch.float32)
+                        down_proj_weight = module.experts.down_proj[expert_idx].to(dtype=torch.float32)
+                        gate, up = F.linear(selected_hidden, gate_up_weight).chunk(2, dim=-1)
+                        raw_expert_output = F.linear(module.experts.act_fn(gate) * up, down_proj_weight)
                         expert_token_weights = (
                             sample_weights[sample_token_mask]
                             * (sample_selected[sample_token_mask] == expert_idx).to(sample_weights.dtype)
                         ).sum(dim=-1)
-                        weighted_expert_output = raw_expert_output * expert_token_weights.unsqueeze(-1)
+                        weighted_expert_output = raw_expert_output * expert_token_weights.to(torch.float32).unsqueeze(-1)
                         expert_ffn_sums[sample_idx, slot] = raw_expert_output.sum(dim=0).to(expert_ffn_sums.dtype)
                         expert_ffn_counts[sample_idx, slot] = token_count
                         expert_contrib_sums[sample_idx, slot] = weighted_expert_output.sum(dim=0).to(
@@ -536,20 +556,20 @@ class InstrumentationContext:
             mask = counts > 0
             if mask.any():
                 pooled[mask] = (pool_sums[mask] / counts[mask].to(pool_sums.dtype).unsqueeze(-1)).to(torch.float16)
-            expert_ffn_pooled = torch.zeros_like(expert_ffn_sums, dtype=torch.float16)
+            expert_ffn_pooled = torch.zeros_like(expert_ffn_sums, dtype=torch.float32)
             expert_ffn_mask = expert_ffn_counts > 0
             if expert_ffn_mask.any():
                 expert_ffn_pooled[expert_ffn_mask] = (
                     expert_ffn_sums[expert_ffn_mask]
                     / expert_ffn_counts[expert_ffn_mask].to(expert_ffn_sums.dtype).unsqueeze(-1)
-                ).to(torch.float16)
-            expert_contrib_pooled = torch.zeros_like(expert_contrib_sums, dtype=torch.float16)
+                ).to(torch.float32)
+            expert_contrib_pooled = torch.zeros_like(expert_contrib_sums, dtype=torch.float32)
             expert_contrib_mask = expert_contrib_counts > 0
             if expert_contrib_mask.any():
                 expert_contrib_pooled[expert_contrib_mask] = (
                     expert_contrib_sums[expert_contrib_mask]
                     / expert_contrib_counts[expert_contrib_mask].to(expert_contrib_sums.dtype).unsqueeze(-1)
-                ).to(torch.float16)
+                ).to(torch.float32)
 
             selected_experts = selected_experts.reshape(batch_size, sequence_length, -1)
             routing_weights = routing_weights.reshape(batch_size, sequence_length, -1)
@@ -746,17 +766,20 @@ def build_pending_batches(
     records: list[TextRecord],
     output_dirs: list[Path],
     query_batch_size: int,
+    query_length_keys: dict[str, int] | None = None,
 ) -> list[RecordBatch]:
     batches: list[RecordBatch] = []
     query_buffer: list[TextRecord] = []
     query_positions: list[int] = []
+    query_length_key: int | None = None
 
     def flush_queries() -> None:
-        nonlocal query_buffer, query_positions
+        nonlocal query_buffer, query_positions, query_length_key
         if query_buffer:
             batches.append(RecordBatch(kind="query", records=query_buffer, positions=query_positions))
             query_buffer = []
             query_positions = []
+            query_length_key = None
 
     for position, record in enumerate(records, start=1):
         all_paths = [output_dir / record.filename for output_dir in output_dirs]
@@ -769,8 +792,12 @@ def build_pending_batches(
             print(f"Resetting partial extraction for {record.text_id}")
 
         if record.kind == "query" and query_batch_size > 1:
+            current_length_key = query_length_keys.get(record.text_id) if query_length_keys is not None else None
+            if query_buffer and query_length_key is not None and current_length_key != query_length_key:
+                flush_queries()
             query_buffer.append(record)
             query_positions.append(position)
+            query_length_key = current_length_key
             if len(query_buffer) >= query_batch_size:
                 flush_queries()
             continue
@@ -790,6 +817,25 @@ def maybe_limit_records(records: list, limit_docs: int | None, limit_queries: in
     if limit_queries is not None:
         queries = queries[:limit_queries]
     return docs + queries
+
+
+def build_query_length_keys(
+    records: list[TextRecord],
+    tokenizer: AutoTokenizer,
+    max_length: int,
+) -> dict[str, int]:
+    query_length_keys: dict[str, int] = {}
+    for record in records:
+        if record.kind != "query":
+            continue
+        token_ids = tokenizer(
+            paper_prompt_text(record),
+            add_special_tokens=True,
+            truncation=True,
+            max_length=max_length,
+        )["input_ids"]
+        query_length_keys[record.text_id] = len(token_ids)
+    return query_length_keys
 
 
 def delete_if_exists(path: Path) -> None:
@@ -1194,17 +1240,19 @@ def main() -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
+    model, tokenizer = load_model_and_tokenizer(args.model_name, torch_dtype, args.device_map)
     corpus, queries, _qrels = load_scifact(dirs["datasets"])
     records = build_records(corpus, queries)
     selected_records = maybe_limit_records(records, args.limit_docs, args.limit_queries)
     write_manifest(selected_records, dirs["results"])
+    query_length_keys = build_query_length_keys(selected_records, tokenizer, args.max_length)
     pending_batches = build_pending_batches(
         selected_records,
         [dirs["rerouted"], dirs["paper_rerouted"]],
         args.query_batch_size,
+        query_length_keys,
     )
 
-    model, tokenizer = load_model_and_tokenizer(args.model_name, torch_dtype, args.device_map)
     text_model, model_path = resolve_text_model(model)
     architecture = inspect_model_architecture(model, text_model, model_path, dirs["root"], args.model_name)
     paper_selection = compute_paper_layer_selection(

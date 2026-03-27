@@ -6,6 +6,13 @@ from .runtime import import_datasets
 from .types import RetrievalTask
 
 
+_TASK_REPO_OVERRIDES = {
+    "scifact": ("zeta-alpha-ai/NanoSciFact", None),
+    "fiqa2018": ("zeta-alpha-ai/NanoFiQA2018", None),
+    "quoraretrieval": ("zeta-alpha-ai/NanoQuoraRetrieval", None),
+}
+
+
 def _guess_column(row: dict[str, Any], candidates):
     for candidate in candidates:
         if candidate in row:
@@ -16,9 +23,13 @@ def _guess_column(row: dict[str, Any], candidates):
 def load_nanobeir_task(repo_name: str, dataset_name: str) -> RetrievalTask:
     datasets = import_datasets()
     dataset_name = dataset_name.lower()
-    corpus_ds = datasets.load_dataset(repo_name, dataset_name, split="corpus")
-    query_ds = datasets.load_dataset(repo_name, dataset_name, split="queries")
-    qrels_ds = datasets.load_dataset(repo_name, dataset_name, split="qrels")
+    repo_override, config_override = _TASK_REPO_OVERRIDES.get(dataset_name, (repo_name, dataset_name))
+    load_kwargs = {}
+    if config_override is not None:
+        load_kwargs["name"] = config_override
+    corpus_ds = datasets.load_dataset(repo_override, split="corpus", **load_kwargs)
+    query_ds = datasets.load_dataset(repo_override, split="queries", **load_kwargs)
+    qrels_ds = datasets.load_dataset(repo_override, split="qrels", **load_kwargs)
 
     corpus = {}
     for row in corpus_ds:

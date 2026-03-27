@@ -11,7 +11,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .prepend import apply_rotary_pos_emb, attention_forward
+from .prepend import attention_forward
 from .types import CaptureCondition, ExampleCaptureBundle, LayerCapture, PassCapture
 
 
@@ -79,6 +79,14 @@ class _AsyncWriter:
 
 
 class VLLMMainCaptureExtension:
+    @staticmethod
+    def _get_text_model(model):
+        if hasattr(model, "language_model") and hasattr(model.language_model, "model"):
+            return model.language_model.model
+        if hasattr(model, "model"):
+            return model.model
+        raise AttributeError(f"Unsupported vLLM model wrapper: {type(model)!r}")
+
     def setup_hooks(self, config_json: str):
         config = json.loads(config_json)
         self.runtime_config = config
@@ -93,7 +101,7 @@ class VLLMMainCaptureExtension:
         self._writer = _AsyncWriter()
 
         model = self.model_runner.model
-        text_model = model.language_model.model
+        text_model = self._get_text_model(model)
         layers = list(text_model.layers)
         self._num_layers = len(layers)
 
@@ -111,7 +119,7 @@ class VLLMMainCaptureExtension:
 
     def get_architecture(self):
         model = self.model_runner.model
-        text_model = model.language_model.model
+        text_model = self._get_text_model(model)
         config = text_model.config
         return json.dumps(
             {
@@ -273,8 +281,13 @@ class VLLMMainCaptureExtension:
         seq_lens = [int(t.shape[0]) for t in tensors]
         max_len = max(seq_lens) if seq_lens else 0
         hidden_dim = int(tensors[0].shape[-1]) if tensors else 0
-        device = tensors[0].device if tensors else self.model_runner.model.language_model.model.embed_tokens.weight.device
-        dtype = tensors[0].dtype if tensors else self.model_runner.model.language_model.model.embed_tokens.weight.dtype
+        if tensors:
+            device = tensors[0].device
+            dtype = tensors[0].dtype
+        else:
+            text_model = self._get_text_model(self.model_runner.model)
+            device = text_model.embed_tokens.weight.device
+            dtype = text_model.embed_tokens.weight.dtype
         batch = torch.zeros((len(tensors), max_len, hidden_dim), device=device, dtype=dtype)
         attention_mask = torch.zeros((len(tensors), max_len), device=device, dtype=torch.long)
         for idx, tensor in enumerate(tensors):
@@ -285,34 +298,67 @@ class VLLMMainCaptureExtension:
 
     def _project_qkv(self, attention_module, hidden_states, position_embeddings):
         batch_size, seq_len, _ = hidden_states.shape
-        head_dim = attention_module.head_dim
-        hidden_shape = (batch_size, seq_len, -1, head_dim)
-        q_pre = attention_module.q_norm(attention_module.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        k_pre = attention_module.k_norm(attention_module.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        v_raw = attention_module.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        cos, sin = position_embeddings
-        q_rot, k_rot = apply_rotary_pos_emb(q_pre, k_pre, cos, sin)
+        qkv, _ = attention_module.qkv_proj(hidden_states)
+        q, k, v = qkv.split([attention_module.q_size, attention_module.kv_size, attention_module.kv_size], dim=-1)
+
+        q_by_head = q.view(batch_size, seq_len, attention_module.num_heads, attention_module.head_dim)
+        q_by_head = attention_module.q_norm(q_by_head)
+        q_normed = q_by_head.view(batch_size, seq_len, attention_module.q_size)
+
+        k_by_head = k.view(batch_size, seq_len, attention_module.num_kv_heads, attention_module.head_dim)
+        k_by_head = attention_module.k_norm(k_by_head)
+        k_normed = k_by_head.view(batch_size, seq_len, attention_module.kv_size)
+
+        q_rot, k_rot = attention_module.rotary_emb(position_embeddings, q_normed, k_normed)
+
+        q_pre = q_by_head.transpose(1, 2).contiguous()
+        k_pre = k_by_head.transpose(1, 2).contiguous()
+        q_rot = q_rot.view(batch_size, seq_len, attention_module.num_heads, attention_module.head_dim).transpose(1, 2).contiguous()
+        k_rot = k_rot.view(batch_size, seq_len, attention_module.num_kv_heads, attention_module.head_dim).transpose(1, 2).contiguous()
+        v_raw = v.view(batch_size, seq_len, attention_module.num_kv_heads, attention_module.head_dim).transpose(1, 2).contiguous()
         return q_pre, k_pre, q_rot, k_rot, v_raw
+
+    @staticmethod
+    def _num_key_value_groups(attention_module) -> int:
+        if hasattr(attention_module, "num_key_value_groups"):
+            return int(attention_module.num_key_value_groups)
+        return int(attention_module.num_heads // attention_module.num_kv_heads)
+
+    @staticmethod
+    def _o_proj(attention_module, attn_output):
+        projected, _ = attention_module.o_proj(attn_output)
+        return projected
 
     def _run_moe(self, mlp_module, hidden_states):
         batch_size, seq_len, hidden_dim = hidden_states.shape
         flat = hidden_states.reshape(-1, hidden_dim)
-        router_logits = F.linear(flat, mlp_module.gate.weight)
+        if not hasattr(mlp_module, "gate") or not hasattr(mlp_module, "experts"):
+            mlp_output = mlp_module(flat).reshape(batch_size, seq_len, hidden_dim)
+            return mlp_output, None, None
+        router_logits, _ = mlp_module.gate(flat)
         router_probs = F.softmax(router_logits.float(), dim=-1)
-        router_scores, top_k_indices = torch.topk(router_probs, mlp_module.gate.top_k, dim=-1)
-        if mlp_module.gate.norm_topk_prob:
-            router_scores = router_scores / router_scores.sum(dim=-1, keepdim=True)
-        router_scores = router_scores.to(router_logits.dtype)
-        mlp_output = mlp_module.experts(flat, top_k_indices, router_scores).reshape(batch_size, seq_len, hidden_dim)
-        return mlp_output, router_logits.reshape(batch_size, seq_len, -1), top_k_indices.reshape(batch_size, seq_len, -1).to(dtype=torch.int8)
+        top_k = int(getattr(mlp_module.experts, "top_k", 0) or 0)
+        top_k_indices = torch.topk(router_probs, top_k, dim=-1).indices if top_k > 0 else None
+        shared_out, fused_out = mlp_module.experts(hidden_states=flat, router_logits=router_logits)
+        mlp_output = (shared_out + fused_out if shared_out is not None else fused_out).reshape(batch_size, seq_len, hidden_dim)
+        router_logits = router_logits.reshape(batch_size, seq_len, -1)
+        if top_k_indices is not None:
+            top_k_indices = top_k_indices.reshape(batch_size, seq_len, -1).to(dtype=torch.int8)
+        return mlp_output, router_logits, top_k_indices
 
     def _run_router_only(self, mlp_module, hidden_states):
         batch_size, seq_len, hidden_dim = hidden_states.shape
         flat = hidden_states.reshape(-1, hidden_dim)
-        router_logits = F.linear(flat, mlp_module.gate.weight)
+        if not hasattr(mlp_module, "gate"):
+            return None, None
+        router_logits, _ = mlp_module.gate(flat)
         router_probs = F.softmax(router_logits.float(), dim=-1)
-        top_k_indices = torch.topk(router_probs, mlp_module.gate.top_k, dim=-1).indices
-        return router_logits.reshape(batch_size, seq_len, -1), top_k_indices.reshape(batch_size, seq_len, -1).to(dtype=torch.int8)
+        top_k = int(getattr(mlp_module.experts, "top_k", 0) or 0) if hasattr(mlp_module, "experts") else 0
+        top_k_indices = torch.topk(router_probs, top_k, dim=-1).indices if top_k > 0 else None
+        router_logits = router_logits.reshape(batch_size, seq_len, -1)
+        if top_k_indices is not None:
+            top_k_indices = top_k_indices.reshape(batch_size, seq_len, -1).to(dtype=torch.int8)
+        return router_logits, top_k_indices
 
     def _signal_enabled_for_layer(self, signal_name: str, layer_idx: int, config: dict[str, Any]) -> bool:
         signals = set(config["main_capture_signals"])
@@ -352,9 +398,10 @@ class VLLMMainCaptureExtension:
         for layer_idx, layer in enumerate(layers):
             hidden_states = causal_inputs[layer_idx]
             attention_mask = causal_inputs["attention_mask"]
+            layer.self_attn.num_key_value_groups = self._num_key_value_groups(layer.self_attn)
             q_pre, k_pre, q_rot, k_rot, v_raw = self._project_qkv(layer.self_attn, layer.input_layernorm(hidden_states), position_embeddings)
             causal = attention_forward(layer.self_attn, q_rot, k_rot, v_raw, attention_mask, key_pre_rope=k_pre)
-            causal_z = layer.self_attn.o_proj(causal.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())
+            causal_z = self._o_proj(layer.self_attn, causal.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())
             causal_hidden = hidden_states + causal_z
             causal_pre_moe = layer.post_attention_layernorm(causal_hidden)
             causal_router_logits, causal_topk = self._run_router_only(layer.mlp, causal_pre_moe)
@@ -377,11 +424,9 @@ class VLLMMainCaptureExtension:
                     v_raw,
                     attention_mask,
                     prepend_mode=config["default_rope_mode"],
-                    cos=position_embeddings[0],
-                    sin=position_embeddings[1],
                     key_pre_rope=k_pre,
                 )
-                prepend_z = layer.self_attn.o_proj(prepend.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())
+                prepend_z = self._o_proj(layer.self_attn, prepend.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())
                 prepend_hidden = hidden_states + prepend_z
                 prepend_pre_moe = layer.post_attention_layernorm(prepend_hidden)
                 prepend_router_logits, prepend_topk = self._run_router_only(layer.mlp, prepend_pre_moe)
@@ -405,6 +450,7 @@ class VLLMMainCaptureExtension:
         }
         for layer_idx in range(int(config["propagate_from_layer"]), len(layers)):
             layer = layers[layer_idx]
+            layer.self_attn.num_key_value_groups = self._num_key_value_groups(layer.self_attn)
             q_pre, k_pre, q_rot, k_rot, v_raw = self._project_qkv(layer.self_attn, layer.input_layernorm(hidden_states), position_embeddings)
             prepend = attention_forward(
                 layer.self_attn,
@@ -413,18 +459,16 @@ class VLLMMainCaptureExtension:
                 v_raw,
                 attention_mask,
                 prepend_mode=config["default_rope_mode"],
-                cos=position_embeddings[0],
-                sin=position_embeddings[1],
                 key_pre_rope=k_pre,
             )
-            prepend_z = layer.self_attn.o_proj(prepend.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())
+            prepend_z = self._o_proj(layer.self_attn, prepend.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())
             prepend_hidden = hidden_states + prepend_z
             prepend_pre_moe = layer.post_attention_layernorm(prepend_hidden)
             prepend_mlp_out, prepend_router_logits, prepend_topk = self._run_moe(layer.mlp, prepend_pre_moe)
             propagated_next = prepend_hidden + prepend_mlp_out
 
             causal = attention_forward(layer.self_attn, q_rot, k_rot, v_raw, attention_mask, key_pre_rope=k_pre)
-            causal_z = layer.self_attn.o_proj(causal.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())
+            causal_z = self._o_proj(layer.self_attn, causal.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())
             causal_hidden = hidden_states + causal_z
             causal_pre_moe = layer.post_attention_layernorm(causal_hidden)
             causal_router_logits, causal_topk = self._run_router_only(layer.mlp, causal_pre_moe)
@@ -457,7 +501,7 @@ class VLLMMainCaptureExtension:
 
     def _build_bundles(self, snapshot):
         config = self.runtime_config
-        text_model = self.model_runner.model.language_model.model
+        text_model = self._get_text_model(self.model_runner.model)
         layers = list(text_model.layers)
         matched = self._sorted_req_infos(snapshot)
         req_ids = [req_id for req_id, _ in matched]
@@ -474,10 +518,6 @@ class VLLMMainCaptureExtension:
         del input_batch  # shape only
         first_hidden = residual_batches[0][0]
         position_ids = torch.arange(attention_mask.shape[1], device=first_hidden.device).unsqueeze(0).expand(len(req_ids), -1)
-        position_embeddings = text_model.rotary_emb(
-            torch.zeros((len(req_ids), attention_mask.shape[1], first_hidden.shape[-1]), device=first_hidden.device, dtype=first_hidden.dtype),
-            position_ids=position_ids,
-        )
         causal_mask = _causal_attention_mask(attention_mask, len(req_ids), attention_mask.shape[1], first_hidden.device, first_hidden.dtype)
 
         causal_inputs = {"attention_mask": causal_mask}
@@ -485,9 +525,9 @@ class VLLMMainCaptureExtension:
             batch_hidden, _, _ = self._pad_hidden_batch(residual_batches[layer_idx])
             causal_inputs[layer_idx] = batch_hidden
 
-        pass1_outputs = self._compute_pass1(layers, position_embeddings, causal_inputs, config)
+        pass1_outputs = self._compute_pass1(layers, position_ids, causal_inputs, config)
         propagated_seed = causal_inputs[int(config["propagate_from_layer"])]
-        pass2_outputs = self._compute_pass2(layers, position_embeddings, propagated_seed, causal_mask, config)
+        pass2_outputs = self._compute_pass2(layers, position_ids, propagated_seed, causal_mask, config)
 
         bundles = []
         for row_idx, info in enumerate(infos):

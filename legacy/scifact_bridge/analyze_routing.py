@@ -4,24 +4,36 @@ import argparse
 import itertools
 from pathlib import Path
 
-from runtime_bootstrap import bootstrap_workspace_env
+try:
+    from .runtime_bootstrap import bootstrap_workspace_env
+    from .experiment_utils import (
+        EPS,
+        MODEL_NAME,
+        ensure_project_dirs,
+        jaccard_from_binary_matrix,
+        load_architecture,
+        load_manifest,
+        load_npz_fields,
+        load_scifact,
+    )
+except ImportError:
+    from runtime_bootstrap import bootstrap_workspace_env
+    from experiment_utils import (
+        EPS,
+        MODEL_NAME,
+        ensure_project_dirs,
+        jaccard_from_binary_matrix,
+        load_architecture,
+        load_manifest,
+        load_npz_fields,
+        load_scifact,
+    )
 
 bootstrap_workspace_env()
 
 import matplotlib.pyplot as plt
 import numpy as np
 from transformers import AutoTokenizer
-
-from experiment_utils import (
-    EPS,
-    MODEL_NAME,
-    ensure_project_dirs,
-    jaccard_from_binary_matrix,
-    load_architecture,
-    load_manifest,
-    load_npz_fields,
-    load_scifact,
-)
 
 
 def parse_args() -> argparse.Namespace:

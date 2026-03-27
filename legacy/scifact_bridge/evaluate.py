@@ -10,7 +10,34 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from runtime_bootstrap import bootstrap_workspace_env
+try:
+    from .runtime_bootstrap import bootstrap_workspace_env
+    from .experiment_utils import (
+        EPS,
+        ensure_project_dirs,
+        human_bytes,
+        load_architecture,
+        load_manifest,
+        load_npz_fields,
+        load_scifact,
+        l2_normalize_array,
+        normalize_multivector,
+        pack_multivectors,
+    )
+except ImportError:
+    from runtime_bootstrap import bootstrap_workspace_env
+    from experiment_utils import (
+        EPS,
+        ensure_project_dirs,
+        human_bytes,
+        load_architecture,
+        load_manifest,
+        load_npz_fields,
+        load_scifact,
+        l2_normalize_array,
+        normalize_multivector,
+        pack_multivectors,
+    )
 
 bootstrap_workspace_env()
 
@@ -18,19 +45,6 @@ import numpy as np
 import pandas as pd
 import torch
 from beir.retrieval.evaluation import EvaluateRetrieval
-
-from experiment_utils import (
-    EPS,
-    ensure_project_dirs,
-    human_bytes,
-    load_architecture,
-    load_manifest,
-    load_npz_fields,
-    load_scifact,
-    l2_normalize_array,
-    normalize_multivector,
-    pack_multivectors,
-)
 
 
 EVAL_TOP_K = 100
