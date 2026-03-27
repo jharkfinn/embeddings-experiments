@@ -42,6 +42,7 @@ class CollectionSpec:
     max_batch_tokens: int = 4096
     sequence_length_buckets: list[int] = field(default_factory=lambda: [128, 256, 384, 512, 768, 1024, 1536, 2048])
     pad_main_batches_to_streaming_size: bool = True
+    attention_backend: str = "sdpa"
     enable_attention_compile: bool = True
     attention_compile_mode: str = "reduce-overhead"
     attention_compile_fullgraph: bool = False

@@ -16,7 +16,7 @@ from .config import ExperimentSpec
 from .prepend import (
     apply_rotary_pos_emb,
     attention_forward,
-    configure_attention_compile,
+    configure_attention_runtime,
     make_prepend_summary_kv,
     matched_norm_random_like,
 )
@@ -161,10 +161,11 @@ class InstrumentedQwen3MoeExperiment:
         self.config, self.model, self.tokenizer = load_model_and_tokenizer(self.spec.model)
         self.contract = verify_model_contract(self.config, self.model)
         self.runtime_stack = runtime_stack_snapshot()
-        configure_attention_compile(
+        configure_attention_runtime(
             enabled=self.spec.collection.enable_attention_compile,
             mode=self.spec.collection.attention_compile_mode,
             fullgraph=self.spec.collection.attention_compile_fullgraph,
+            backend=self.spec.collection.attention_backend,
         )
         return self
 
@@ -700,6 +701,7 @@ class InstrumentedQwen3MoeExperiment:
         layer_idx: int,
         hidden_states,
         attention_mask,
+        token_counts,
         position_embeddings,
         position_ids,
         calibration: bool,
@@ -729,6 +731,7 @@ class InstrumentedQwen3MoeExperiment:
             v_raw,
             attention_mask,
             prepend_mode=None,
+            token_counts=token_counts,
             return_weights=need_causal_weights,
         )
         causal_z = layer.self_attn.o_proj(causal.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())
@@ -772,6 +775,7 @@ class InstrumentedQwen3MoeExperiment:
                 key_pre_rope=k_pre,
                 summary_key=summary_k,
                 summary_value=summary_v,
+                token_counts=token_counts,
                 return_weights=need_prepend_weights,
             )
             prepend_z = layer.self_attn.o_proj(prepend_result.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())
@@ -898,12 +902,20 @@ class InstrumentedQwen3MoeExperiment:
             else:
                 hidden_states = initial_hidden_states
             position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1)
-            causal_mask = _causal_attention_mask(
-                attention_mask=attention_mask,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
+            token_counts = attention_mask.sum(dim=1).to(device=hidden_states.device, dtype=torch.int32)
+            uses_dense_attention_mask = bool(
+                calibration or self.spec.collection.attention_backend == "sdpa"
+            )
+            causal_mask = (
+                _causal_attention_mask(
+                    attention_mask=attention_mask,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+                if uses_dense_attention_mask
+                else None
             )
             position_embeddings = model_core.rotary_emb(hidden_states, position_ids=position_ids)
             batch_rng = random.Random(self.spec.collection.random_seed)
@@ -921,6 +933,7 @@ class InstrumentedQwen3MoeExperiment:
                         layer_idx=layer_idx,
                         hidden_states=hidden_states,
                         attention_mask=causal_mask,
+                        token_counts=token_counts,
                         position_embeddings=position_embeddings,
                         position_ids=position_ids,
                         calibration=calibration,
@@ -937,6 +950,7 @@ class InstrumentedQwen3MoeExperiment:
                         layer_idx=layer_idx,
                         hidden_states=hidden_states,
                         attention_mask=causal_mask,
+                        token_counts=token_counts,
                         position_embeddings=position_embeddings,
                         position_ids=position_ids,
                         calibration=calibration,
@@ -971,6 +985,7 @@ class InstrumentedQwen3MoeExperiment:
             causal_mask = _causal_attention_mask(attention_mask, batch_size, seq_len, hidden_states.device, hidden_states.dtype)
             position_embeddings = model_core.rotary_emb(hidden_states, position_ids=position_ids)
             summaries = {}
+            token_counts = attention_mask.sum(dim=1).to(device=hidden_states.device, dtype=torch.int32)
             for layer_idx, layer in enumerate(model_core.layers):
                 residual = hidden_states
                 normed_hidden = layer.input_layernorm(hidden_states)
@@ -987,6 +1002,7 @@ class InstrumentedQwen3MoeExperiment:
                     v_raw,
                     causal_mask,
                     key_pre_rope=k_pre,
+                    token_counts=token_counts,
                     return_weights=False,
                 )
                 causal_z = layer.self_attn.o_proj(causal.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())

@@ -26,6 +26,7 @@ def build_main_hf_teacher_forcing_spec(base: ExperimentSpec) -> ExperimentSpec:
     spec.collection.run_bridge = False
     spec.collection.streaming_batch_size = max(spec.collection.streaming_batch_size, 16)
     spec.collection.max_batch_tokens = max(spec.collection.max_batch_tokens, 8192)
+    spec.collection.attention_backend = "flex_packed"
     spec.collection.sequence_length_buckets = [128, 256, 384, 512, 768, 1024, 1536, 2048]
     spec.collection.pad_main_batches_to_streaming_size = True
     spec.collection.enable_attention_compile = True
@@ -49,6 +50,7 @@ def build_calibration_hf_spec(base: ExperimentSpec) -> ExperimentSpec:
     spec = _clone_spec(base)
     spec.collection.runtime_backend = "hf"
     spec.collection.calibration_subset_size = max(spec.collection.calibration_subset_size, 100)
+    spec.collection.attention_backend = "sdpa"
     spec.collection.enable_attention_compile = False
     spec.collection.capture_q_vectors = True
     spec.collection.capture_attention_weights_for_all_layers = False
@@ -133,6 +135,7 @@ def describe_run(spec: ExperimentSpec, run_name: str) -> dict[str, Any]:
                 "execution_mode": "batched teacher-forced HF forward passes; no generation backend",
                 "storage_policy": "fp8-first lean corpus cache; no calibration-only tensors",
                 "performance": {
+                    "attention_backend": spec.collection.attention_backend,
                     "attention_compile": bool(spec.collection.enable_attention_compile),
                     "attention_compile_mode": spec.collection.attention_compile_mode,
                     "attention_compile_fullgraph": bool(spec.collection.attention_compile_fullgraph),

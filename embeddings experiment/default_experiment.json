@@ -12,6 +12,7 @@
     "bias_sweep_points": 51,
     "bridge_storage_mode": "summary_only",
     "calibration_subset_size": 64,
+    "attention_backend": "sdpa",
     "enable_attention_compile": true,
     "attention_compile_fullgraph": false,
     "attention_compile_mode": "reduce-overhead",

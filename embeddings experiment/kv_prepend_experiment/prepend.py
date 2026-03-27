@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -17,15 +16,27 @@ class PrependResult:
 _ATTENTION_COMPILE_ENABLED = False
 _ATTENTION_COMPILE_MODE = "reduce-overhead"
 _ATTENTION_COMPILE_FULLGRAPH = False
+_ATTENTION_BACKEND = "sdpa"
 
 
-def configure_attention_compile(*, enabled: bool, mode: str = "reduce-overhead", fullgraph: bool = False):
-    global _ATTENTION_COMPILE_ENABLED, _ATTENTION_COMPILE_MODE, _ATTENTION_COMPILE_FULLGRAPH
+def configure_attention_runtime(
+    *,
+    enabled: bool,
+    mode: str = "reduce-overhead",
+    fullgraph: bool = False,
+    backend: str = "sdpa",
+):
+    global _ATTENTION_COMPILE_ENABLED, _ATTENTION_COMPILE_MODE, _ATTENTION_COMPILE_FULLGRAPH, _ATTENTION_BACKEND
     _ATTENTION_COMPILE_ENABLED = bool(enabled)
     _ATTENTION_COMPILE_MODE = str(mode)
     _ATTENTION_COMPILE_FULLGRAPH = bool(fullgraph)
+    _ATTENTION_BACKEND = str(backend)
     _get_plain_sdpa_kernel.cache_clear()
     _get_prepend_sdpa_kernel.cache_clear()
+
+
+def configure_attention_compile(*, enabled: bool, mode: str = "reduce-overhead", fullgraph: bool = False):
+    configure_attention_runtime(enabled=enabled, mode=mode, fullgraph=fullgraph, backend=_ATTENTION_BACKEND)
 
 
 def rotate_half(x):
@@ -77,11 +88,10 @@ def _prepend_sdpa_no_weights(query_states, key_states, value_states, summary_key
 def _get_plain_sdpa_kernel(enabled: bool, mode: str, fullgraph: bool):
     import torch
 
-    if enabled and hasattr(torch, "compile"):
-        try:
-            return torch.compile(_plain_sdpa_no_weights, mode=mode, fullgraph=fullgraph)
-        except Exception:  # pragma: no cover - compile availability varies by build
-            return _plain_sdpa_no_weights
+    if enabled:
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("attention compile was requested, but torch.compile is unavailable.")
+        return torch.compile(_plain_sdpa_no_weights, mode=mode, fullgraph=fullgraph)
     return _plain_sdpa_no_weights
 
 
@@ -89,12 +99,156 @@ def _get_plain_sdpa_kernel(enabled: bool, mode: str, fullgraph: bool):
 def _get_prepend_sdpa_kernel(enabled: bool, mode: str, fullgraph: bool):
     import torch
 
-    if enabled and hasattr(torch, "compile"):
-        try:
-            return torch.compile(_prepend_sdpa_no_weights, mode=mode, fullgraph=fullgraph)
-        except Exception:  # pragma: no cover - compile availability varies by build
-            return _prepend_sdpa_no_weights
+    if enabled:
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("attention compile was requested, but torch.compile is unavailable.")
+        return torch.compile(_prepend_sdpa_no_weights, mode=mode, fullgraph=fullgraph)
     return _prepend_sdpa_no_weights
+
+
+@lru_cache(maxsize=1)
+def _get_flex_attention_ops():
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+    return create_block_mask, flex_attention
+
+
+def _pack_sequences(tokens, lengths: list[int]):
+    import torch
+
+    parts = []
+    for row_idx, length in enumerate(lengths):
+        if length <= 0:
+            continue
+        parts.append(tokens[row_idx, :, :length, :])
+    if not parts:
+        return tokens.new_empty((1, tokens.shape[1], 0, tokens.shape[-1]))
+    return torch.cat(parts, dim=1).unsqueeze(0)
+
+
+def _unpack_sequences(output_packed, lengths: list[int], batch_size: int, num_heads: int, query_len: int, head_dim: int):
+    out = output_packed.new_zeros((batch_size, num_heads, query_len, head_dim))
+    offset = 0
+    packed = output_packed[0]
+    for row_idx, length in enumerate(lengths):
+        if length <= 0:
+            continue
+        out[row_idx, :, :length, :] = packed[:, offset : offset + length, :]
+        offset += length
+    return out
+
+
+@lru_cache(maxsize=128)
+def _packed_metadata(
+    q_lengths: tuple[int, ...],
+    k_lengths: tuple[int, ...],
+    device_type: str,
+    device_index: int | None,
+):
+    import torch
+
+    device = torch.device(device_type, device_index) if device_index is not None else torch.device(device_type)
+    q_doc = []
+    q_pos = []
+    k_doc = []
+    k_pos = []
+    for doc_idx, (q_len, k_len) in enumerate(zip(q_lengths, k_lengths)):
+        q_len_i = int(q_len)
+        k_len_i = int(k_len)
+        if q_len_i > 0:
+            q_doc.extend([doc_idx] * q_len_i)
+            q_pos.extend(range(q_len_i))
+        if k_len_i > 0:
+            k_doc.extend([doc_idx] * k_len_i)
+            k_pos.extend(range(k_len_i))
+    return (
+        torch.tensor(q_doc, dtype=torch.int32, device=device),
+        torch.tensor(q_pos, dtype=torch.int32, device=device),
+        torch.tensor(k_doc, dtype=torch.int32, device=device),
+        torch.tensor(k_pos, dtype=torch.int32, device=device),
+        int(sum(q_lengths)),
+        int(sum(k_lengths)),
+    )
+
+
+@lru_cache(maxsize=128)
+def _cached_flex_block_mask(
+    q_lengths: tuple[int, ...],
+    k_lengths: tuple[int, ...],
+    num_heads: int,
+    device_type: str,
+    device_index: int | None,
+):
+    q_doc_ids, q_positions, k_doc_ids, k_positions, total_q, total_k = _packed_metadata(
+        q_lengths, k_lengths, device_type, device_index
+    )
+    if total_q <= 0 or total_k <= 0:
+        return None
+    create_block_mask, _ = _get_flex_attention_ops()
+    prepend = bool(any(k_len > q_len for q_len, k_len in zip(q_lengths, k_lengths)))
+    device = q_doc_ids.device
+
+    def mask_mod(batch, head, q_idx, kv_idx):
+        same_doc = q_doc_ids[q_idx] == k_doc_ids[kv_idx]
+        if prepend:
+            causal = k_positions[kv_idx] <= (q_positions[q_idx] + 1)
+        else:
+            causal = k_positions[kv_idx] <= q_positions[q_idx]
+        return same_doc & causal
+
+    return create_block_mask(
+        mask_mod,
+        B=1,
+        H=num_heads,
+        Q_LEN=total_q,
+        KV_LEN=total_k,
+        device=device,
+        _compile=True,
+    )
+
+
+def _flex_attention_no_weights(query_states, key_states, value_states, q_lengths, k_lengths, num_key_value_groups: int):
+    _, flex_attention = _get_flex_attention_ops()
+    batch_size, num_heads, query_len, head_dim = query_states.shape
+    q_lengths_tuple = tuple(int(length) for length in q_lengths)
+    k_lengths_tuple = tuple(int(length) for length in k_lengths)
+    q_packed = _pack_sequences(query_states, list(q_lengths_tuple)).contiguous()
+    k_packed = _pack_sequences(key_states, list(k_lengths_tuple)).contiguous()
+    v_packed = _pack_sequences(value_states, list(k_lengths_tuple)).contiguous()
+    if q_packed.shape[2] == 0 or k_packed.shape[2] == 0:
+        return query_states.new_zeros((batch_size, num_heads, query_len, head_dim))
+    block_mask = _cached_flex_block_mask(
+        q_lengths_tuple,
+        k_lengths_tuple,
+        int(num_heads),
+        query_states.device.type,
+        query_states.device.index,
+    )
+    return _unpack_sequences(
+        flex_attention(
+            q_packed,
+            k_packed,
+            v_packed,
+            block_mask=block_mask,
+            enable_gqa=bool(num_key_value_groups > 1),
+        ),
+        list(q_lengths_tuple),
+        batch_size,
+        num_heads,
+        query_len,
+        head_dim,
+    )
+
+
+@lru_cache(maxsize=8)
+def _get_flex_packed_kernel(enabled: bool, mode: str, fullgraph: bool):
+    import torch
+
+    if enabled:
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("attention compile was requested, but torch.compile is unavailable.")
+        return torch.compile(_flex_attention_no_weights, mode=mode, fullgraph=fullgraph)
+    return _flex_attention_no_weights
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim: int = 1):
@@ -166,6 +320,7 @@ def attention_forward(
     summary_key=None,
     summary_value=None,
     return_weights: bool = True,
+    token_counts=None,
 ):
     import torch
     import torch.nn.functional as F
@@ -191,9 +346,11 @@ def attention_forward(
             )
         used_key = torch.cat([summary_key, key_states], dim=2)
         used_value = torch.cat([summary_value, value_states], dim=2)
-        used_mask = build_prepend_attention_mask(attention_mask, query_states.shape[2], num_slots=1)
+        used_mask = None
 
     if return_weights:
+        if prepend_mode is not None:
+            used_mask = build_prepend_attention_mask(attention_mask, query_states.shape[2], num_slots=1)
         key_repeated = repeat_kv(used_key, module.num_key_value_groups)
         value_repeated = repeat_kv(used_value, module.num_key_value_groups)
         attn_weights = torch.matmul(query_states, key_repeated.transpose(2, 3)) * module.scaling
@@ -202,8 +359,29 @@ def attention_forward(
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_repeated)
     else:
-        try:
-            compile_enabled = bool(_ATTENTION_COMPILE_ENABLED and query_states.is_cuda)
+        compile_enabled = bool(_ATTENTION_COMPILE_ENABLED and query_states.is_cuda)
+        backend = _ATTENTION_BACKEND
+        if backend == "flex_packed":
+            if token_counts is None:
+                raise RuntimeError("flex_packed attention backend requires token_counts.")
+            if not query_states.is_cuda:
+                raise RuntimeError("flex_packed attention backend requires CUDA tensors.")
+            q_lengths = tuple(int(length) for length in token_counts.tolist())
+            k_lengths = tuple(length + 1 if prepend_mode is not None and length > 0 else length for length in q_lengths)
+            kernel = _get_flex_packed_kernel(
+                compile_enabled,
+                _ATTENTION_COMPILE_MODE,
+                _ATTENTION_COMPILE_FULLGRAPH,
+            )
+            attn_output = kernel(
+                query_states.contiguous(),
+                used_key.contiguous(),
+                used_value.contiguous(),
+                q_lengths,
+                k_lengths,
+                int(module.num_key_value_groups),
+            )
+        elif backend == "sdpa":
             if prepend_mode is None:
                 key_repeated = repeat_kv(used_key, module.num_key_value_groups)
                 value_repeated = repeat_kv(used_value, module.num_key_value_groups)
@@ -212,6 +390,7 @@ def attention_forward(
                     _ATTENTION_COMPILE_MODE,
                     _ATTENTION_COMPILE_FULLGRAPH,
                 )
+                used_mask = attention_mask
                 attn_output = kernel(
                     query_states.contiguous(),
                     key_repeated.contiguous(),
@@ -224,6 +403,7 @@ def attention_forward(
                     _ATTENTION_COMPILE_MODE,
                     _ATTENTION_COMPILE_FULLGRAPH,
                 )
+                used_mask = build_prepend_attention_mask(attention_mask, query_states.shape[2], num_slots=1)
                 attn_output = kernel(
                     query_states.contiguous(),
                     key_states.contiguous(),
@@ -233,39 +413,8 @@ def attention_forward(
                     used_mask,
                     int(module.num_key_value_groups),
                 )
-        except Exception:
-            use_cpu_fallback = os.environ.get("KV_PREPEND_REPLAY_ATTENTION_CPU", "0") == "1"
-            target_device = query_states.device
-            query_f = query_states.contiguous().float()
-            key_f = repeat_kv(used_key, module.num_key_value_groups).contiguous().float()
-            value_f = repeat_kv(used_value, module.num_key_value_groups).contiguous().float()
-            mask_f = used_mask
-            if use_cpu_fallback:
-                query_f = query_f.cpu()
-                key_f = key_f.cpu()
-                value_f = value_f.cpu()
-                if mask_f is not None:
-                    mask_f = mask_f.to(device="cpu", dtype=torch.float32)
-            try:
-                attn_scores = torch.einsum("bhqd,bhkd->bhqk", query_f, key_f) * float(module.scaling)
-            except Exception as exc:  # pragma: no cover - debug path
-                raise RuntimeError(
-                    "Replay attention matmul failed with "
-                    f"q={tuple(query_f.shape)}/{query_f.dtype}/{query_f.device}, "
-                    f"k={tuple(key_f.shape)}/{key_f.dtype}/{key_f.device}, "
-                    f"v={tuple(value_f.shape)}/{value_f.dtype}/{value_f.device}, "
-                    f"mask={None if mask_f is None else (tuple(mask_f.shape), mask_f.dtype, mask_f.device)}, "
-                    f"num_kv_groups={getattr(module, 'num_key_value_groups', None)}, "
-                    f"num_heads={getattr(module, 'num_heads', None)}, "
-                    f"num_kv_heads={getattr(module, 'num_kv_heads', None)}"
-                ) from exc
-            if mask_f is not None:
-                attn_scores = attn_scores + mask_f.to(device=attn_scores.device, dtype=attn_scores.dtype)
-            attn_probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32)
-            attn_output = torch.einsum("bhqk,bhkd->bhqd", attn_probs, value_f)
-            if use_cpu_fallback:
-                attn_output = attn_output.to(device=target_device)
-            attn_output = attn_output.to(query_states.dtype)
+        else:
+            raise ValueError(f"Unsupported attention backend: {backend}")
         attn_weights = None
     attn_output = attn_output.transpose(1, 2).contiguous()
 
