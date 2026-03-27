@@ -133,15 +133,14 @@ def attention_forward(
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_repeated)
     else:
-        attn_output = F.scaled_dot_product_attention(
-            query_states,
-            key_repeated,
-            value_repeated,
-            attn_mask=used_mask,
-            dropout_p=0.0,
-            is_causal=False,
-            scale=module.scaling,
-        )
+        query_f = query_states.contiguous().float()
+        key_f = key_repeated.contiguous().float()
+        value_f = value_repeated.contiguous().float()
+        attn_scores = torch.matmul(query_f, key_f.transpose(2, 3)) * float(module.scaling)
+        if used_mask is not None:
+            attn_scores = attn_scores + used_mask.to(device=attn_scores.device, dtype=attn_scores.dtype)
+        attn_probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32)
+        attn_output = torch.matmul(attn_probs, value_f).to(query_states.dtype)
         attn_weights = None
     attn_output = attn_output.transpose(1, 2).contiguous()
 
