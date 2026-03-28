@@ -38,6 +38,8 @@ scaling_metric = "concurrency_utilization"
 [cerebrium.dependencies.pip]
 accelerate = "1.13.0"
 datasets = "4.8.4"
+fbgemm-gpu = "latest"
+fbgemm-gpu-genai = "latest"
 numpy = "latest"
 torch = "latest"
 transformers = "5.4.0"

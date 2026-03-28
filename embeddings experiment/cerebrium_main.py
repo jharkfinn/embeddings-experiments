@@ -137,7 +137,3 @@ def full_smoke() -> dict[str, object]:
         "repo": repo_smoke(),
         "stack": stack_smoke(),
     }
-
-
-if __name__ == "__main__":
-    print(json.dumps(full_smoke(), indent=2, sort_keys=True))
