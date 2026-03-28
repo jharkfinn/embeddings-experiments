@@ -14,6 +14,10 @@ Everything created for this experiment lives in this folder:
 - `spec_bridge_hf_3tasks.json`: bridge echo run
 - `run_kv_prepend_experiment.py`: CLI entrypoint
 - `kv_prepend_experiment/`: collection, evaluation, analysis, and runtime modules
+- `cerebrium.toml`: GPU-backed Cerebrium app config for collection/model-load runs
+- `cerebrium_analysis.toml`: CPU-only Cerebrium app config for analysis runs
+- `run_cerebrium_analysis_cpu.sh`: launcher for CPU-only Cerebrium analysis
+- `launch_cerebrium_analysis_async.py`: async CPU-only Cerebrium analysis launcher with persisted status/output paths
 
 ## Target runtime
 
@@ -107,6 +111,26 @@ python run_kv_prepend_experiment.py \
 
 For calibration, controls, and bridge, use the generated split specs instead of
 the default main spec.
+
+For Cerebrium analysis, use the CPU-only launcher instead of the GPU app:
+
+```bash
+./run_cerebrium_analysis_cpu.sh
+```
+
+For a traceable async analysis run with a unique run ID, persisted `status.json`,
+and explicit remote paths for logs and outputs:
+
+```bash
+python launch_cerebrium_analysis_async.py --workers 10
+```
+
+That launcher deploys the CPU-only Cerebrium app, posts
+`analyze_latest_calibration` asynchronously, and prints the remote paths for:
+
+- `analysis_runs/<analysis_run_id>/status.json`
+- `analysis_runs/<analysis_run_id>/analysis_run.log`
+- `analysis_runs/<analysis_run_id>/capture_analysis.json`
 
 `records.json` is a list of objects with:
 

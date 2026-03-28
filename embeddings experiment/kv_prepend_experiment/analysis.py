@@ -7,7 +7,7 @@ import math
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -274,10 +274,24 @@ def summarize_bundles(bundles):
     return _finalize_summary(summary)
 
 
-def analyze_capture_directory(capture_dir: str | Path, output_path: str | Path):
+def analyze_capture_directory(
+    capture_dir: str | Path,
+    output_path: str | Path,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+):
     capture_dir = Path(capture_dir)
     logger.info("analysis_start capture_dir=%s", capture_dir)
     capture_paths = sorted(capture_dir.glob("*.pt"))
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "stage": "analysis_start",
+                "capture_dir": str(capture_dir),
+                "total_shards": len(capture_paths),
+                "completed_shards": 0,
+            }
+        )
     if not capture_paths:
         summary = {"num_bundles": 0, "layers": {}}
     else:
@@ -287,9 +301,9 @@ def analyze_capture_directory(capture_dir: str | Path, output_path: str | Path):
         for env_name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
             os.environ[env_name] = "1"
         configured_workers = int(os.environ.get("KV_PREPEND_ANALYSIS_WORKERS", "0") or "0")
-        worker_count = min(4, max(1, os.cpu_count() or 1), len(capture_paths))
+        worker_count = min(max(1, os.cpu_count() or 1), len(capture_paths))
         if configured_workers > 0:
-            worker_count = min(worker_count, configured_workers)
+            worker_count = min(len(capture_paths), configured_workers)
         ctx = mp.get_context("spawn")
         logger.info(
             "analysis_parallel workers=%s shards=%s start_method=%s blas_threads=1",
@@ -297,6 +311,15 @@ def analyze_capture_directory(capture_dir: str | Path, output_path: str | Path):
             len(capture_paths),
             ctx.get_start_method(),
         )
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "stage": "analysis_parallel",
+                    "worker_count": worker_count,
+                    "total_shards": len(capture_paths),
+                    "completed_shards": 0,
+                }
+            )
         partials: list[dict[str, Any]] = []
         with ProcessPoolExecutor(max_workers=worker_count, mp_context=ctx) as executor:
             future_to_path = {
@@ -315,6 +338,16 @@ def analyze_capture_directory(capture_dir: str | Path, output_path: str | Path):
                     path,
                     partial.get("num_bundles", 0),
                 )
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "stage": "analysis_shard_done",
+                            "completed_shards": completed,
+                            "total_shards": len(capture_paths),
+                            "last_path": str(path),
+                            "last_bundles": int(partial.get("num_bundles", 0)),
+                        }
+                    )
                 partials.append(partial)
         summary = _merge_summary_partials(partials)
     output_path = Path(output_path)
@@ -326,4 +359,15 @@ def analyze_capture_directory(capture_dir: str | Path, output_path: str | Path):
         summary["num_bundles"],
         len(summary["layers"]),
     )
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "stage": "analysis_done",
+                "completed_shards": len(capture_paths),
+                "total_shards": len(capture_paths),
+                "output_path": str(output_path),
+                "num_bundles": int(summary.get("num_bundles", 0)),
+                "num_layers": len(summary.get("layers", {})),
+            }
+        )
     return summary

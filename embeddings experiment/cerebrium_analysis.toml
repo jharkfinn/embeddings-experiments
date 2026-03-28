@@ -1,19 +1,14 @@
 [cerebrium.deployment]
-name = "kv-prepend-l40s-smoke"
+name = "kv-prepend-analysis-cpu"
 python_version = "3.11"
 docker_base_image_url = "debian:bookworm-slim"
 disable_auth = true
 include = [
-  "./main.py",
   "./cerebrium_main.py",
-  "./cerebrium.toml",
+  "./cerebrium_analysis.toml",
   "./kv_prepend_experiment/**/*",
-  "./run_kv_prepend_experiment.py",
   "./default_experiment.json",
   "./spec_calibration_hf_3tasks.json",
-  "./spec_main_hf_teacher_forcing_l40s_3tasks.json",
-  "./spec_main_hf_teacher_forcing_3tasks.json",
-  "./smoke_records.json",
 ]
 exclude = [
   "./legacy/**/*",
@@ -23,10 +18,9 @@ exclude = [
 ]
 
 [cerebrium.hardware]
-cpu = 8.0
-memory = 60.0
-compute = "ADA_L40"
-gpu_count = 1
+cpu = 10
+memory = 32.0
+compute = "CPU"
 provider = "aws"
 region = "us-east-1"
 
@@ -39,9 +33,5 @@ replica_concurrency = 1
 scaling_metric = "concurrency_utilization"
 
 [cerebrium.dependencies.pip]
-accelerate = "1.13.0"
-datasets = "4.8.4"
-kernels = "latest"
 numpy = "latest"
 torch = "latest"
-transformers = "5.4.0"
