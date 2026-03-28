@@ -384,15 +384,11 @@ def analyze_capture_directory(
                 }
             )
         partials: list[dict[str, Any]] = []
-        with ProcessPoolExecutor(max_workers=worker_count, mp_context=ctx) as executor:
-            future_to_path = {
-                executor.submit(_summarize_capture_path, str(path)): path
-                for path in capture_paths
-            }
-            completed = 0
-            for future in as_completed(future_to_path):
-                path = future_to_path[future]
-                partial = future.result()
+        completed = 0
+        if worker_count == 1:
+            logger.info("analysis_serial shards=%s", len(capture_paths))
+            for path in capture_paths:
+                partial = _summarize_capture_path(str(path))
                 completed += 1
                 logger.info(
                     "analysis_shard_done completed=%s/%s path=%s bundles=%s",
@@ -412,6 +408,34 @@ def analyze_capture_directory(
                         }
                     )
                 partials.append(partial)
+        else:
+            with ProcessPoolExecutor(max_workers=worker_count, mp_context=ctx) as executor:
+                future_to_path = {
+                    executor.submit(_summarize_capture_path, str(path)): path
+                    for path in capture_paths
+                }
+                for future in as_completed(future_to_path):
+                    path = future_to_path[future]
+                    partial = future.result()
+                    completed += 1
+                    logger.info(
+                        "analysis_shard_done completed=%s/%s path=%s bundles=%s",
+                        completed,
+                        len(capture_paths),
+                        path,
+                        partial.get("num_bundles", 0),
+                    )
+                    if progress_callback is not None:
+                        progress_callback(
+                            {
+                                "stage": "analysis_shard_done",
+                                "completed_shards": completed,
+                                "total_shards": len(capture_paths),
+                                "last_path": str(path),
+                                "last_bundles": int(partial.get("num_bundles", 0)),
+                            }
+                        )
+                    partials.append(partial)
         summary = _merge_summary_partials(partials)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
