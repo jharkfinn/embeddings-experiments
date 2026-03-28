@@ -24,7 +24,7 @@ exclude = [
 
 [cerebrium.hardware]
 cpu = 8.0
-memory = 64.0
+memory = 60.0
 compute = "ADA_L40"
 gpu_count = 1
 provider = "aws"
