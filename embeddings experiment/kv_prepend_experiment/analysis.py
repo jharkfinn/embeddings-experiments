@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 
+from .capture_io import iter_payload_bundles
 from .evaluation import _content_row_mask, _find_layer_capture, _tensor_to_numpy, load_capture_payloads
 from .quantization import cosine_similarity
 from .types import CaptureCondition, ExampleCaptureBundle
@@ -97,7 +98,7 @@ def _summarize_capture_path(path_str: str) -> dict[str, Any]:
     path = Path(path_str)
     payload = torch.load(path, map_location="cpu", weights_only=False)
     partial: dict[str, Any] = {"num_bundles": 0, "layers": {}}
-    for bundle in payload.get("bundles", []):
+    for bundle in iter_payload_bundles(payload):
         _accumulate_bundle(partial, bundle)
     return partial
 

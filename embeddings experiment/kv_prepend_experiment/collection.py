@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .analysis import summarize_bundles
+from .capture_io import build_batched_capture_payload, split_pass_capture, trim_pass_capture
 from .config import ExperimentSpec
 from .prepend import (
     apply_rotary_pos_emb,
@@ -232,6 +233,36 @@ class CollectionWriter:
         if self._error is not None:
             raise RuntimeError("Background capture writer failed.") from self._error
 
+    def write_payload(
+        self,
+        batch_id: str,
+        payload: dict[str, Any],
+        *,
+        row_count: int,
+        target_subdir: str = "captures",
+        transfer_event=None,
+        staged_tensors: int = 0,
+        staged_groups: int = 0,
+        staged_bytes: int = 0,
+    ):
+        self._raise_if_error()
+        path = self.root / target_subdir / f"{batch_id}.pt"
+        self._queue.put(
+            (
+                path,
+                payload,
+                transfer_event,
+                {
+                    "batch_id": batch_id,
+                    "bundle_count": row_count,
+                    "staged_tensors": staged_tensors,
+                    "staged_groups": staged_groups,
+                    "staged_bytes": staged_bytes,
+                },
+            )
+        )
+        return path
+
     def write_batch(
         self,
         batch_id: str,
@@ -243,29 +274,22 @@ class CollectionWriter:
         staged_groups: int = 0,
         staged_bytes: int = 0,
     ):
-        self._raise_if_error()
         payload = {
             "schema_version": 2,
             "batch_id": batch_id,
             "metadata": extra_metadata or {},
             "bundles": bundles,
         }
-        path = self.root / target_subdir / f"{batch_id}.pt"
-        self._queue.put(
-            (
-                path,
-                payload,
-                transfer_event,
-                {
-                    "batch_id": batch_id,
-                    "bundle_count": len(bundles),
-                    "staged_tensors": staged_tensors,
-                    "staged_groups": staged_groups,
-                    "staged_bytes": staged_bytes,
-                },
-            )
+        return self.write_payload(
+            batch_id,
+            payload,
+            row_count=len(bundles),
+            target_subdir=target_subdir,
+            transfer_event=transfer_event,
+            staged_tensors=staged_tensors,
+            staged_groups=staged_groups,
+            staged_bytes=staged_bytes,
         )
-        return path
 
     def flush(self):
         start = time.perf_counter()
@@ -597,20 +621,7 @@ class InstrumentedQwen3MoeExperiment:
         )
 
     def _split_pass_capture(self, pass_capture: PassCapture, batch_examples: list[PromptExample]) -> list[PassCapture]:
-        batch_size = len(batch_examples)
-        outputs: list[PassCapture] = []
-        for row_idx in range(batch_size):
-            captures_by_condition: dict[str, list[LayerCapture]] = {}
-            for condition, captures in pass_capture.captures_by_condition.items():
-                captures_by_condition[condition] = [self._slice_layer_capture(capture, row_idx, batch_size) for capture in captures]
-            outputs.append(
-                PassCapture(
-                    pass_name=pass_capture.pass_name,
-                    rope_mode=pass_capture.rope_mode,
-                    captures_by_condition=captures_by_condition,
-                )
-            )
-        return outputs
+        return split_pass_capture(pass_capture, len(batch_examples))
 
     def _split_summary_batch(self, summaries: dict[int, dict[str, Any]], batch_examples: list[PromptExample]):
         batch_size = len(batch_examples)
@@ -1475,56 +1486,84 @@ class InstrumentedQwen3MoeExperiment:
                 batch_index,
                 time.perf_counter() - pass2_start,
             )
-            split_start = time.perf_counter()
-            pass1_split = self._split_pass_capture(pass1_batched, batch_examples)
-            pass2_split = self._split_pass_capture(pass2_batched, batch_examples)
+            postprocess_start = time.perf_counter()
             batch_multi_slot = {}
             calibration_examples = [example for example in batch_examples if example.calibration]
             if calibration_examples:
                 for example, multi_slot in zip(calibration_examples, self.collect_multi_slot_summaries_batch(calibration_examples)):
                     batch_multi_slot[example.text_id] = multi_slot
+            needs_bundle_split = retain_bundles or not write_batches
+            if needs_bundle_split:
+                pass1_split = self._split_pass_capture(pass1_batched, batch_examples)
+                pass2_split = self._split_pass_capture(pass2_batched, batch_examples)
             logger.info(
-                "batch_postprocess_done dataset=%s batch_index=%s seconds=%.3f calibration_examples=%s",
+                "batch_postprocess_done dataset=%s batch_index=%s seconds=%.3f calibration_examples=%s split_bundles=%s",
                 dataset_name,
                 batch_index,
-                time.perf_counter() - split_start,
+                time.perf_counter() - postprocess_start,
                 len(calibration_examples),
+                needs_bundle_split,
             )
             batch_bundles: list[ExampleCaptureBundle] = []
-            for row_idx, example in enumerate(batch_examples):
-                bundle = ExampleCaptureBundle(
-                    text_id=example.text_id,
-                    dataset_name=dataset_name,
-                    kind=example.kind,
-                    prompt=example.prompt,
-                    token_ids=list(example.prompt_token_ids or []),
-                    content_token_mask=list(example.content_token_mask or []),
-                    passes=[pass1_split[row_idx], pass2_split[row_idx]],
-                    metadata={"calibration": example.calibration, "tags": list(example.tags)},
-                )
-                if example.calibration:
-                    bundle.metadata["multi_slot_summaries"] = batch_multi_slot[example.text_id]
-                batch_bundles.append(bundle)
-            batch_id = f"{dataset_name}_{control_summary_mode or 'main'}_{batch_index}_{len(batch_bundles)}_{uuid.uuid4().hex[:8]}"
+            if needs_bundle_split:
+                for row_idx, example in enumerate(batch_examples):
+                    bundle = ExampleCaptureBundle(
+                        text_id=example.text_id,
+                        dataset_name=dataset_name,
+                        kind=example.kind,
+                        prompt=example.prompt,
+                        token_ids=list(example.prompt_token_ids or []),
+                        content_token_mask=list(example.content_token_mask or []),
+                        passes=[pass1_split[row_idx], pass2_split[row_idx]],
+                        metadata={"calibration": example.calibration, "tags": list(example.tags)},
+                    )
+                    if example.calibration:
+                        bundle.metadata["multi_slot_summaries"] = batch_multi_slot[example.text_id]
+                    batch_bundles.append(bundle)
+            batch_id = f"{dataset_name}_{control_summary_mode or 'main'}_{batch_index}_{len(batch_bundles) or len(batch_examples)}_{uuid.uuid4().hex[:8]}"
             transfer_event, staged_tensors, staged_groups, staged_bytes = self._finalize_transfer_session()
             if write_batches:
-                path = self.writer.write_batch(
-                    batch_id,
-                    batch_bundles,
-                    extra_metadata={
-                        "dataset_name": dataset_name,
-                        "control": control_summary_mode,
-                        "runtime_stack": getattr(self, "runtime_stack", {}),
-                        "model_contract": None if self.contract is None else self.contract.__dict__,
-                        "batch_index": batch_index,
-                        "batch_size": len(batch_examples),
-                    },
-                    target_subdir=target,
-                    transfer_event=transfer_event,
-                    staged_tensors=staged_tensors,
-                    staged_groups=staged_groups,
-                    staged_bytes=staged_bytes,
-                )
+                extra_metadata = {
+                    "dataset_name": dataset_name,
+                    "control": control_summary_mode,
+                    "runtime_stack": getattr(self, "runtime_stack", {}),
+                    "model_contract": None if self.contract is None else self.contract.__dict__,
+                    "batch_index": batch_index,
+                    "batch_size": len(batch_examples),
+                }
+                if needs_bundle_split:
+                    path = self.writer.write_batch(
+                        batch_id,
+                        batch_bundles,
+                        extra_metadata=extra_metadata,
+                        target_subdir=target,
+                        transfer_event=transfer_event,
+                        staged_tensors=staged_tensors,
+                        staged_groups=staged_groups,
+                        staged_bytes=staged_bytes,
+                    )
+                else:
+                    payload = build_batched_capture_payload(
+                        batch_id=batch_id,
+                        dataset_name=dataset_name,
+                        batch_examples=batch_examples,
+                        passes=[
+                            trim_pass_capture(pass1_batched, len(batch_examples)),
+                            trim_pass_capture(pass2_batched, len(batch_examples)),
+                        ],
+                        extra_metadata=extra_metadata,
+                        multi_slot_by_text_id=batch_multi_slot,
+                    )
+                    path = self.writer.write_payload(
+                        batch_id,
+                        payload,
+                        row_count=len(batch_examples),
+                        target_subdir=target,
+                        transfer_event=transfer_event,
+                        staged_tensors=staged_tensors,
+                        staged_groups=staged_groups,
+                        staged_bytes=staged_bytes,
+                    )
                 path_list.append(path)
             if not write_batches or retain_bundles:
                 sync_start = time.perf_counter()

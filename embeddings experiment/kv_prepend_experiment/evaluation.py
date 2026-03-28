@@ -16,6 +16,7 @@ from .quantization import (
     mean_pool_trinary,
     trinarize_array,
 )
+from .capture_io import iter_payload_bundles
 from .types import CaptureCondition, ExampleCaptureBundle, RetrievalTask
 
 
@@ -30,7 +31,7 @@ def load_capture_payloads(capture_dir: str | Path):
 
 def iter_bundles(capture_dir: str | Path):
     for _, payload in load_capture_payloads(capture_dir):
-        for bundle in payload["bundles"]:
+        for bundle in iter_payload_bundles(payload):
             yield bundle
 
 
