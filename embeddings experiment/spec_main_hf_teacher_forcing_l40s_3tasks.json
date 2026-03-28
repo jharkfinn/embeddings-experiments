@@ -1,6 +1,6 @@
 {
   "collection": {
-    "attention_backend": "sdpa",
+    "attention_backend": "flex_packed",
     "attention_compile_fullgraph": false,
     "attention_compile_mode": "default",
     "attention_weight_layers": [
@@ -14,12 +14,12 @@
     "bias_sweep_min": -6.0,
     "bias_sweep_points": 51,
     "bridge_storage_mode": "summary_only",
-    "calibration_subset_size": 100,
+    "calibration_subset_size": 0,
     "capture_attention_weights_for_all_layers": false,
-    "capture_q_vectors": true,
+    "capture_q_vectors": false,
     "controls_storage_mode": "summary_only",
     "default_rope_mode": "reuse_rotated",
-    "enable_attention_compile": false,
+    "enable_attention_compile": true,
     "main_capture_signals": [
       "attention_output",
       "pre_moe",
@@ -95,7 +95,7 @@
     ],
     "run_bridge": false,
     "run_controls": false,
-    "runtime_backend": "hf",
+    "runtime_backend": "hf_teacher_forcing",
     "save_every_batch": true,
     "sequence_length_buckets": [
       128,
@@ -108,7 +108,7 @@
       2048
     ],
     "sort_by_length": true,
-    "streaming_batch_size": 2,
+    "streaming_batch_size": 8,
     "writer_queue_size": 4
   },
   "evaluation": {
@@ -196,17 +196,17 @@
     "preflight_max_used_memory_gib": 8.0,
     "quantization": "fp8",
     "tokenizer_name": null,
-    "torch_dtype": "bfloat16",
+    "torch_dtype": "auto",
     "trust_remote_code": true
   },
   "output": {
-    "analysis_dir": "analysis_calibration",
-    "artifacts_dir": "artifacts_calibration",
+    "analysis_dir": "analysis_main_l40s",
+    "artifacts_dir": "artifacts_main_l40s",
     "base_dir": ".",
-    "bridge_dir": "bridge_calibration",
-    "captures_dir": "captures_calibration",
-    "controls_dir": "controls_calibration",
-    "evaluation_dir": "evaluation_calibration"
+    "bridge_dir": "bridge_main_l40s",
+    "captures_dir": "captures_main_l40s",
+    "controls_dir": "controls_main_l40s",
+    "evaluation_dir": "evaluation_main_l40s"
   },
   "prompts": {
     "bridge_separator": "\n<kv-prepend-separator>\n",

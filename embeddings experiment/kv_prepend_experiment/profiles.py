@@ -46,6 +46,20 @@ def build_main_hf_teacher_forcing_spec(base: ExperimentSpec) -> ExperimentSpec:
     return spec
 
 
+def build_main_hf_teacher_forcing_l40s_spec(base: ExperimentSpec) -> ExperimentSpec:
+    spec = build_main_hf_teacher_forcing_spec(base)
+    spec.model.torch_dtype = "auto"
+    spec.collection.streaming_batch_size = min(spec.collection.streaming_batch_size, 8)
+    spec.collection.max_batch_tokens = min(spec.collection.max_batch_tokens, 4096)
+    spec.output.artifacts_dir = "artifacts_main_l40s"
+    spec.output.captures_dir = "captures_main_l40s"
+    spec.output.evaluation_dir = "evaluation_main_l40s"
+    spec.output.analysis_dir = "analysis_main_l40s"
+    spec.output.controls_dir = "controls_main_l40s"
+    spec.output.bridge_dir = "bridge_main_l40s"
+    return spec
+
+
 def build_calibration_hf_spec(base: ExperimentSpec) -> ExperimentSpec:
     spec = _clone_spec(base)
     spec.collection.runtime_backend = "hf"
@@ -101,6 +115,7 @@ def named_run_specs(base: ExperimentSpec) -> dict[str, ExperimentSpec]:
     main_spec = build_main_hf_teacher_forcing_spec(base)
     return {
         "main_hf_teacher_forcing_3tasks": main_spec,
+        "main_hf_teacher_forcing_l40s_3tasks": build_main_hf_teacher_forcing_l40s_spec(base),
         "calibration_hf_3tasks": build_calibration_hf_spec(base),
         "controls_hf_3tasks": build_controls_hf_spec(base),
         "bridge_hf_3tasks": build_bridge_hf_spec(base),
@@ -141,6 +156,48 @@ def describe_run(spec: ExperimentSpec, run_name: str) -> dict[str, Any]:
                     "attention_compile_fullgraph": bool(spec.collection.attention_compile_fullgraph),
                     "sequence_length_buckets": list(spec.collection.sequence_length_buckets),
                     "pad_main_batches_to_streaming_size": bool(spec.collection.pad_main_batches_to_streaming_size),
+                },
+                "omits": [
+                    "q_pre_rope",
+                    "attention_weights",
+                    "beta",
+                    "final_token_k_raw",
+                    "final_token_k_rot",
+                    "final_token_v",
+                    "position_ids",
+                    "multi_slot_summaries",
+                    "bias_spectrum_signature",
+                    "bias_spectrum_transitions",
+                ],
+            },
+            "outputs": {
+                "captures_dir": spec.output.captures_dir,
+                "evaluation_dir": spec.output.evaluation_dir,
+                "analysis_dir": spec.output.analysis_dir,
+            },
+        }
+    if run_name == "main_hf_teacher_forcing_l40s_3tasks":
+        return {
+            "run_name": run_name,
+            "runtime_backend": spec.collection.runtime_backend,
+            "datasets": list(spec.evaluation.dataset_names),
+            "captures": {
+                **common,
+                "dense_layers": list(spec.collection.main_dense_layers),
+                "router_layers": list(spec.collection.main_router_layers),
+                "signals": list(spec.collection.main_capture_signals),
+                "execution_mode": "batched teacher-forced HF forward passes; reduced-memory L40S profile",
+                "storage_policy": "fp8-first lean corpus cache; no calibration-only tensors",
+                "performance": {
+                    "attention_backend": spec.collection.attention_backend,
+                    "attention_compile": bool(spec.collection.enable_attention_compile),
+                    "attention_compile_mode": spec.collection.attention_compile_mode,
+                    "attention_compile_fullgraph": bool(spec.collection.attention_compile_fullgraph),
+                    "sequence_length_buckets": list(spec.collection.sequence_length_buckets),
+                    "pad_main_batches_to_streaming_size": bool(spec.collection.pad_main_batches_to_streaming_size),
+                    "streaming_batch_size": int(spec.collection.streaming_batch_size),
+                    "max_batch_tokens": int(spec.collection.max_batch_tokens),
+                    "torch_dtype": spec.model.torch_dtype,
                 },
                 "omits": [
                     "q_pre_rope",

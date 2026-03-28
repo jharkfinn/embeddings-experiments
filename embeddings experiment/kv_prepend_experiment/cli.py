@@ -34,6 +34,7 @@ def parse_args():
         required=True,
         choices=[
             "main_hf_teacher_forcing_3tasks",
+            "main_hf_teacher_forcing_l40s_3tasks",
             "calibration_hf_3tasks",
             "controls_hf_3tasks",
             "bridge_hf_3tasks",

@@ -188,7 +188,10 @@ def load_model_and_tokenizer(model_spec):
         "device_map": device_map,
     }
     if model_spec.torch_dtype:
-        model_kwargs["torch_dtype"] = getattr(torch, model_spec.torch_dtype)
+        if str(model_spec.torch_dtype).lower() == "auto":
+            model_kwargs["torch_dtype"] = "auto"
+        else:
+            model_kwargs["torch_dtype"] = getattr(torch, model_spec.torch_dtype)
     if model_spec.quantization.lower() == "fp8":
         quantization_config = build_fp8_quantization_config(transformers)
         if quantization_config is None:

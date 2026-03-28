@@ -193,6 +193,7 @@
     "max_length": 2048,
     "model_name": "Qwen/Qwen3-30B-A3B",
     "output_attentions": true,
+    "preflight_max_used_memory_gib": 8.0,
     "quantization": "fp8",
     "tokenizer_name": null,
     "torch_dtype": "bfloat16",

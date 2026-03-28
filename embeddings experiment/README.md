@@ -8,6 +8,7 @@ Everything created for this experiment lives in this folder:
 
 - `default_experiment.json`: default runtime spec
 - `spec_main_hf_teacher_forcing_3tasks.json`: lean 3-task main-run contract
+- `spec_main_hf_teacher_forcing_l40s_3tasks.json`: reduced-memory main-run contract for 48GB-class GPUs
 - `spec_calibration_hf_3tasks.json`: exact calibration run
 - `spec_controls_hf_3tasks.json`: control-only calibration run
 - `spec_bridge_hf_3tasks.json`: bridge echo run
@@ -66,6 +67,7 @@ python run_kv_prepend_experiment.py write-split-specs
 
 ```bash
 python run_kv_prepend_experiment.py describe-run --run-name main_hf_teacher_forcing_3tasks
+python run_kv_prepend_experiment.py describe-run --run-name main_hf_teacher_forcing_l40s_3tasks
 python run_kv_prepend_experiment.py describe-run --run-name calibration_hf_3tasks
 python run_kv_prepend_experiment.py describe-run --run-name controls_hf_3tasks
 python run_kv_prepend_experiment.py describe-run --run-name bridge_hf_3tasks
@@ -85,6 +87,18 @@ teacher-forced HF spec:
 ```bash
 python run_kv_prepend_experiment.py \
   --spec spec_main_hf_teacher_forcing_3tasks.json \
+  collect \
+  --records-json records_nanobeir_3tasks.json \
+  --dataset-name nanobeir_3tasks
+```
+
+For a reduced-memory 48GB-class GPU target such as an L40S, use the dedicated
+L40S profile instead. It keeps the same signal families but lowers the main
+batch envelope and loads with `torch_dtype="auto"`:
+
+```bash
+python run_kv_prepend_experiment.py \
+  --spec spec_main_hf_teacher_forcing_l40s_3tasks.json \
   collect \
   --records-json records_nanobeir_3tasks.json \
   --dataset-name nanobeir_3tasks
