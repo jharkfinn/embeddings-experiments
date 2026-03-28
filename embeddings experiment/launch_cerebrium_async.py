@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -84,6 +85,32 @@ def _post_async(endpoint: str, token: str | None, payload: dict[str, object]) ->
     )
     with urllib.request.urlopen(request, timeout=60) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _post_async_with_retry(
+    endpoint: str,
+    token: str | None,
+    payload: dict[str, object],
+    *,
+    retries: int,
+    delay_seconds: float,
+) -> dict[str, object]:
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return _post_async(endpoint, token, payload)
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code != 404 or attempt >= retries:
+                raise
+            time.sleep(delay_seconds * (attempt + 1))
+        except Exception as exc:
+            last_error = exc
+            if attempt >= retries:
+                raise
+            time.sleep(delay_seconds * (attempt + 1))
+    assert last_error is not None
+    raise last_error
 
 
 def _api_get_json(url: str, token: str | None) -> object:
@@ -216,6 +243,8 @@ def main() -> int:
     parser.add_argument("--keep-app", action="store_true")
     parser.add_argument("--poll-seconds", type=float, default=10.0)
     parser.add_argument("--timeout-seconds", type=float, default=43200.0)
+    parser.add_argument("--submit-retries", type=int, default=8)
+    parser.add_argument("--submit-retry-seconds", type=float, default=3.0)
     args = parser.parse_args()
 
     cli_config = _read_cli_config()
@@ -278,7 +307,13 @@ def main() -> int:
         f"{urllib.parse.quote(project)}/{urllib.parse.quote(app_name)}/"
         f"{args.function}?async=true"
     )
-    response = _post_async(endpoint, token, function_payload)
+    response = _post_async_with_retry(
+        endpoint,
+        token,
+        function_payload,
+        retries=args.submit_retries,
+        delay_seconds=args.submit_retry_seconds,
+    )
     run_id = str(response.get("run_id", ""))
     result = {
         "function": args.function,

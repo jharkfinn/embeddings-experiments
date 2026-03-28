@@ -185,7 +185,7 @@ def radial_tangential_decomposition(h_base: np.ndarray, delta_z: np.ndarray, eps
 
 
 def token_collapse_panel(tokens: np.ndarray):
-    tokens = np.asarray(tokens, dtype=np.float32)
+    tokens = np.asarray(tokens, dtype=np.float64)
     if tokens.ndim != 2 or tokens.size == 0:
         return {"effective_rank": 0.0, "pairwise_cosine_mean": 0.0, "pairwise_cosine_std": 0.0}
     finite_rows = np.all(np.isfinite(tokens), axis=1)
@@ -194,14 +194,27 @@ def token_collapse_panel(tokens: np.ndarray):
         return {"effective_rank": 0.0, "pairwise_cosine_mean": 0.0, "pairwise_cosine_std": 0.0}
     tokens = np.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
     centered = tokens - tokens.mean(axis=0, keepdims=True)
-    covariance = centered.T @ centered / max(1, tokens.shape[0] - 1)
-    covariance = np.nan_to_num(covariance, nan=0.0, posinf=0.0, neginf=0.0)
+    centered = np.nan_to_num(centered, nan=0.0, posinf=0.0, neginf=0.0)
+    scale = float(np.max(np.abs(centered))) if centered.size else 0.0
+    if scale > 0.0:
+        centered = centered / scale
     try:
-        singular_values = np.linalg.svd(covariance, compute_uv=False)
+        singular_values = np.linalg.svd(centered, full_matrices=False, compute_uv=False)
     except np.linalg.LinAlgError:
         logger.warning("analysis_svd_nonconverged rows=%s width=%s", tokens.shape[0], tokens.shape[1])
-        singular_values = np.array([], dtype=np.float32)
-    effective_rank = float(np.exp(-(p := singular_values / singular_values.sum() if singular_values.sum() > 0 else singular_values).dot(np.log(np.clip(p, 1e-12, None))))) if singular_values.size > 0 and singular_values.sum() > 0 else 0.0
+        singular_values = np.array([], dtype=np.float64)
+    energy = singular_values * singular_values if singular_values.size > 0 else singular_values
+    effective_rank = (
+        float(
+            np.exp(
+                -(
+                    p := energy / energy.sum() if energy.sum() > 0 else energy
+                ).dot(np.log(np.clip(p, 1e-12, None)))
+            )
+        )
+        if energy.size > 0 and energy.sum() > 0
+        else 0.0
+    )
     norms = np.linalg.norm(tokens, axis=-1, keepdims=True)
     norms = np.nan_to_num(norms, nan=0.0, posinf=0.0, neginf=0.0)
     unit = tokens / np.clip(norms, 1e-6, None)
@@ -212,6 +225,7 @@ def token_collapse_panel(tokens: np.ndarray):
         cosine_values = cosine_matrix[mask]
     else:
         cosine_values = cosine_matrix.reshape(-1)
+    cosine_values = np.nan_to_num(cosine_values, nan=0.0, posinf=0.0, neginf=0.0)
     return {
         "effective_rank": effective_rank,
         "pairwise_cosine_mean": float(cosine_values.mean()),
