@@ -112,32 +112,63 @@ class AsyncTransferSession:
         self._device = None
         self.staged_bytes = 0
         self.staged_tensors = 0
+        self.staged_groups = 0
 
-    def stage_tensor(self, tensor, dtype=None):
-        if tensor is None:
-            return None
+    def _normalize_tensor(self, tensor, dtype=None):
         torch = import_torch()
-        if not isinstance(tensor, torch.Tensor):
+        if tensor is None or not isinstance(tensor, torch.Tensor):
             return tensor
         src = tensor.detach()
         if dtype is not None and src.dtype != dtype:
             src = src.to(dtype=dtype)
-        if src.device.type != "cuda":
-            out = src.cpu()
-            if dtype is not None and out.dtype != dtype:
-                out = out.to(dtype=dtype)
-            return out
-        if self._copy_stream is None:
-            self._device = src.device
-            self._copy_stream = torch.cuda.Stream(device=src.device)
-        current_stream = torch.cuda.current_stream(device=src.device)
-        self._copy_stream.wait_stream(current_stream)
-        with torch.cuda.stream(self._copy_stream):
-            dst = torch.empty(src.shape, dtype=src.dtype, device="cpu", pin_memory=True)
-            dst.copy_(src, non_blocking=True)
-        self.staged_tensors += 1
-        self.staged_bytes += int(src.numel() * src.element_size())
-        return dst
+        return src
+
+    def stage_tensor_group(self, tensors: dict[str, tuple[Any, Any | None]]):
+        if not tensors:
+            return {}
+        torch = import_torch()
+        normalized: dict[str, Any] = {}
+        grouped: dict[tuple[str, int | None, str], list[tuple[str, Any]]] = {}
+        for name, (tensor, dtype) in tensors.items():
+            src = self._normalize_tensor(tensor, dtype=dtype)
+            normalized[name] = src
+            if src is None or not isinstance(src, torch.Tensor):
+                continue
+            key = (src.device.type, src.device.index, str(src.dtype))
+            grouped.setdefault(key, []).append((name, src))
+        outputs = dict(normalized)
+        for (_, _, _), group_items in grouped.items():
+            first = group_items[0][1]
+            if first.device.type != "cuda":
+                for name, src in group_items:
+                    outputs[name] = src.cpu()
+                continue
+            if self._copy_stream is None:
+                self._device = first.device
+                self._copy_stream = torch.cuda.Stream(device=first.device)
+            current_stream = torch.cuda.current_stream(device=first.device)
+            self._copy_stream.wait_stream(current_stream)
+            flat_tensors = []
+            total_numel = 0
+            for name, src in group_items:
+                flat = src.contiguous().view(-1)
+                flat_tensors.append((name, src, flat, total_numel))
+                total_numel += int(flat.numel())
+            with torch.cuda.stream(self._copy_stream):
+                packed = torch.empty(total_numel, dtype=first.dtype, device="cpu", pin_memory=True)
+                for _, _, flat, offset in flat_tensors:
+                    packed[offset : offset + flat.numel()].copy_(flat, non_blocking=True)
+            for name, src, flat, offset in flat_tensors:
+                outputs[name] = packed[offset : offset + flat.numel()].view(src.shape)
+                self.staged_tensors += 1
+                self.staged_bytes += int(src.numel() * src.element_size())
+            self.staged_groups += 1
+        return outputs
+
+    def stage_tensor(self, tensor, dtype=None):
+        if tensor is None:
+            return None
+        return self.stage_tensor_group({"value": (tensor, dtype)})["value"]
 
     def finalize_event(self):
         torch = import_torch()
@@ -182,13 +213,14 @@ class CollectionWriter:
                 torch.save(payload, path)
                 save_s = time.perf_counter() - save_start
                 logger.info(
-                    "writer_saved batch_id=%s path=%s bundles=%s wait_s=%.3f save_s=%.3f staged_tensors=%s staged_bytes=%s",
+                    "writer_saved batch_id=%s path=%s bundles=%s wait_s=%.3f save_s=%.3f staged_tensors=%s staged_groups=%s staged_bytes=%s",
                     write_metadata.get("batch_id"),
                     path,
                     write_metadata.get("bundle_count"),
                     wait_s,
                     save_s,
                     write_metadata.get("staged_tensors"),
+                    write_metadata.get("staged_groups"),
                     write_metadata.get("staged_bytes"),
                 )
             except BaseException as exc:  # pragma: no cover - async path
@@ -208,6 +240,7 @@ class CollectionWriter:
         target_subdir: str = "captures",
         transfer_event=None,
         staged_tensors: int = 0,
+        staged_groups: int = 0,
         staged_bytes: int = 0,
     ):
         self._raise_if_error()
@@ -227,6 +260,7 @@ class CollectionWriter:
                     "batch_id": batch_id,
                     "bundle_count": len(bundles),
                     "staged_tensors": staged_tensors,
+                    "staged_groups": staged_groups,
                     "staged_bytes": staged_bytes,
                 },
             )
@@ -309,8 +343,8 @@ class InstrumentedQwen3MoeExperiment:
         session = self._transfer_session
         self._transfer_session = None
         if session is None:
-            return None, 0, 0
-        return session.finalize_event(), session.staged_tensors, session.staged_bytes
+            return None, 0, 0, 0
+        return session.finalize_event(), session.staged_tensors, session.staged_groups, session.staged_bytes
 
     def _synchronize_transfer_session(self):
         session = self._transfer_session
@@ -613,64 +647,84 @@ class InstrumentedQwen3MoeExperiment:
         metadata = {"calibration": calibration}
         if extra_metadata:
             metadata.update(extra_metadata)
+        staged = self._transfer_session.stage_tensor_group(
+            {
+                "resid_pre_attn": (
+                    resid_pre_attn if self._signal_enabled_for_layer("resid_pre_attn", layer_idx, calibration) else None,
+                    _storage_dtype("resid_pre_attn", calibration),
+                ),
+                "q_pre_rope": (
+                    (
+                        q_pre
+                        if calibration
+                        and self.spec.collection.capture_q_vectors
+                        and self._signal_enabled_for_layer("q_pre_rope", layer_idx, calibration)
+                        else None
+                    ),
+                    _storage_dtype("q_pre_rope", calibration),
+                ),
+                "v_raw": (
+                    v_raw if self._signal_enabled_for_layer("v_raw", layer_idx, calibration) else None,
+                    _storage_dtype("v_raw", calibration),
+                ),
+                "attention_weights": (
+                    attn_weights if self._signal_enabled_for_layer("attention_weights", layer_idx, calibration) else None,
+                    _storage_dtype("attention_weights", calibration),
+                ),
+                "beta": (
+                    beta if self._signal_enabled_for_layer("beta", layer_idx, calibration) else None,
+                    _storage_dtype("beta", calibration),
+                ),
+                "z_attn": (
+                    z_attn if self._signal_enabled_for_layer("attention_output", layer_idx, calibration) else None,
+                    _storage_dtype("z_attn", calibration),
+                ),
+                "h_pre_moe": (
+                    h_pre_moe if self._signal_enabled_for_layer("pre_moe", layer_idx, calibration) else None,
+                    _storage_dtype("h_pre_moe", calibration),
+                ),
+                "router_logits_pre_softmax": (
+                    router_logits if self._signal_enabled_for_layer("router_logits", layer_idx, calibration) else None,
+                    _storage_dtype("router_logits_pre_softmax", calibration),
+                ),
+                "top_k_indices": (
+                    top_k_indices if self._signal_enabled_for_layer("top_k_binary", layer_idx, calibration) else None,
+                    _storage_dtype("top_k_indices", calibration),
+                ),
+                "final_token_k_rot": (
+                    final_token_k_rot if self._signal_enabled_for_layer("final_token_k_rot", layer_idx, calibration) else None,
+                    _storage_dtype("final_token_k_rot", calibration),
+                ),
+                "final_token_v": (
+                    final_token_v if self._signal_enabled_for_layer("final_token_v", layer_idx, calibration) else None,
+                    _storage_dtype("final_token_v", calibration),
+                ),
+                "final_token_k_raw": (
+                    final_token_k_raw if self._signal_enabled_for_layer("final_token_k_raw", layer_idx, calibration) else None,
+                    _storage_dtype("final_token_k_raw", calibration),
+                ),
+                "position_ids": (
+                    position_ids if self._signal_enabled_for_layer("position_ids", layer_idx, calibration) else None,
+                    None,
+                ),
+            }
+        )
         return LayerCapture(
             layer_idx=layer_idx,
             condition=condition.value,
-            resid_pre_attn=self._stage_tensor(
-                resid_pre_attn if self._signal_enabled_for_layer("resid_pre_attn", layer_idx, calibration) else None,
-                dtype=_storage_dtype("resid_pre_attn", calibration),
-            ),
-            q_pre_rope=self._stage_tensor(
-                (
-                    q_pre
-                    if calibration and self.spec.collection.capture_q_vectors and self._signal_enabled_for_layer("q_pre_rope", layer_idx, calibration)
-                    else None
-                ),
-                dtype=_storage_dtype("q_pre_rope", calibration),
-            ),
-            v_raw=self._stage_tensor(
-                v_raw if self._signal_enabled_for_layer("v_raw", layer_idx, calibration) else None,
-                dtype=_storage_dtype("v_raw", calibration),
-            ),
-            attention_weights=self._stage_tensor(
-                attn_weights if self._signal_enabled_for_layer("attention_weights", layer_idx, calibration) else None,
-                dtype=_storage_dtype("attention_weights", calibration),
-            ),
-            beta=self._stage_tensor(
-                beta if self._signal_enabled_for_layer("beta", layer_idx, calibration) else None,
-                dtype=_storage_dtype("beta", calibration),
-            ),
-            z_attn=self._stage_tensor(
-                z_attn if self._signal_enabled_for_layer("attention_output", layer_idx, calibration) else None,
-                dtype=_storage_dtype("z_attn", calibration),
-            ),
-            h_pre_moe=self._stage_tensor(
-                h_pre_moe if self._signal_enabled_for_layer("pre_moe", layer_idx, calibration) else None,
-                dtype=_storage_dtype("h_pre_moe", calibration),
-            ),
-            router_logits_pre_softmax=self._stage_tensor(
-                router_logits if self._signal_enabled_for_layer("router_logits", layer_idx, calibration) else None,
-                dtype=_storage_dtype("router_logits_pre_softmax", calibration),
-            ),
-            top_k_indices=self._stage_tensor(
-                top_k_indices if self._signal_enabled_for_layer("top_k_binary", layer_idx, calibration) else None,
-                dtype=_storage_dtype("top_k_indices", calibration),
-            ),
-            final_token_k_rot=self._stage_tensor(
-                final_token_k_rot if self._signal_enabled_for_layer("final_token_k_rot", layer_idx, calibration) else None,
-                dtype=_storage_dtype("final_token_k_rot", calibration),
-            ),
-            final_token_v=self._stage_tensor(
-                final_token_v if self._signal_enabled_for_layer("final_token_v", layer_idx, calibration) else None,
-                dtype=_storage_dtype("final_token_v", calibration),
-            ),
-            final_token_k_raw=self._stage_tensor(
-                final_token_k_raw if self._signal_enabled_for_layer("final_token_k_raw", layer_idx, calibration) else None,
-                dtype=_storage_dtype("final_token_k_raw", calibration),
-            ),
-            position_ids=self._stage_tensor(
-                position_ids if self._signal_enabled_for_layer("position_ids", layer_idx, calibration) else None
-            ),
+            resid_pre_attn=staged["resid_pre_attn"],
+            q_pre_rope=staged["q_pre_rope"],
+            v_raw=staged["v_raw"],
+            attention_weights=staged["attention_weights"],
+            beta=staged["beta"],
+            z_attn=staged["z_attn"],
+            h_pre_moe=staged["h_pre_moe"],
+            router_logits_pre_softmax=staged["router_logits_pre_softmax"],
+            top_k_indices=staged["top_k_indices"],
+            final_token_k_rot=staged["final_token_k_rot"],
+            final_token_v=staged["final_token_v"],
+            final_token_k_raw=staged["final_token_k_raw"],
+            position_ids=staged["position_ids"],
             metadata=metadata,
         )
 
@@ -1176,20 +1230,22 @@ class InstrumentedQwen3MoeExperiment:
                 residual = hidden_states
                 normed_hidden = layer.input_layernorm(hidden_states)
                 q_pre, k_pre, q_rot, k_rot, v_raw, _, _ = self._project_qkv(layer.self_attn, normed_hidden, position_embeddings)
-                summaries[layer_idx] = {
-                    "final_token_k_rot": self._stage_tensor(
-                        _gather_last_kv(k_rot, last_positions),
-                        dtype=_storage_dtype("final_token_k_rot", calibration=False),
-                    ),
-                    "final_token_k_raw": self._stage_tensor(
-                        _gather_last_kv(k_pre, last_positions),
-                        dtype=_storage_dtype("final_token_k_raw", calibration=False),
-                    ),
-                    "final_token_v": self._stage_tensor(
-                        _gather_last_kv(v_raw, last_positions),
-                        dtype=_storage_dtype("final_token_v", calibration=False),
-                    ),
-                }
+                summaries[layer_idx] = self._transfer_session.stage_tensor_group(
+                    {
+                        "final_token_k_rot": (
+                            _gather_last_kv(k_rot, last_positions),
+                            _storage_dtype("final_token_k_rot", calibration=False),
+                        ),
+                        "final_token_k_raw": (
+                            _gather_last_kv(k_pre, last_positions),
+                            _storage_dtype("final_token_k_raw", calibration=False),
+                        ),
+                        "final_token_v": (
+                            _gather_last_kv(v_raw, last_positions),
+                            _storage_dtype("final_token_v", calibration=False),
+                        ),
+                    }
+                )
                 causal = attention_forward(
                     layer.self_attn,
                     q_rot,
@@ -1450,7 +1506,7 @@ class InstrumentedQwen3MoeExperiment:
                     bundle.metadata["multi_slot_summaries"] = batch_multi_slot[example.text_id]
                 batch_bundles.append(bundle)
             batch_id = f"{dataset_name}_{control_summary_mode or 'main'}_{batch_index}_{len(batch_bundles)}_{uuid.uuid4().hex[:8]}"
-            transfer_event, staged_tensors, staged_bytes = self._finalize_transfer_session()
+            transfer_event, staged_tensors, staged_groups, staged_bytes = self._finalize_transfer_session()
             if write_batches:
                 path = self.writer.write_batch(
                     batch_id,
@@ -1466,6 +1522,7 @@ class InstrumentedQwen3MoeExperiment:
                     target_subdir=target,
                     transfer_event=transfer_event,
                     staged_tensors=staged_tensors,
+                    staged_groups=staged_groups,
                     staged_bytes=staged_bytes,
                 )
                 path_list.append(path)
@@ -1474,21 +1531,23 @@ class InstrumentedQwen3MoeExperiment:
                 if transfer_event is not None:
                     transfer_event.synchronize()
                 logger.info(
-                    "batch_transfer_synced dataset=%s batch_index=%s seconds=%.3f staged_tensors=%s staged_bytes=%s",
+                    "batch_transfer_synced dataset=%s batch_index=%s seconds=%.3f staged_tensors=%s staged_groups=%s staged_bytes=%s",
                     dataset_name,
                     batch_index,
                     time.perf_counter() - sync_start,
                     staged_tensors,
+                    staged_groups,
                     staged_bytes,
                 )
             if retain_bundles:
                 all_bundles.extend(batch_bundles)
             logger.info(
-                "batch_done dataset=%s batch_index=%s total_seconds=%.3f staged_tensors=%s staged_bytes=%s wrote_batch=%s",
+                "batch_done dataset=%s batch_index=%s total_seconds=%.3f staged_tensors=%s staged_groups=%s staged_bytes=%s wrote_batch=%s",
                 dataset_name,
                 batch_index,
                 time.perf_counter() - batch_start,
                 staged_tensors,
+                staged_groups,
                 staged_bytes,
                 write_batches,
             )
