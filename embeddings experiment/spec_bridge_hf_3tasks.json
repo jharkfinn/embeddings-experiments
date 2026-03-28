@@ -191,7 +191,7 @@
     "device": "cuda",
     "device_map": "cuda:0",
     "max_length": 2048,
-    "model_name": "Qwen/Qwen3-30B-A3B",
+    "model_name": "Qwen/Qwen3-30B-A3B-FP8",
     "output_attentions": true,
     "preflight_max_used_memory_gib": 8.0,
     "quantization": "fp8",

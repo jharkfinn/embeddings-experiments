@@ -85,30 +85,23 @@ def stack_smoke() -> dict[str, object]:
     import accelerate
     import datasets
     import torch
-    import torchao
     import transformers
 
     from kv_prepend_experiment.runtime import (
         build_fp8_quantization_config,
-        build_torchao_quantization_config,
         resolve_qwen3_moe_module,
         runtime_stack_snapshot,
     )
 
     _, module = resolve_qwen3_moe_module()
     fp8_config = build_fp8_quantization_config(transformers)
-    torchao_weight_only = build_torchao_quantization_config(transformers, "torchao_fp8_weight_only")
-    torchao_dynamic = build_torchao_quantization_config(transformers, "torchao_fp8_dynamic")
     return {
         "runtime": runtime_stack_snapshot(transformers),
         "accelerate_version": accelerate.__version__,
         "datasets_version": datasets.__version__,
-        "torchao_version": torchao.__version__,
         "device_capability": list(torch.cuda.get_device_capability(0)) if torch.cuda.is_available() else None,
         "has_fbgemm_fp8_config": fp8_config is not None,
         "fp8_config_class": None if fp8_config is None else fp8_config.__class__.__name__,
-        "torchao_weight_only_config_class": torchao_weight_only.__class__.__name__,
-        "torchao_dynamic_config_class": torchao_dynamic.__class__.__name__,
         "qwen3_moe_module": module.__name__,
     }
 

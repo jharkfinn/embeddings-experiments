@@ -49,7 +49,7 @@ def build_main_hf_teacher_forcing_spec(base: ExperimentSpec) -> ExperimentSpec:
 def build_main_hf_teacher_forcing_l40s_spec(base: ExperimentSpec) -> ExperimentSpec:
     spec = build_main_hf_teacher_forcing_spec(base)
     spec.model.torch_dtype = "auto"
-    spec.model.quantization = "torchao_fp8_weight_only"
+    spec.model.quantization = "fp8"
     spec.collection.streaming_batch_size = min(spec.collection.streaming_batch_size, 8)
     spec.collection.max_batch_tokens = min(spec.collection.max_batch_tokens, 4096)
     spec.output.artifacts_dir = "artifacts_main_l40s"

@@ -8,7 +8,7 @@ Everything created for this experiment lives in this folder:
 
 - `default_experiment.json`: default runtime spec
 - `spec_main_hf_teacher_forcing_3tasks.json`: lean 3-task main-run contract
-- `spec_main_hf_teacher_forcing_l40s_3tasks.json`: reduced-memory 48GB-class GPU contract using TorchAO FP8 weight-only quantization
+- `spec_main_hf_teacher_forcing_l40s_3tasks.json`: reduced-memory 48GB-class GPU contract using the native Qwen FP8 checkpoint
 - `spec_calibration_hf_3tasks.json`: exact calibration run
 - `spec_controls_hf_3tasks.json`: control-only calibration run
 - `spec_bridge_hf_3tasks.json`: bridge echo run
@@ -94,8 +94,8 @@ python run_kv_prepend_experiment.py \
 
 For a reduced-memory 48GB-class GPU target such as an L40S, use the dedicated
 L40S profile instead. It keeps the same signal families but lowers the main
-batch envelope, loads with `torch_dtype="auto"`, and uses TorchAO FP8
-weight-only quantization instead of the H100-only FBGEMM FP8 path:
+batch envelope, loads with `torch_dtype="auto"`, and uses the native
+`Qwen/Qwen3-30B-A3B-FP8` checkpoint:
 
 ```bash
 python run_kv_prepend_experiment.py \

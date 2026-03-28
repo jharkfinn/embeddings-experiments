@@ -8,7 +8,7 @@ from typing import Any
 
 @dataclass
 class ModelSpec:
-    model_name: str = "Qwen/Qwen3-30B-A3B"
+    model_name: str = "Qwen/Qwen3-30B-A3B-FP8"
     tokenizer_name: str | None = None
     torch_dtype: str = "bfloat16"
     quantization: str = "fp8"

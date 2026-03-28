@@ -17,6 +17,10 @@ class MissingDependencyError(RuntimeError):
     pass
 
 
+def _is_native_fp8_checkpoint(model_name: str) -> bool:
+    return model_name.rstrip("/").endswith("-FP8")
+
+
 def _ensure_libcuda_on_link_path() -> None:
     candidates = [
         Path("/usr/lib/x86_64-linux-gnu/libcuda.so.1"),
@@ -227,13 +231,19 @@ def load_model_and_tokenizer(model_spec):
         else:
             model_kwargs["torch_dtype"] = getattr(torch, model_spec.torch_dtype)
     if quantization_mode == "fp8":
-        quantization_config = build_fp8_quantization_config(transformers)
-        if quantization_config is None:
-            raise RuntimeError(
-                "No FP8 quantization config was found in this Transformers build. "
-                "Install a build that exposes FBGEMM FP8 support on Thunder."
+        if _is_native_fp8_checkpoint(model_spec.model_name):
+            logger.info(
+                "using_native_fp8_checkpoint model=%s checkpoint_quantization_config=true",
+                model_spec.model_name,
             )
-        model_kwargs["quantization_config"] = quantization_config
+        else:
+            quantization_config = build_fp8_quantization_config(transformers)
+            if quantization_config is None:
+                raise RuntimeError(
+                    "No FP8 quantization config was found in this Transformers build. "
+                    "Install a build that exposes FBGEMM FP8 support on Thunder."
+                )
+            model_kwargs["quantization_config"] = quantization_config
     elif quantization_mode.startswith("torchao_"):
         model_kwargs["quantization_config"] = build_torchao_quantization_config(
             transformers, quantization_mode
