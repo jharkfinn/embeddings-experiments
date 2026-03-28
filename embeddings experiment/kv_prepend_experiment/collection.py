@@ -1298,7 +1298,7 @@ class InstrumentedQwen3MoeExperiment:
                     all_slots[row_idx][layer_idx]["k"].append(layer_summary["final_token_k_rot"])
                     all_slots[row_idx][layer_idx]["k_pre"].append(layer_summary["final_token_k_raw"])
                     all_slots[row_idx][layer_idx]["v"].append(layer_summary["final_token_v"])
-            next_logits = self.model.lm_head(last_hidden)
+            next_logits = self.model.lm_head(last_hidden.clone())
             next_tokens = next_logits.argmax(dim=-1).tolist()
             for token_ids, next_token in zip(sequences, next_tokens):
                 token_ids.append(int(next_token))
