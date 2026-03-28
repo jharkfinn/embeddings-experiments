@@ -4,6 +4,7 @@ import os
 import json
 import logging
 import math
+import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -272,10 +273,21 @@ def analyze_capture_directory(capture_dir: str | Path, output_path: str | Path):
     if not capture_paths:
         summary = {"num_bundles": 0, "layers": {}}
     else:
-        worker_count = min(max(1, os.cpu_count() or 1), len(capture_paths))
-        logger.info("analysis_parallel workers=%s shards=%s", worker_count, len(capture_paths))
+        # This workload is dominated by large torch.load() calls plus NumPy SVDs.
+        # Letting every worker use multithreaded BLAS causes severe oversubscription
+        # on the 8-vCPU Thunder box and can look like a hang.
+        for env_name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            os.environ[env_name] = "1"
+        worker_count = min(4, max(1, os.cpu_count() or 1), len(capture_paths))
+        ctx = mp.get_context("spawn")
+        logger.info(
+            "analysis_parallel workers=%s shards=%s start_method=%s blas_threads=1",
+            worker_count,
+            len(capture_paths),
+            ctx.get_start_method(),
+        )
         partials: list[dict[str, Any]] = []
-        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        with ProcessPoolExecutor(max_workers=worker_count, mp_context=ctx) as executor:
             future_to_path = {
                 executor.submit(_summarize_capture_path, str(path)): path
                 for path in capture_paths
