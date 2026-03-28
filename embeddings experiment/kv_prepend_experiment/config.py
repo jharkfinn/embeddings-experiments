@@ -18,6 +18,7 @@ class ModelSpec:
     max_length: int = 2048
     trust_remote_code: bool = True
     output_attentions: bool = True
+    preflight_max_used_memory_gib: float | None = 8.0
 
 
 @dataclass

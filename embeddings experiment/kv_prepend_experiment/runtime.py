@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -101,10 +102,63 @@ def build_fp8_quantization_config(transformers: Any):
     return None
 
 
+def _query_gpu_snapshot() -> dict[str, float | str] | None:
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.total,utilization.gpu,power.draw",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+    first_line = result.stdout.strip().splitlines()
+    if not first_line:
+        return None
+    used, total, util, power = [field.strip() for field in first_line[0].split(",")]
+    return {
+        "memory_used_mib": float(used),
+        "memory_total_mib": float(total),
+        "utilization_gpu_pct": float(util),
+        "power_draw_watts": float(power),
+    }
+
+
+def _log_and_validate_gpu_preflight(model_spec) -> None:
+    if not str(model_spec.device).startswith("cuda"):
+        return
+    snapshot = _query_gpu_snapshot()
+    if snapshot is None:
+        logger.warning("gpu_preflight_unavailable device=%s", model_spec.device)
+        return
+    logger.info(
+        "gpu_preflight device=%s used_mib=%.0f total_mib=%.0f util_pct=%.0f power_watts=%.2f",
+        model_spec.device,
+        snapshot["memory_used_mib"],
+        snapshot["memory_total_mib"],
+        snapshot["utilization_gpu_pct"],
+        snapshot["power_draw_watts"],
+    )
+    max_used_gib = model_spec.preflight_max_used_memory_gib
+    if max_used_gib is None:
+        return
+    used_gib = float(snapshot["memory_used_mib"]) / 1024.0
+    if used_gib > max_used_gib:
+        raise RuntimeError(
+            f"GPU preflight failed: found {used_gib:.2f} GiB already allocated on {model_spec.device} "
+            f"before model load (limit {max_used_gib:.2f} GiB). Clear the device and retry."
+        )
+
+
 def load_model_and_tokenizer(model_spec):
     torch = import_torch()
     transformers, module = resolve_qwen3_moe_module()
     start = time.perf_counter()
+    _log_and_validate_gpu_preflight(model_spec)
 
     AutoConfig = transformers.AutoConfig
     AutoTokenizer = transformers.AutoTokenizer
@@ -152,7 +206,20 @@ def load_model_and_tokenizer(model_spec):
     logger.info("tokenizer_loaded name=%s seconds=%.3f", tokenizer_name, time.perf_counter() - tokenizer_start)
 
     model_start = time.perf_counter()
-    model = model_cls.from_pretrained(model_spec.model_name, **model_kwargs)
+    try:
+        model = model_cls.from_pretrained(model_spec.model_name, **model_kwargs)
+    except Exception:
+        snapshot = _query_gpu_snapshot()
+        if snapshot is not None:
+            logger.exception(
+                "model_load_failed model=%s used_mib=%.0f total_mib=%.0f util_pct=%.0f power_watts=%.2f",
+                model_spec.model_name,
+                snapshot["memory_used_mib"],
+                snapshot["memory_total_mib"],
+                snapshot["utilization_gpu_pct"],
+                snapshot["power_draw_watts"],
+            )
+        raise
     model.eval()
     logger.info(
         "model_loaded model=%s seconds=%.3f total_seconds=%.3f",
