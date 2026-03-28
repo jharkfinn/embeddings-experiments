@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import json
 import logging
 import math
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +15,90 @@ from .quantization import cosine_similarity
 from .types import CaptureCondition, ExampleCaptureBundle
 
 logger = logging.getLogger(__name__)
+
+
+def _empty_layer_stats() -> dict[str, list[float]]:
+    return {
+        "delta_norms": [],
+        "router_entropy": [],
+        "m_rank": [],
+        "d_rank": [],
+        "bias_sensitivity": [],
+        "bias_flip_count": [],
+    }
+
+
+def _accumulate_bundle(summary: dict[str, Any], bundle: ExampleCaptureBundle) -> None:
+    summary["num_bundles"] += 1
+    bundle_count = summary["num_bundles"]
+    if bundle_count % 10 == 0:
+        logger.info("analysis_progress bundles=%s", bundle_count)
+    for layer_idx in range(48):
+        try:
+            causal = _find_layer_capture(bundle, "pass1", CaptureCondition.CAUSAL.value, layer_idx)
+            local = _find_layer_capture(bundle, "pass1", CaptureCondition.LOCAL_PREPEND_CAUSAL_BASE.value, layer_idx)
+        except KeyError:
+            continue
+        layer_key = str(layer_idx)
+        summary["layers"].setdefault(layer_key, _empty_layer_stats())
+        causal_z = _tensor_to_numpy(causal.z_attn, dtype=np.float32)[0]
+        local_z = _tensor_to_numpy(local.z_attn, dtype=np.float32)[0]
+        expected_len = min(causal_z.shape[0], local_z.shape[0])
+        mask = _content_row_mask(bundle, expected_len)
+        delta = local_z[:expected_len][mask] - causal_z[:expected_len][mask]
+        mdu = compute_m_d_u(
+            causal_z[:expected_len][mask],
+            local_z[:expected_len][mask],
+            _tensor_to_numpy(local.beta, dtype=np.float32).squeeze(-1)[0][:, :expected_len][:, mask] if local.beta is not None else None,
+        )
+        summary["layers"][layer_key]["delta_norms"].append(float(np.linalg.norm(delta)))
+        summary["layers"][layer_key]["m_rank"].append(token_collapse_panel(mdu["m"])["effective_rank"])
+        summary["layers"][layer_key]["d_rank"].append(token_collapse_panel(mdu["d"])["effective_rank"])
+        if local.router_logits_pre_softmax is not None and local.top_k_indices is not None:
+            local_router = _tensor_to_numpy(local.router_logits_pre_softmax, dtype=np.float32)[0]
+            local_topk = _tensor_to_numpy(local.top_k_indices, dtype=np.int16)[0]
+            routing = routing_entropy_and_divergence(
+                local_router[:expected_len][mask],
+                local_topk[:expected_len][mask],
+            )
+            summary["layers"][layer_key]["router_entropy"].append(routing["entropy_mean"])
+        if "bias_spectrum_signature" in local.metadata:
+            bias_meta = local.metadata["bias_spectrum_signature"]
+            summary["layers"][layer_key]["bias_sensitivity"].extend(bias_meta.get("sensitivity", []))
+            summary["layers"][layer_key]["bias_flip_count"].extend(bias_meta.get("flip_count", []))
+
+
+def _finalize_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    for layer_stats in summary["layers"].values():
+        layer_stats["delta_norm_mean"] = float(np.mean(layer_stats["delta_norms"])) if layer_stats["delta_norms"] else 0.0
+        layer_stats["router_entropy_mean"] = float(np.mean(layer_stats["router_entropy"])) if layer_stats["router_entropy"] else 0.0
+        layer_stats["m_rank_mean"] = float(np.mean(layer_stats["m_rank"])) if layer_stats["m_rank"] else 0.0
+        layer_stats["d_rank_mean"] = float(np.mean(layer_stats["d_rank"])) if layer_stats["d_rank"] else 0.0
+        layer_stats["bias_sensitivity_mean"] = float(np.mean(layer_stats.get("bias_sensitivity", []))) if layer_stats.get("bias_sensitivity") else 0.0
+        layer_stats["bias_flip_count_mean"] = float(np.mean(layer_stats.get("bias_flip_count", []))) if layer_stats.get("bias_flip_count") else 0.0
+    return summary
+
+
+def _merge_summary_partials(partials: list[dict[str, Any]]) -> dict[str, Any]:
+    merged: dict[str, Any] = {"num_bundles": 0, "layers": {}}
+    for partial in partials:
+        merged["num_bundles"] += int(partial.get("num_bundles", 0))
+        for layer_key, layer_stats in partial.get("layers", {}).items():
+            merged["layers"].setdefault(layer_key, _empty_layer_stats())
+            for field in ("delta_norms", "router_entropy", "m_rank", "d_rank", "bias_sensitivity", "bias_flip_count"):
+                merged["layers"][layer_key][field].extend(layer_stats.get(field, []))
+    return _finalize_summary(merged)
+
+
+def _summarize_capture_path(path_str: str) -> dict[str, Any]:
+    import torch
+
+    path = Path(path_str)
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    partial: dict[str, Any] = {"num_bundles": 0, "layers": {}}
+    for bundle in payload.get("bundles", []):
+        _accumulate_bundle(partial, bundle)
+    return partial
 
 
 def compute_m_d_u(base_tokens: np.ndarray, treated_tokens: np.ndarray, uptake: np.ndarray | None = None):
@@ -174,74 +260,40 @@ def sparse_transport_summary(local_delta: np.ndarray, final_delta: np.ndarray):
 
 def summarize_bundles(bundles):
     summary: dict[str, Any] = {"num_bundles": 0, "layers": {}}
-    bundle_count = 0
     for bundle in bundles:
-        bundle_count += 1
-        if bundle_count % 10 == 0:
-            logger.info("analysis_progress bundles=%s", bundle_count)
-        for layer_idx in range(48):
-            try:
-                causal = _find_layer_capture(bundle, "pass1", CaptureCondition.CAUSAL.value, layer_idx)
-                local = _find_layer_capture(bundle, "pass1", CaptureCondition.LOCAL_PREPEND_CAUSAL_BASE.value, layer_idx)
-            except KeyError:
-                continue
-            layer_key = str(layer_idx)
-            summary["layers"].setdefault(layer_key, {"delta_norms": [], "router_entropy": [], "m_rank": [], "d_rank": []})
-            causal_z = _tensor_to_numpy(causal.z_attn, dtype=np.float32)[0]
-            local_z = _tensor_to_numpy(local.z_attn, dtype=np.float32)[0]
-            expected_len = min(causal_z.shape[0], local_z.shape[0])
-            mask = _content_row_mask(bundle, expected_len)
-            delta = local_z[:expected_len][mask] - causal_z[:expected_len][mask]
-            mdu = compute_m_d_u(
-                causal_z[:expected_len][mask],
-                local_z[:expected_len][mask],
-                _tensor_to_numpy(local.beta, dtype=np.float32).squeeze(-1)[0][:, :expected_len][:, mask] if local.beta is not None else None,
-            )
-            summary["layers"][layer_key]["delta_norms"].append(float(np.linalg.norm(delta)))
-            summary["layers"][layer_key]["m_rank"].append(token_collapse_panel(mdu["m"])["effective_rank"])
-            summary["layers"][layer_key]["d_rank"].append(token_collapse_panel(mdu["d"])["effective_rank"])
-            if local.router_logits_pre_softmax is not None and local.top_k_indices is not None:
-                local_router = _tensor_to_numpy(local.router_logits_pre_softmax, dtype=np.float32)[0]
-                local_topk = _tensor_to_numpy(local.top_k_indices, dtype=np.int16)[0]
-                routing = routing_entropy_and_divergence(
-                    local_router[:expected_len][mask],
-                    local_topk[:expected_len][mask],
-                )
-                summary["layers"][layer_key]["router_entropy"].append(routing["entropy_mean"])
-            if "bias_spectrum_signature" in local.metadata:
-                bias_meta = local.metadata["bias_spectrum_signature"]
-                summary["layers"][layer_key].setdefault("bias_sensitivity", []).extend(bias_meta.get("sensitivity", []))
-                summary["layers"][layer_key].setdefault("bias_flip_count", []).extend(bias_meta.get("flip_count", []))
-    summary["num_bundles"] = bundle_count
-    for layer_stats in summary["layers"].values():
-        layer_stats["delta_norm_mean"] = float(np.mean(layer_stats["delta_norms"])) if layer_stats["delta_norms"] else 0.0
-        layer_stats["router_entropy_mean"] = float(np.mean(layer_stats["router_entropy"])) if layer_stats["router_entropy"] else 0.0
-        layer_stats["m_rank_mean"] = float(np.mean(layer_stats["m_rank"])) if layer_stats["m_rank"] else 0.0
-        layer_stats["d_rank_mean"] = float(np.mean(layer_stats["d_rank"])) if layer_stats["d_rank"] else 0.0
-        layer_stats["bias_sensitivity_mean"] = float(np.mean(layer_stats.get("bias_sensitivity", []))) if layer_stats.get("bias_sensitivity") else 0.0
-        layer_stats["bias_flip_count_mean"] = float(np.mean(layer_stats.get("bias_flip_count", []))) if layer_stats.get("bias_flip_count") else 0.0
-    return summary
+        _accumulate_bundle(summary, bundle)
+    return _finalize_summary(summary)
 
 
 def analyze_capture_directory(capture_dir: str | Path, output_path: str | Path):
     capture_dir = Path(capture_dir)
     logger.info("analysis_start capture_dir=%s", capture_dir)
-
-    def _bundle_stream():
-        shard_count = 0
-        for path, payload in load_capture_payloads(capture_dir):
-            shard_count += 1
-            bundles = payload.get("bundles", [])
-            logger.info(
-                "analysis_shard_loaded shard_index=%s path=%s bundles=%s",
-                shard_count,
-                path,
-                len(bundles),
-            )
-            for bundle in bundles:
-                yield bundle
-
-    summary = summarize_bundles(_bundle_stream())
+    capture_paths = sorted(capture_dir.glob("*.pt"))
+    if not capture_paths:
+        summary = {"num_bundles": 0, "layers": {}}
+    else:
+        worker_count = min(max(1, os.cpu_count() or 1), len(capture_paths))
+        logger.info("analysis_parallel workers=%s shards=%s", worker_count, len(capture_paths))
+        partials: list[dict[str, Any]] = []
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            future_to_path = {
+                executor.submit(_summarize_capture_path, str(path)): path
+                for path in capture_paths
+            }
+            completed = 0
+            for future in as_completed(future_to_path):
+                path = future_to_path[future]
+                partial = future.result()
+                completed += 1
+                logger.info(
+                    "analysis_shard_done completed=%s/%s path=%s bundles=%s",
+                    completed,
+                    len(capture_paths),
+                    path,
+                    partial.get("num_bundles", 0),
+                )
+                partials.append(partial)
+        summary = _merge_summary_partials(partials)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
