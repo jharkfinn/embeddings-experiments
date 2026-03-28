@@ -30,9 +30,9 @@ def _app_storage_root() -> Path:
     return root
 
 
-def _new_persistent_run_root(run_kind: str) -> Path:
+def _new_persistent_run_root(run_kind: str, run_id: str | None = None) -> Path:
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_id = f"{timestamp}_{uuid.uuid4().hex[:8]}"
+    run_id = run_id or f"{timestamp}_{uuid.uuid4().hex[:8]}"
     run_root = _app_storage_root() / run_kind / run_id
     run_root.mkdir(parents=True, exist_ok=True)
     return run_root
@@ -388,7 +388,7 @@ def _load_nanobeir_records(dataset_names: list[str]) -> list[dict[str, str]]:
     return records
 
 
-def collect_smoke() -> dict[str, object]:
+def collect_smoke(smoke_run_id: str | None = None) -> dict[str, object]:
     from kv_prepend_experiment.collection import InstrumentedQwen3MoeExperiment
     from kv_prepend_experiment.config import load_experiment_spec
     from kv_prepend_experiment.logging_utils import configure_logging
@@ -398,26 +398,46 @@ def collect_smoke() -> dict[str, object]:
     spec = load_experiment_spec(spec_path)
     spec.model.preflight_max_used_memory_gib = None
 
-    run_root = _new_persistent_run_root("smoke_runs")
+    run_root = _new_persistent_run_root("smoke_runs", smoke_run_id)
+    status_path = run_root / "status.json"
     configure_logging(log_path=run_root / "artifacts" / "logs" / "collect_smoke.log", level="INFO")
     LOGGER.info("collect_smoke_setup spec=%s records=%s", spec_path.name, records_path.name)
 
     records = json.loads(records_path.read_text(encoding="utf-8"))
     start = time.perf_counter()
     LOGGER.info("collect_smoke_records_loaded records=%s", len(records))
+    state: dict[str, object] = {
+        "run_id": run_root.name,
+        "stage": "setup",
+        "records": len(records),
+        "run_root": str(run_root),
+        "status_path": str(status_path),
+        "started_at": _iso_now(),
+    }
+
+    def update_state(**kwargs: object) -> None:
+        state.update(kwargs)
+        _write_json_atomic(status_path, dict(state, updated_at=_iso_now(), resource_snapshot=_resource_snapshot(run_root)))
+
     try:
-        with _resource_heartbeat("collect_smoke", run_root=run_root):
+        with _resource_heartbeat("collect_smoke", run_root=run_root), _status_heartbeat(
+            status_path, state, run_root=run_root
+        ):
             experiment = InstrumentedQwen3MoeExperiment(spec, run_root)
+            update_state(stage="experiment_load_start")
             LOGGER.info("collect_smoke_experiment_load_start")
             experiment.load()
+            update_state(stage="experiment_load_done")
             LOGGER.info("collect_smoke_experiment_load_done")
             spec_snapshot = experiment.save_spec_snapshot()
+            update_state(stage="collect_examples")
             paths, _ = experiment.collect_examples(
                 records,
                 dataset_name="cerebrium_smoke",
                 retain_bundles=False,
             )
             LOGGER.info("collect_smoke_collect_done paths=%s", len(paths))
+            update_state(stage="flush_writes", capture_count=len(paths))
             experiment.flush_writes()
             LOGGER.info("collect_smoke_flush_done")
         captures = []
@@ -429,20 +449,30 @@ def collect_smoke() -> dict[str, object]:
                     "bytes": stat.st_size,
                 }
             )
+        update_state(
+            stage="completed",
+            finished_at=_iso_now(),
+            capture_count=len(paths),
+            output_bytes=sum(capture["bytes"] for capture in captures),
+        )
         return {
             "seconds": round(time.perf_counter() - start, 3),
             "records": len(records),
             "capture_count": len(paths),
             "captures": captures,
             "run_root": str(run_root),
+            "status_path": str(status_path),
             "spec_snapshot": str(spec_snapshot.relative_to(run_root)),
             "nvidia_smi_after_collect": _nvidia_smi(),
         }
+    except BaseException as exc:
+        update_state(stage="failed", finished_at=_iso_now(), error=repr(exc))
+        raise
     finally:
         _best_effort_runtime_cleanup("collect_smoke")
 
 
-def calibration_run() -> dict[str, object]:
+def calibration_run(calibration_run_id: str | None = None) -> dict[str, object]:
     from kv_prepend_experiment.collection import InstrumentedQwen3MoeExperiment
     from kv_prepend_experiment.config import load_experiment_spec
     from kv_prepend_experiment.logging_utils import configure_logging
@@ -453,26 +483,46 @@ def calibration_run() -> dict[str, object]:
     spec.model.torch_dtype = "auto"
     spec.collection.writer_queue_size = 1
 
-    run_root = _new_persistent_run_root("calibration_runs")
+    run_root = _new_persistent_run_root("calibration_runs", calibration_run_id)
+    status_path = run_root / "status.json"
     configure_logging(log_path=run_root / "artifacts" / "logs" / "calibration_run.log", level="INFO")
     LOGGER.info("calibration_run_setup spec=%s", spec_path.name)
 
     records = _load_nanobeir_records(["scifact", "fiqa2018", "quoraretrieval"])
     start = time.perf_counter()
     LOGGER.info("calibration_run_records_loaded records=%s", len(records))
+    state: dict[str, object] = {
+        "run_id": run_root.name,
+        "stage": "setup",
+        "records": len(records),
+        "run_root": str(run_root),
+        "status_path": str(status_path),
+        "started_at": _iso_now(),
+    }
+
+    def update_state(**kwargs: object) -> None:
+        state.update(kwargs)
+        _write_json_atomic(status_path, dict(state, updated_at=_iso_now(), resource_snapshot=_resource_snapshot(run_root)))
+
     try:
-        with _resource_heartbeat("calibration_run", run_root=run_root):
+        with _resource_heartbeat("calibration_run", run_root=run_root), _status_heartbeat(
+            status_path, state, run_root=run_root
+        ):
             experiment = InstrumentedQwen3MoeExperiment(spec, run_root)
+            update_state(stage="experiment_load_start")
             LOGGER.info("calibration_run_experiment_load_start")
             experiment.load()
+            update_state(stage="experiment_load_done")
             LOGGER.info("calibration_run_experiment_load_done")
             spec_snapshot = experiment.save_spec_snapshot()
+            update_state(stage="collect_examples")
             paths, _ = experiment.collect_examples(
                 records,
                 dataset_name="nanobeir_3tasks",
                 retain_bundles=False,
             )
             LOGGER.info("calibration_run_collect_done paths=%s", len(paths))
+            update_state(stage="flush_writes", capture_count=len(paths))
             experiment.flush_writes()
             LOGGER.info("calibration_run_flush_done")
         captures = []
@@ -486,6 +536,12 @@ def calibration_run() -> dict[str, object]:
                     "bytes": stat.st_size,
                 }
             )
+        update_state(
+            stage="completed",
+            finished_at=_iso_now(),
+            capture_count=len(paths),
+            output_bytes=total_bytes,
+        )
         return {
             "seconds": round(time.perf_counter() - start, 3),
             "records": len(records),
@@ -493,9 +549,13 @@ def calibration_run() -> dict[str, object]:
             "capture_bytes": total_bytes,
             "captures": captures,
             "run_root": str(run_root),
+            "status_path": str(status_path),
             "spec_snapshot": str(spec_snapshot.relative_to(run_root)),
             "nvidia_smi_after_collect": _nvidia_smi(),
         }
+    except BaseException as exc:
+        update_state(stage="failed", finished_at=_iso_now(), error=repr(exc))
+        raise
     finally:
         _best_effort_runtime_cleanup("calibration_run")
 

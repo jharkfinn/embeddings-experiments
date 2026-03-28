@@ -16,8 +16,9 @@ Everything created for this experiment lives in this folder:
 - `kv_prepend_experiment/`: collection, evaluation, analysis, and runtime modules
 - `cerebrium.toml`: GPU-backed Cerebrium app config for collection/model-load runs
 - `cerebrium_analysis.toml`: CPU-only Cerebrium app config for analysis runs
+- `launch_cerebrium_async.py`: generic async Cerebrium launcher for smoke, calibration, and analysis
 - `run_cerebrium_analysis_cpu.sh`: launcher for CPU-only Cerebrium analysis
-- `launch_cerebrium_analysis_async.py`: async CPU-only Cerebrium analysis launcher with persisted status/output paths
+- `launch_cerebrium_analysis_async.py`: compatibility wrapper for async CPU-only analysis
 
 ## Target runtime
 
@@ -112,22 +113,40 @@ python run_kv_prepend_experiment.py \
 For calibration, controls, and bridge, use the generated split specs instead of
 the default main spec.
 
-For Cerebrium analysis, use the CPU-only launcher instead of the GPU app:
+For a traceable async Cerebrium smoke run on the GPU app:
 
 ```bash
-./run_cerebrium_analysis_cpu.sh
+python launch_cerebrium_async.py collect_smoke
 ```
 
-For a traceable async analysis run with a unique run ID, persisted `status.json`,
-and explicit remote paths for logs and outputs:
+For a traceable async Cerebrium calibration run on the GPU app:
+
+```bash
+python launch_cerebrium_async.py calibration_run
+```
+
+For a traceable async Cerebrium analysis run on the CPU-only app:
+
+```bash
+python launch_cerebrium_async.py analyze_latest_calibration --workers 10
+```
+
+Each async launch returns a Cerebrium `run_id` plus deterministic persisted
+remote paths. The GPU collect endpoints now also write a top-level `status.json`
+for the run, so all long jobs have a single status artifact to poll.
+
+The older analysis-only wrapper remains available:
 
 ```bash
 python launch_cerebrium_analysis_async.py --workers 10
 ```
 
-That launcher deploys the CPU-only Cerebrium app, posts
-`analyze_latest_calibration` asynchronously, and prints the remote paths for:
+That wrapper forwards to `launch_cerebrium_async.py analyze_latest_calibration`.
 
+Async launchers print the remote paths for:
+
+- `smoke_runs/<run_id>/status.json`
+- `calibration_runs/<run_id>/status.json`
 - `analysis_runs/<analysis_run_id>/status.json`
 - `analysis_runs/<analysis_run_id>/analysis_run.log`
 - `analysis_runs/<analysis_run_id>/capture_analysis.json`
