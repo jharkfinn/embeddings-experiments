@@ -223,6 +223,7 @@ def calibration_run() -> dict[str, object]:
     spec = load_experiment_spec(spec_path)
     spec.model.preflight_max_used_memory_gib = None
     spec.model.torch_dtype = "auto"
+    spec.collection.writer_queue_size = 1
 
     run_root = ROOT / "cerebrium_calibration_output"
     if run_root.exists():
