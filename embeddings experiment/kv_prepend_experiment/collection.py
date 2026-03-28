@@ -307,6 +307,9 @@ class InstrumentedQwen3MoeExperiment:
         )
         return build_prompt_examples(records, self.spec.prompts, calibration_ids=calibration_ids)
 
+    def _restrict_to_calibration_subset(self) -> bool:
+        return self.spec.collection.runtime_backend == "hf" and int(self.spec.collection.calibration_subset_size) > 0
+
     def _write_calibration_manifest(self, dataset_name: str):
         manifest = getattr(self, "_last_calibration_manifest", None)
         if manifest is None:
@@ -1083,6 +1086,8 @@ class InstrumentedQwen3MoeExperiment:
         self._ensure_loaded()
         examples = self.prepare_examples(records)
         self._write_calibration_manifest(dataset_name)
+        if self._restrict_to_calibration_subset():
+            examples = [example for example in examples if example.calibration]
         self.annotate_examples(examples)
         summary_by_id: dict[str, dict[int, dict[str, Any]]] = {}
         for batch_examples in self._iter_example_batches(examples):
@@ -1097,6 +1102,8 @@ class InstrumentedQwen3MoeExperiment:
     def _compute_prompt_continuation_summaries(self, records: list[dict[str, Any]]):
         self._ensure_loaded()
         examples = self.prepare_examples(records)
+        if self._restrict_to_calibration_subset():
+            examples = [example for example in examples if example.calibration]
         outputs = []
         for example in examples:
             multi_slot = self.collect_multi_slot_summaries(example)
@@ -1123,6 +1130,8 @@ class InstrumentedQwen3MoeExperiment:
         self._ensure_loaded()
         examples = self.prepare_examples(records)
         self._write_calibration_manifest(dataset_name)
+        if self._restrict_to_calibration_subset():
+            examples = [example for example in examples if example.calibration]
         self.annotate_examples(examples)
         path_list: list[Path] = []
         all_bundles: list[ExampleCaptureBundle] = []

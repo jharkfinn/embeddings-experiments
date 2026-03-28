@@ -189,7 +189,7 @@
   "model": {
     "attn_implementation": "eager",
     "device": "cuda",
-    "device_map": "auto",
+    "device_map": "cuda:0",
     "max_length": 2048,
     "model_name": "Qwen/Qwen3-30B-A3B",
     "output_attentions": true,
