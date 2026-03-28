@@ -320,6 +320,7 @@ def attention_forward(
     summary_key=None,
     summary_value=None,
     return_weights: bool = True,
+    return_beta_only: bool = False,
     token_counts=None,
 ):
     import torch
@@ -418,8 +419,19 @@ def attention_forward(
         attn_weights = None
     attn_output = attn_output.transpose(1, 2).contiguous()
 
-    if prepend_mode is not None and attn_weights is not None:
-        beta = attn_weights[..., :1]
+    if prepend_mode is not None:
+        if attn_weights is not None:
+            beta = attn_weights[..., :1]
+        elif return_beta_only:
+            key_repeated = repeat_kv(key_states, module.num_key_value_groups)
+            summary_key_repeated = repeat_kv(summary_key, module.num_key_value_groups)
+            summary_scores = torch.matmul(query_states, summary_key_repeated.transpose(2, 3)) * module.scaling
+            token_scores = torch.matmul(query_states, key_repeated.transpose(2, 3)) * module.scaling
+            if attention_mask is not None:
+                token_scores = token_scores + attention_mask
+            token_logsumexp = torch.logsumexp(token_scores.float(), dim=-1, keepdim=True)
+            denom = torch.logaddexp(summary_scores.float(), token_logsumexp)
+            beta = torch.exp(summary_scores.float() - denom).to(query_states.dtype)
 
     return PrependResult(
         attn_output=attn_output,

@@ -898,8 +898,7 @@ class InstrumentedQwen3MoeExperiment:
         self._current_cos = cos
         self._current_sin = sin
         store_attn = self._should_store_attention(layer_idx, calibration)
-        need_causal_weights = bool(store_attn or calibration)
-        need_prepend_weights = bool(calibration)
+        need_causal_weights = bool(store_attn)
         final_token_k_rot = k_rot[..., -1, :]
         final_token_v = v_raw[..., -1, :]
         final_token_k_raw = k_pre[..., -1, :]
@@ -956,7 +955,8 @@ class InstrumentedQwen3MoeExperiment:
                 summary_key=summary_k,
                 summary_value=summary_v,
                 token_counts=token_counts,
-                return_weights=need_prepend_weights,
+                return_weights=False,
+                return_beta_only=calibration,
             )
             prepend_z = layer.self_attn.o_proj(prepend_result.attn_output.reshape(*hidden_states.shape[:-1], -1).contiguous())
             prepend_hidden = residual + prepend_z
