@@ -754,43 +754,65 @@ class InstrumentedQwen3MoeExperiment:
         self,
         *,
         layer,
-        causal_weights,
-        v_raw,
+        layer_idx: int,
+        causal_headwise,
         prepend_result,
         resid_pre_attn,
     ) -> dict[str, Any]:
         torch = import_torch()
         import torch.nn.functional as F
 
+        start = time.perf_counter()
         try:
             summary_value = prepend_result.summary_value
-            repeated_values = v_raw.repeat_interleave(layer.self_attn.num_key_value_groups, dim=1)
-            causal_headwise = torch.matmul(causal_weights, repeated_values)
             summary_headwise = summary_value.repeat_interleave(layer.self_attn.num_key_value_groups, dim=1).expand(
                 -1, -1, causal_headwise.shape[2], -1
             )
             beta0 = prepend_result.beta.squeeze(-1).clamp(1e-6, 1 - 1e-6)
             margin0 = torch.log(beta0 / (1.0 - beta0))
             bias_values = self._bias_values()
-
+            bias_chunk_size = 8
             router_rows = []
             topk_rows = []
-            for bias in bias_values:
-                beta_b = torch.sigmoid(margin0 + bias).unsqueeze(-1)
-                mixed_headwise = (1.0 - beta_b) * causal_headwise + beta_b * summary_headwise
-                concat = mixed_headwise.transpose(1, 2).reshape(resid_pre_attn.shape[0], resid_pre_attn.shape[1], -1)
-                z_b = layer.self_attn.o_proj(concat)
-                h_base = resid_pre_attn + z_b
-                h_pre_moe = layer.post_attention_layernorm(h_base)
-                flat = h_pre_moe.reshape(-1, h_pre_moe.shape[-1])
-                router_logits = F.linear(flat, layer.mlp.gate.weight).reshape(h_pre_moe.shape[0], h_pre_moe.shape[1], -1)
+            gate_weight = layer.mlp.gate.weight
+            hidden_dim = resid_pre_attn.shape[-1]
+
+            for start_idx in range(0, bias_values.shape[0], bias_chunk_size):
+                bias_chunk = bias_values[start_idx : start_idx + bias_chunk_size]
+                beta_chunk = torch.sigmoid(
+                    margin0.unsqueeze(1) + bias_chunk.view(1, -1, 1, 1)
+                ).unsqueeze(-1)
+                mixed_headwise = (
+                    (1.0 - beta_chunk) * causal_headwise.unsqueeze(1)
+                    + beta_chunk * summary_headwise.unsqueeze(1)
+                )
+                concat = mixed_headwise.permute(0, 1, 3, 2, 4).reshape(-1, hidden_dim)
+                z_b = layer.self_attn.o_proj(concat).reshape(
+                    resid_pre_attn.shape[0],
+                    bias_chunk.shape[0],
+                    resid_pre_attn.shape[1],
+                    hidden_dim,
+                )
+                h_base = resid_pre_attn.unsqueeze(1) + z_b
+                h_pre_moe = layer.post_attention_layernorm(
+                    h_base.reshape(-1, hidden_dim)
+                ).reshape_as(h_base)
+                router_logits = F.linear(
+                    h_pre_moe.reshape(-1, hidden_dim),
+                    gate_weight,
+                ).reshape(
+                    resid_pre_attn.shape[0],
+                    bias_chunk.shape[0],
+                    resid_pre_attn.shape[1],
+                    -1,
+                )
                 probs = F.softmax(router_logits.float(), dim=-1)
                 topk = torch.topk(probs, layer.mlp.gate.top_k, dim=-1).indices
                 router_rows.append(router_logits[0])
                 topk_rows.append(topk[0])
 
-            router_curve = torch.stack(router_rows, dim=1)
-            topk_curve = torch.stack(topk_rows, dim=1)
+            router_curve = torch.cat(router_rows, dim=0).permute(1, 0, 2)
+            topk_curve = torch.cat(topk_rows, dim=0).permute(1, 0, 2)
             probs_curve = torch.softmax(router_curve.float(), dim=-1)
             top1_prob = probs_curve.max(dim=-1).values
             grad = torch.gradient(top1_prob, spacing=(bias_values.float(),), dim=1)[0]
@@ -841,6 +863,13 @@ class InstrumentedQwen3MoeExperiment:
                 "kl_terminal": kl.detach().cpu().tolist(),
                 "beta_margin": margin0.mean(dim=0).detach().cpu().tolist(),
             }
+            logger.info(
+                "bias_sweep_done layer=%s tokens=%s bias_points=%s seconds=%.3f",
+                layer_idx,
+                resid_pre_attn.shape[1],
+                bias_values.shape[0],
+                time.perf_counter() - start,
+            )
             return {"bias_spectrum_signature": signature, "bias_spectrum_transitions": transitions}
         except Exception as exc:  # pragma: no cover - runtime/model specific
             return {"bias_spectrum_error": str(exc)}
@@ -941,8 +970,8 @@ class InstrumentedQwen3MoeExperiment:
             if calibration:
                 bias_metadata = self._compute_bias_sweep_metadata(
                     layer=layer,
-                    causal_weights=causal.attn_weights,
-                    v_raw=v_raw,
+                    layer_idx=layer_idx,
+                    causal_headwise=causal.attn_output.transpose(1, 2),
                     prepend_result=prepend_result,
                     resid_pre_attn=residual,
                 )
