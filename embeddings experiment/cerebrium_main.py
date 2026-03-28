@@ -388,7 +388,7 @@ def _load_nanobeir_records(dataset_names: list[str]) -> list[dict[str, str]]:
     return records
 
 
-def collect_smoke(smoke_run_id: str | None = None) -> dict[str, object]:
+def collect_smoke(smoke_run_id: str = "") -> dict[str, object]:
     from kv_prepend_experiment.collection import InstrumentedQwen3MoeExperiment
     from kv_prepend_experiment.config import load_experiment_spec
     from kv_prepend_experiment.logging_utils import configure_logging
@@ -398,7 +398,7 @@ def collect_smoke(smoke_run_id: str | None = None) -> dict[str, object]:
     spec = load_experiment_spec(spec_path)
     spec.model.preflight_max_used_memory_gib = None
 
-    run_root = _new_persistent_run_root("smoke_runs", smoke_run_id)
+    run_root = _new_persistent_run_root("smoke_runs", smoke_run_id or None)
     status_path = run_root / "status.json"
     configure_logging(log_path=run_root / "artifacts" / "logs" / "collect_smoke.log", level="INFO")
     LOGGER.info("collect_smoke_setup spec=%s records=%s", spec_path.name, records_path.name)
@@ -472,7 +472,7 @@ def collect_smoke(smoke_run_id: str | None = None) -> dict[str, object]:
         _best_effort_runtime_cleanup("collect_smoke")
 
 
-def calibration_run(calibration_run_id: str | None = None) -> dict[str, object]:
+def calibration_run(calibration_run_id: str = "") -> dict[str, object]:
     from kv_prepend_experiment.collection import InstrumentedQwen3MoeExperiment
     from kv_prepend_experiment.config import load_experiment_spec
     from kv_prepend_experiment.logging_utils import configure_logging
@@ -483,7 +483,7 @@ def calibration_run(calibration_run_id: str | None = None) -> dict[str, object]:
     spec.model.torch_dtype = "auto"
     spec.collection.writer_queue_size = 1
 
-    run_root = _new_persistent_run_root("calibration_runs", calibration_run_id)
+    run_root = _new_persistent_run_root("calibration_runs", calibration_run_id or None)
     status_path = run_root / "status.json"
     configure_logging(log_path=run_root / "artifacts" / "logs" / "calibration_run.log", level="INFO")
     LOGGER.info("calibration_run_setup spec=%s", spec_path.name)
@@ -561,9 +561,9 @@ def calibration_run(calibration_run_id: str | None = None) -> dict[str, object]:
 
 
 def analyze_latest_calibration(
-    calibration_run_id: str | None = None,
-    analysis_run_id: str | None = None,
-    workers: int | None = None,
+    calibration_run_id: str = "",
+    analysis_run_id: str = "",
+    workers: int = 0,
 ) -> dict[str, object]:
     from kv_prepend_experiment.analysis import analyze_capture_directory
     from kv_prepend_experiment.config import load_experiment_spec
@@ -577,10 +577,10 @@ def analyze_latest_calibration(
         else _latest_persistent_run_root("calibration_runs")
     )
     capture_dir = run_root / spec.output.captures_dir
-    analysis_root = _new_analysis_root(run_root, analysis_run_id=analysis_run_id)
+    analysis_root = _new_analysis_root(run_root, analysis_run_id=analysis_run_id or None)
     output_path = analysis_root / "capture_analysis.json"
     status_path = analysis_root / "status.json"
-    requested_workers = workers if workers is not None else max(8, os.cpu_count() or 1)
+    requested_workers = workers if workers > 0 else max(8, os.cpu_count() or 1)
     os.environ["KV_PREPEND_ANALYSIS_WORKERS"] = str(requested_workers)
     configure_logging(log_path=analysis_root / "analysis_run.log", level="INFO")
     state: dict[str, object] = {
