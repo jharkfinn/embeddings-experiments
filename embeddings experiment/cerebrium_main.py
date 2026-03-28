@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -13,6 +15,86 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _read_proc_status() -> dict[str, str]:
+    try:
+        lines = (Path("/proc/self/status").read_text(encoding="utf-8")).splitlines()
+    except OSError:
+        return {}
+    wanted = {"VmRSS", "VmHWM", "VmSize", "Threads"}
+    parsed: dict[str, str] = {}
+    for line in lines:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        if key in wanted:
+            parsed[key.lower()] = value.strip()
+    return parsed
+
+
+def _capture_dir_snapshot(run_root: Path | None) -> dict[str, object]:
+    if run_root is None or not run_root.exists():
+        return {}
+    payload: dict[str, object] = {}
+    capture_dirs = sorted(
+        path for path in run_root.iterdir() if path.is_dir() and path.name.startswith("captures_")
+    )
+    for capture_dir in capture_dirs:
+        count = 0
+        total_bytes = 0
+        for entry in capture_dir.iterdir():
+            if not entry.is_file():
+                continue
+            count += 1
+            total_bytes += entry.stat().st_size
+        payload[capture_dir.name] = {
+            "files": count,
+            "bytes": total_bytes,
+        }
+    return payload
+
+
+def _resource_snapshot(run_root: Path | None = None) -> dict[str, object]:
+    return {
+        "proc": _read_proc_status(),
+        "gpu": _nvidia_smi(),
+        "captures": _capture_dir_snapshot(run_root),
+    }
+
+
+@contextmanager
+def _resource_heartbeat(label: str, *, run_root: Path | None = None, interval_s: float = 10.0) -> object:
+    stop_event = threading.Event()
+
+    def emit(stage: str) -> None:
+        LOGGER.info(
+            "cerebrium_resource label=%s stage=%s snapshot=%s",
+            label,
+            stage,
+            json.dumps(_resource_snapshot(run_root), sort_keys=True),
+        )
+
+    def loop() -> None:
+        while not stop_event.wait(interval_s):
+            emit("tick")
+
+    emit("start")
+    worker = threading.Thread(target=loop, name=f"{label}-heartbeat", daemon=True)
+    worker.start()
+    try:
+        yield
+    except BaseException:
+        LOGGER.exception("cerebrium_run_failed label=%s", label)
+        raise
+    finally:
+        stop_event.set()
+        worker.join(timeout=1.0)
+        emit("stop")
 
 
 def _nvidia_smi() -> dict[str, str] | None:
@@ -183,18 +265,25 @@ def collect_smoke() -> dict[str, object]:
         shutil.rmtree(run_root)
     run_root.mkdir(parents=True, exist_ok=True)
     configure_logging(log_path=run_root / "artifacts" / "logs" / "collect_smoke.log", level="INFO")
+    LOGGER.info("collect_smoke_setup spec=%s records=%s", spec_path.name, records_path.name)
 
     records = json.loads(records_path.read_text(encoding="utf-8"))
     start = time.perf_counter()
-    experiment = InstrumentedQwen3MoeExperiment(spec, run_root)
-    experiment.load()
-    spec_snapshot = experiment.save_spec_snapshot()
-    paths, _ = experiment.collect_examples(
-        records,
-        dataset_name="cerebrium_smoke",
-        retain_bundles=False,
-    )
-    experiment.flush_writes()
+    LOGGER.info("collect_smoke_records_loaded records=%s", len(records))
+    with _resource_heartbeat("collect_smoke", run_root=run_root):
+        experiment = InstrumentedQwen3MoeExperiment(spec, run_root)
+        LOGGER.info("collect_smoke_experiment_load_start")
+        experiment.load()
+        LOGGER.info("collect_smoke_experiment_load_done")
+        spec_snapshot = experiment.save_spec_snapshot()
+        paths, _ = experiment.collect_examples(
+            records,
+            dataset_name="cerebrium_smoke",
+            retain_bundles=False,
+        )
+        LOGGER.info("collect_smoke_collect_done paths=%s", len(paths))
+        experiment.flush_writes()
+        LOGGER.info("collect_smoke_flush_done")
     captures = []
     for path in paths:
         stat = path.stat()
@@ -230,18 +319,25 @@ def calibration_run() -> dict[str, object]:
         shutil.rmtree(run_root)
     run_root.mkdir(parents=True, exist_ok=True)
     configure_logging(log_path=run_root / "artifacts" / "logs" / "calibration_run.log", level="INFO")
+    LOGGER.info("calibration_run_setup spec=%s", spec_path.name)
 
     records = _load_nanobeir_records(["scifact", "fiqa2018", "quoraretrieval"])
     start = time.perf_counter()
-    experiment = InstrumentedQwen3MoeExperiment(spec, run_root)
-    experiment.load()
-    spec_snapshot = experiment.save_spec_snapshot()
-    paths, _ = experiment.collect_examples(
-        records,
-        dataset_name="nanobeir_3tasks",
-        retain_bundles=False,
-    )
-    experiment.flush_writes()
+    LOGGER.info("calibration_run_records_loaded records=%s", len(records))
+    with _resource_heartbeat("calibration_run", run_root=run_root):
+        experiment = InstrumentedQwen3MoeExperiment(spec, run_root)
+        LOGGER.info("calibration_run_experiment_load_start")
+        experiment.load()
+        LOGGER.info("calibration_run_experiment_load_done")
+        spec_snapshot = experiment.save_spec_snapshot()
+        paths, _ = experiment.collect_examples(
+            records,
+            dataset_name="nanobeir_3tasks",
+            retain_bundles=False,
+        )
+        LOGGER.info("calibration_run_collect_done paths=%s", len(paths))
+        experiment.flush_writes()
+        LOGGER.info("calibration_run_flush_done")
     captures = []
     total_bytes = 0
     for path in paths:

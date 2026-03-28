@@ -20,6 +20,14 @@ def configure_logging(
     log_path: str | Path | None = None,
     level: str = "INFO",
 ) -> Path | None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(line_buffering=True, write_through=True)
+        except Exception:
+            pass
     resolved_level = getattr(logging, level.upper(), logging.INFO)
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
     resolved_path = None if log_path is None else Path(log_path)
