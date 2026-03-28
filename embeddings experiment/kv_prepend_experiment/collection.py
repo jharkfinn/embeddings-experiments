@@ -8,7 +8,6 @@ import random
 import threading
 import time
 import uuid
-from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -51,31 +50,6 @@ def _storage_dtype(role: str, calibration: bool):
     if calibration:
         return torch.bfloat16
     return getattr(torch, "float8_e4m3fn", torch.bfloat16)
-
-
-def _to_cpu(tensor, dtype=None):
-    if tensor is None:
-        return None
-    torch = import_torch()
-    if isinstance(tensor, torch.Tensor):
-        out = tensor.detach().cpu()
-        if dtype is not None:
-            out = out.to(dtype=dtype)
-        return out
-    return tensor
-
-
-def _storage_metadata(tensor, storage_dtype) -> dict[str, Any]:
-    if tensor is None:
-        return {}
-    torch = import_torch()
-    if isinstance(tensor, torch.Tensor):
-        return {
-            "source_dtype": str(tensor.dtype).replace("torch.", ""),
-            "storage_dtype": str(storage_dtype).replace("torch.", ""),
-            "shape": list(tensor.shape),
-        }
-    return {"storage_dtype": str(storage_dtype)}
 
 
 def _causal_attention_mask(attention_mask, batch_size: int, seq_len: int, device, dtype):
@@ -378,10 +352,22 @@ class InstrumentedQwen3MoeExperiment:
         session.synchronize()
         return session.staged_tensors, session.staged_bytes
 
-    def _stage_tensor(self, tensor, dtype=None):
+    def _stage_tensor_group(self, tensors: dict[str, tuple[Any, Any | None]]):
         if self._transfer_session is None:
-            return _to_cpu(tensor, dtype=dtype)
-        return self._transfer_session.stage_tensor(tensor, dtype=dtype)
+            torch = import_torch()
+            outputs: dict[str, Any] = {}
+            for name, (tensor, dtype) in tensors.items():
+                if tensor is None:
+                    outputs[name] = None
+                elif isinstance(tensor, torch.Tensor):
+                    src = tensor.detach()
+                    if dtype is not None and src.dtype != dtype:
+                        src = src.to(dtype=dtype)
+                    outputs[name] = src.cpu()
+                else:
+                    outputs[name] = tensor
+            return outputs
+        return self._transfer_session.stage_tensor_group(tensors)
 
     def annotate_examples(self, examples: list[PromptExample]):
         self._ensure_loaded()
@@ -600,26 +586,6 @@ class InstrumentedQwen3MoeExperiment:
             pass
         return value
 
-    def _slice_layer_capture(self, capture: LayerCapture, row_idx: int, batch_size: int) -> LayerCapture:
-        return LayerCapture(
-            layer_idx=capture.layer_idx,
-            condition=capture.condition,
-            resid_pre_attn=self._slice_batch_value(capture.resid_pre_attn, row_idx, batch_size),
-            q_pre_rope=self._slice_batch_value(capture.q_pre_rope, row_idx, batch_size),
-            v_raw=self._slice_batch_value(capture.v_raw, row_idx, batch_size),
-            attention_weights=self._slice_batch_value(capture.attention_weights, row_idx, batch_size),
-            beta=self._slice_batch_value(capture.beta, row_idx, batch_size),
-            z_attn=self._slice_batch_value(capture.z_attn, row_idx, batch_size),
-            h_pre_moe=self._slice_batch_value(capture.h_pre_moe, row_idx, batch_size),
-            router_logits_pre_softmax=self._slice_batch_value(capture.router_logits_pre_softmax, row_idx, batch_size),
-            top_k_indices=self._slice_batch_value(capture.top_k_indices, row_idx, batch_size),
-            final_token_k_rot=self._slice_batch_value(capture.final_token_k_rot, row_idx, batch_size),
-            final_token_v=self._slice_batch_value(capture.final_token_v, row_idx, batch_size),
-            final_token_k_raw=self._slice_batch_value(capture.final_token_k_raw, row_idx, batch_size),
-            position_ids=self._slice_batch_value(capture.position_ids, row_idx, batch_size),
-            metadata=dict(capture.metadata),
-        )
-
     def _split_pass_capture(self, pass_capture: PassCapture, batch_examples: list[PromptExample]) -> list[PassCapture]:
         return split_pass_capture(pass_capture, len(batch_examples))
 
@@ -658,7 +624,7 @@ class InstrumentedQwen3MoeExperiment:
         metadata = {"calibration": calibration}
         if extra_metadata:
             metadata.update(extra_metadata)
-        staged = self._transfer_session.stage_tensor_group(
+        staged = self._stage_tensor_group(
             {
                 "resid_pre_attn": (
                     resid_pre_attn if self._signal_enabled_for_layer("resid_pre_attn", layer_idx, calibration) else None,
@@ -873,61 +839,75 @@ class InstrumentedQwen3MoeExperiment:
                 )
                 probs = F.softmax(router_logits.float(), dim=-1)
                 topk = torch.topk(probs, layer.mlp.gate.top_k, dim=-1).indices
-                router_rows.append(router_logits[0])
-                topk_rows.append(topk[0])
+                router_rows.append(router_logits)
+                topk_rows.append(topk)
 
-            router_curve = torch.cat(router_rows, dim=0).permute(1, 0, 2)
-            topk_curve = torch.cat(topk_rows, dim=0).permute(1, 0, 2)
+            router_curve = torch.cat(router_rows, dim=1).permute(0, 2, 1, 3)
+            topk_curve = torch.cat(topk_rows, dim=1).permute(0, 2, 1, 3)
             probs_curve = torch.softmax(router_curve.float(), dim=-1)
             top1_prob = probs_curve.max(dim=-1).values
-            grad = torch.gradient(top1_prob, spacing=(bias_values.float(),), dim=1)[0]
-            curvature = torch.gradient(grad, spacing=(bias_values.float(),), dim=1)[0]
-            baseline_probs = probs_curve[:, bias_values.shape[0] // 2, :]
+            grad = torch.gradient(top1_prob, spacing=(bias_values.float(),), dim=2)[0]
+            curvature = torch.gradient(grad, spacing=(bias_values.float(),), dim=2)[0]
+            baseline_index = bias_values.shape[0] // 2
+            baseline_probs = probs_curve[:, :, baseline_index, :]
             sorted_probs = torch.sort(baseline_probs, dim=-1, descending=True).values
             topk_width = layer.mlp.gate.top_k
-            margin = sorted_probs[:, topk_width - 1] - sorted_probs[:, topk_width]
-            kl = (baseline_probs * (baseline_probs.clamp_min(1e-6).log() - probs_curve[:, -1, :].clamp_min(1e-6).log())).sum(dim=-1)
+            margin = sorted_probs[..., topk_width - 1] - sorted_probs[..., topk_width]
+            kl = (
+                baseline_probs
+                * (baseline_probs.clamp_min(1e-6).log() - probs_curve[:, :, -1, :].clamp_min(1e-6).log())
+            ).sum(dim=-1)
 
-            transitions = []
-            first_transition = torch.full((topk_curve.shape[0],), float("nan"), device=topk_curve.device)
-            flip_count = torch.zeros((topk_curve.shape[0],), dtype=torch.int32, device=topk_curve.device)
-            baseline_index = bias_values.shape[0] // 2
-            baseline_topk = topk_curve[:, baseline_index, :]
-            for bias_index in range(topk_curve.shape[1]):
-                if bias_index == baseline_index:
-                    continue
-                current = topk_curve[:, bias_index, :]
-                changed = (current != baseline_topk).any(dim=-1)
-                newly_changed = changed & torch.isnan(first_transition)
-                first_transition[newly_changed] = bias_values[bias_index]
-                flip_count = flip_count + changed.to(torch.int32)
-                for token_index in torch.nonzero(changed, as_tuple=False).flatten().tolist():
-                    prev = set(baseline_topk[token_index].tolist())
-                    curr = set(current[token_index].tolist())
-                    outs = sorted(prev - curr)
-                    ins = sorted(curr - prev)
-                    for out_expert, in_expert in zip(outs, ins):
-                        rank_position = int((current[token_index] == in_expert).nonzero(as_tuple=False)[0].item())
-                        transitions.append(
-                            {
-                                "token_index": int(token_index),
-                                "b_critical": float(bias_values[bias_index].item()),
-                                "expert_out": int(out_expert),
-                                "expert_in": int(in_expert),
-                                "rank_position": rank_position,
-                            }
-                        )
-
-            signature = {
-                "bias_values": [float(v) for v in bias_values.detach().cpu().tolist()],
-                "sensitivity": grad[:, bias_values.shape[0] // 2].detach().cpu().tolist(),
-                "curvature": curvature[:, bias_values.shape[0] // 2].detach().cpu().tolist(),
-                "first_phase_transition": first_transition.detach().cpu().tolist(),
-                "flip_count": flip_count.detach().cpu().tolist(),
-                "margin": margin.detach().cpu().tolist(),
-                "kl_terminal": kl.detach().cpu().tolist(),
-                "beta_margin": margin0.mean(dim=0).detach().cpu().tolist(),
-            }
+            per_example_metadata = []
+            baseline_topk = topk_curve[:, :, baseline_index, :]
+            if margin0.ndim == 3:
+                beta_margin = margin0.mean(dim=1)
+            else:
+                beta_margin = margin0
+            for row_idx in range(router_curve.shape[0]):
+                transitions = []
+                first_transition = torch.full((topk_curve.shape[1],), float("nan"), device=topk_curve.device)
+                flip_count = torch.zeros((topk_curve.shape[1],), dtype=torch.int32, device=topk_curve.device)
+                row_baseline_topk = baseline_topk[row_idx]
+                for bias_index in range(topk_curve.shape[2]):
+                    if bias_index == baseline_index:
+                        continue
+                    current = topk_curve[row_idx, :, bias_index, :]
+                    changed = (current != row_baseline_topk).any(dim=-1)
+                    newly_changed = changed & torch.isnan(first_transition)
+                    first_transition[newly_changed] = bias_values[bias_index]
+                    flip_count = flip_count + changed.to(torch.int32)
+                    for token_index in torch.nonzero(changed, as_tuple=False).flatten().tolist():
+                        prev = set(row_baseline_topk[token_index].tolist())
+                        curr = set(current[token_index].tolist())
+                        outs = sorted(prev - curr)
+                        ins = sorted(curr - prev)
+                        for out_expert, in_expert in zip(outs, ins):
+                            rank_position = int((current[token_index] == in_expert).nonzero(as_tuple=False)[0].item())
+                            transitions.append(
+                                {
+                                    "token_index": int(token_index),
+                                    "b_critical": float(bias_values[bias_index].item()),
+                                    "expert_out": int(out_expert),
+                                    "expert_in": int(in_expert),
+                                    "rank_position": rank_position,
+                                }
+                            )
+                per_example_metadata.append(
+                    {
+                        "bias_spectrum_signature": {
+                            "bias_values": [float(v) for v in bias_values.detach().cpu().tolist()],
+                            "sensitivity": grad[row_idx, :, baseline_index].detach().cpu().tolist(),
+                            "curvature": curvature[row_idx, :, baseline_index].detach().cpu().tolist(),
+                            "first_phase_transition": first_transition.detach().cpu().tolist(),
+                            "flip_count": flip_count.detach().cpu().tolist(),
+                            "margin": margin[row_idx].detach().cpu().tolist(),
+                            "kl_terminal": kl[row_idx].detach().cpu().tolist(),
+                            "beta_margin": beta_margin[row_idx].detach().cpu().tolist(),
+                        },
+                        "bias_spectrum_transitions": transitions,
+                    }
+                )
             logger.info(
                 "bias_sweep_done layer=%s tokens=%s bias_points=%s seconds=%.3f",
                 layer_idx,
@@ -935,7 +915,7 @@ class InstrumentedQwen3MoeExperiment:
                 bias_values.shape[0],
                 time.perf_counter() - start,
             )
-            return {"bias_spectrum_signature": signature, "bias_spectrum_transitions": transitions}
+            return {"_per_example_metadata": per_example_metadata}
         except Exception as exc:  # pragma: no cover - runtime/model specific
             return {"bias_spectrum_error": str(exc)}
 
@@ -1241,7 +1221,7 @@ class InstrumentedQwen3MoeExperiment:
                 residual = hidden_states
                 normed_hidden = layer.input_layernorm(hidden_states)
                 q_pre, k_pre, q_rot, k_rot, v_raw, _, _ = self._project_qkv(layer.self_attn, normed_hidden, position_embeddings)
-                summaries[layer_idx] = self._transfer_session.stage_tensor_group(
+                summaries[layer_idx] = self._stage_tensor_group(
                     {
                         "final_token_k_rot": (
                             _gather_last_kv(k_rot, last_positions),

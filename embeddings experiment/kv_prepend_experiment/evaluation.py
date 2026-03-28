@@ -356,9 +356,14 @@ def evaluate_signal_family(
         if sample_bundle is not None and _has_layer_capture(sample_bundle, pass_name, condition, layer_idx)
     ]
     if not available_layers:
-        raise ValueError(
-            f"No available layers for signal={signal_name}, pass={pass_name}, condition={condition}"
-        )
+        return {
+            "skipped": True,
+            "reason": f"No available layers for signal={signal_name}, pass={pass_name}, condition={condition}",
+            "signal_name": signal_name,
+            "condition": condition,
+            "pass_name": pass_name,
+            "requested_layers": selected_layers,
+        }
     per_layer = []
     for layer_idx in available_layers:
         layer_result = evaluate_signal(
@@ -590,7 +595,7 @@ def evaluate_task_suite(
             quantization_spec=quantization_spec,
         )
     task = load_nanobeir_task(repo_name, task_name)
-    keys = list(suite["signals"].keys())
+    keys = [key for key, value in suite["signals"].items() if not value.get("skipped")]
     for left_index, left_signal in enumerate(keys):
         left_scores = suite["signals"][left_signal]["grouped_multi"]["multivector_scores"]
         for right_signal in keys[left_index + 1 :]:

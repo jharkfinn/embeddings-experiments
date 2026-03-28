@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 
 from .capture_io import iter_payload_bundles
-from .evaluation import _content_row_mask, _find_layer_capture, _tensor_to_numpy, load_capture_payloads
+from .evaluation import _content_row_mask, _find_layer_capture, _tensor_to_numpy
 from .quantization import cosine_similarity
 from .types import CaptureCondition, ExampleCaptureBundle
 
@@ -137,11 +137,18 @@ def token_collapse_panel(tokens: np.ndarray):
     covariance = centered.T @ centered / max(1, tokens.shape[0] - 1)
     singular_values = np.linalg.svd(covariance, compute_uv=False)
     effective_rank = float(np.exp(-(p := singular_values / singular_values.sum() if singular_values.sum() > 0 else singular_values).dot(np.log(np.clip(p, 1e-12, None))))) if singular_values.sum() > 0 else 0.0
-    cosine_matrix = tokens @ tokens.T
+    norms = np.linalg.norm(tokens, axis=-1, keepdims=True)
+    unit = tokens / np.clip(norms, 1e-6, None)
+    cosine_matrix = unit @ unit.T
+    if cosine_matrix.shape[0] > 1:
+        mask = ~np.eye(cosine_matrix.shape[0], dtype=bool)
+        cosine_values = cosine_matrix[mask]
+    else:
+        cosine_values = cosine_matrix.reshape(-1)
     return {
         "effective_rank": effective_rank,
-        "pairwise_cosine_mean": float(cosine_matrix.mean()),
-        "pairwise_cosine_std": float(cosine_matrix.std()),
+        "pairwise_cosine_mean": float(cosine_values.mean()),
+        "pairwise_cosine_std": float(cosine_values.std()),
     }
 
 

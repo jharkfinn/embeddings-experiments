@@ -32,6 +32,24 @@ def _trim_batch_value(value, batch_size: int):
     return value
 
 
+def _slice_metadata(metadata: dict[str, Any], row_idx: int, batch_size: int) -> dict[str, Any]:
+    out = {key: value for key, value in metadata.items() if key != "_per_example_metadata"}
+    per_example = metadata.get("_per_example_metadata")
+    if isinstance(per_example, list) and row_idx < min(batch_size, len(per_example)):
+        row_meta = per_example[row_idx]
+        if isinstance(row_meta, dict):
+            out.update(row_meta)
+    return out
+
+
+def _trim_metadata(metadata: dict[str, Any], batch_size: int) -> dict[str, Any]:
+    out = dict(metadata)
+    per_example = out.get("_per_example_metadata")
+    if isinstance(per_example, list) and len(per_example) > batch_size:
+        out["_per_example_metadata"] = per_example[:batch_size]
+    return out
+
+
 def slice_layer_capture(capture: LayerCapture, row_idx: int, batch_size: int) -> LayerCapture:
     return LayerCapture(
         layer_idx=capture.layer_idx,
@@ -49,7 +67,7 @@ def slice_layer_capture(capture: LayerCapture, row_idx: int, batch_size: int) ->
         final_token_v=_slice_batch_value(capture.final_token_v, row_idx, batch_size),
         final_token_k_raw=_slice_batch_value(capture.final_token_k_raw, row_idx, batch_size),
         position_ids=_slice_batch_value(capture.position_ids, row_idx, batch_size),
-        metadata=dict(capture.metadata),
+        metadata=_slice_metadata(capture.metadata, row_idx, batch_size),
     )
 
 
@@ -70,7 +88,7 @@ def trim_layer_capture(capture: LayerCapture, batch_size: int) -> LayerCapture:
         final_token_v=_trim_batch_value(capture.final_token_v, batch_size),
         final_token_k_raw=_trim_batch_value(capture.final_token_k_raw, batch_size),
         position_ids=_trim_batch_value(capture.position_ids, batch_size),
-        metadata=dict(capture.metadata),
+        metadata=_trim_metadata(capture.metadata, batch_size),
     )
 
 
