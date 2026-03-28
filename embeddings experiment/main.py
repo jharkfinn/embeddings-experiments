@@ -1,4 +1,5 @@
 from cerebrium_main import (
+    analyze_latest_calibration,
     calibration_run,
     collect_smoke,
     full_smoke,
@@ -7,4 +8,3 @@ from cerebrium_main import (
     repo_smoke,
     stack_smoke,
 )
-

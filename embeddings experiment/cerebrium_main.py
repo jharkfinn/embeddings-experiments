@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -16,8 +16,34 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+PERSISTENT_STORAGE_ROOT = Path("/persistent-storage")
+APP_STORAGE_ROOT = PERSISTENT_STORAGE_ROOT / "kv-prepend-l40s-smoke"
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _app_storage_root() -> Path:
+    root = APP_STORAGE_ROOT if PERSISTENT_STORAGE_ROOT.exists() else (ROOT / "cerebrium_storage")
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _new_persistent_run_root(run_kind: str) -> Path:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    run_id = f"{timestamp}_{uuid.uuid4().hex[:8]}"
+    run_root = _app_storage_root() / run_kind / run_id
+    run_root.mkdir(parents=True, exist_ok=True)
+    return run_root
+
+
+def _latest_persistent_run_root(run_kind: str) -> Path:
+    parent = _app_storage_root() / run_kind
+    if not parent.exists():
+        raise FileNotFoundError(f"no persisted runs found under {parent}")
+    candidates = sorted(path for path in parent.iterdir() if path.is_dir())
+    if not candidates:
+        raise FileNotFoundError(f"no persisted runs found under {parent}")
+    return candidates[-1]
 
 
 def _read_proc_status() -> dict[str, str]:
@@ -260,10 +286,7 @@ def collect_smoke() -> dict[str, object]:
     spec = load_experiment_spec(spec_path)
     spec.model.preflight_max_used_memory_gib = None
 
-    run_root = ROOT / "cerebrium_smoke_output"
-    if run_root.exists():
-        shutil.rmtree(run_root)
-    run_root.mkdir(parents=True, exist_ok=True)
+    run_root = _new_persistent_run_root("smoke_runs")
     configure_logging(log_path=run_root / "artifacts" / "logs" / "collect_smoke.log", level="INFO")
     LOGGER.info("collect_smoke_setup spec=%s records=%s", spec_path.name, records_path.name)
 
@@ -298,6 +321,7 @@ def collect_smoke() -> dict[str, object]:
         "records": len(records),
         "capture_count": len(paths),
         "captures": captures,
+        "run_root": str(run_root),
         "spec_snapshot": str(spec_snapshot.relative_to(run_root)),
         "nvidia_smi_after_collect": _nvidia_smi(),
     }
@@ -314,10 +338,7 @@ def calibration_run() -> dict[str, object]:
     spec.model.torch_dtype = "auto"
     spec.collection.writer_queue_size = 1
 
-    run_root = ROOT / "cerebrium_calibration_output"
-    if run_root.exists():
-        shutil.rmtree(run_root)
-    run_root.mkdir(parents=True, exist_ok=True)
+    run_root = _new_persistent_run_root("calibration_runs")
     configure_logging(log_path=run_root / "artifacts" / "logs" / "calibration_run.log", level="INFO")
     LOGGER.info("calibration_run_setup spec=%s", spec_path.name)
 
@@ -355,8 +376,43 @@ def calibration_run() -> dict[str, object]:
         "capture_count": len(paths),
         "capture_bytes": total_bytes,
         "captures": captures,
+        "run_root": str(run_root),
         "spec_snapshot": str(spec_snapshot.relative_to(run_root)),
         "nvidia_smi_after_collect": _nvidia_smi(),
+    }
+
+
+def analyze_latest_calibration() -> dict[str, object]:
+    from kv_prepend_experiment.analysis import analyze_capture_directory
+    from kv_prepend_experiment.config import load_experiment_spec
+    from kv_prepend_experiment.logging_utils import configure_logging
+
+    spec_path = ROOT / "spec_calibration_hf_3tasks.json"
+    spec = load_experiment_spec(spec_path)
+    run_root = _latest_persistent_run_root("calibration_runs")
+    capture_dir = run_root / spec.output.captures_dir
+    output_path = run_root / spec.output.analysis_dir / "capture_analysis.json"
+    os.environ.setdefault("KV_PREPEND_ANALYSIS_WORKERS", "2")
+    configure_logging(log_path=run_root / "artifacts" / "logs" / "analysis_run.log", level="INFO")
+    LOGGER.info(
+        "analysis_run_setup spec=%s run_root=%s capture_dir=%s workers=%s",
+        spec_path.name,
+        run_root,
+        capture_dir,
+        os.environ.get("KV_PREPEND_ANALYSIS_WORKERS"),
+    )
+    start = time.perf_counter()
+    with _resource_heartbeat("analysis_run", run_root=run_root):
+        summary = analyze_capture_directory(capture_dir, output_path)
+    return {
+        "seconds": round(time.perf_counter() - start, 3),
+        "run_root": str(run_root),
+        "capture_dir": str(capture_dir),
+        "output_path": str(output_path),
+        "bundles": int(summary.get("num_bundles", 0)),
+        "layers": len(summary.get("layers", {})),
+        "output_bytes": output_path.stat().st_size if output_path.exists() else 0,
+        "nvidia_smi_after_analysis": _nvidia_smi(),
     }
 
 

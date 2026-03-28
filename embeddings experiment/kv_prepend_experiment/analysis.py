@@ -286,7 +286,10 @@ def analyze_capture_directory(capture_dir: str | Path, output_path: str | Path):
         # on the 8-vCPU Thunder box and can look like a hang.
         for env_name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
             os.environ[env_name] = "1"
+        configured_workers = int(os.environ.get("KV_PREPEND_ANALYSIS_WORKERS", "0") or "0")
         worker_count = min(4, max(1, os.cpu_count() or 1), len(capture_paths))
+        if configured_workers > 0:
+            worker_count = min(worker_count, configured_workers)
         ctx = mp.get_context("spawn")
         logger.info(
             "analysis_parallel workers=%s shards=%s start_method=%s blas_threads=1",
