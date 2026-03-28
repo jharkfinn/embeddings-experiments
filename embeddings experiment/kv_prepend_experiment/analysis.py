@@ -185,14 +185,27 @@ def radial_tangential_decomposition(h_base: np.ndarray, delta_z: np.ndarray, eps
 
 
 def token_collapse_panel(tokens: np.ndarray):
-    if tokens.size == 0:
+    tokens = np.asarray(tokens, dtype=np.float32)
+    if tokens.ndim != 2 or tokens.size == 0:
         return {"effective_rank": 0.0, "pairwise_cosine_mean": 0.0, "pairwise_cosine_std": 0.0}
+    finite_rows = np.all(np.isfinite(tokens), axis=1)
+    tokens = tokens[finite_rows]
+    if tokens.shape[0] == 0:
+        return {"effective_rank": 0.0, "pairwise_cosine_mean": 0.0, "pairwise_cosine_std": 0.0}
+    tokens = np.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
     centered = tokens - tokens.mean(axis=0, keepdims=True)
     covariance = centered.T @ centered / max(1, tokens.shape[0] - 1)
-    singular_values = np.linalg.svd(covariance, compute_uv=False)
-    effective_rank = float(np.exp(-(p := singular_values / singular_values.sum() if singular_values.sum() > 0 else singular_values).dot(np.log(np.clip(p, 1e-12, None))))) if singular_values.sum() > 0 else 0.0
+    covariance = np.nan_to_num(covariance, nan=0.0, posinf=0.0, neginf=0.0)
+    try:
+        singular_values = np.linalg.svd(covariance, compute_uv=False)
+    except np.linalg.LinAlgError:
+        logger.warning("analysis_svd_nonconverged rows=%s width=%s", tokens.shape[0], tokens.shape[1])
+        singular_values = np.array([], dtype=np.float32)
+    effective_rank = float(np.exp(-(p := singular_values / singular_values.sum() if singular_values.sum() > 0 else singular_values).dot(np.log(np.clip(p, 1e-12, None))))) if singular_values.size > 0 and singular_values.sum() > 0 else 0.0
     norms = np.linalg.norm(tokens, axis=-1, keepdims=True)
+    norms = np.nan_to_num(norms, nan=0.0, posinf=0.0, neginf=0.0)
     unit = tokens / np.clip(norms, 1e-6, None)
+    unit = np.nan_to_num(unit, nan=0.0, posinf=0.0, neginf=0.0)
     cosine_matrix = unit @ unit.T
     if cosine_matrix.shape[0] > 1:
         mask = ~np.eye(cosine_matrix.shape[0], dtype=bool)
