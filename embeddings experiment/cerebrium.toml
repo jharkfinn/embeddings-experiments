@@ -9,6 +9,7 @@ include = [
   "./kv_prepend_experiment/**/*",
   "./run_kv_prepend_experiment.py",
   "./default_experiment.json",
+  "./spec_calibration_hf_3tasks.json",
   "./spec_main_hf_teacher_forcing_l40s_3tasks.json",
   "./spec_main_hf_teacher_forcing_3tasks.json",
   "./smoke_records.json",
@@ -38,6 +39,7 @@ scaling_metric = "concurrency_utilization"
 [cerebrium.dependencies.pip]
 accelerate = "1.13.0"
 datasets = "4.8.4"
+kernels = "latest"
 numpy = "latest"
 torch = "latest"
 transformers = "5.4.0"

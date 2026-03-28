@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -129,6 +130,136 @@ def model_load_smoke() -> dict[str, object]:
             "module_name": contract.module_name,
         },
         "nvidia_smi_after_load": _nvidia_smi(),
+    }
+
+
+def _doc_text(row: dict[str, str]) -> str:
+    title = str(row.get("title", "")).strip()
+    text = str(row.get("text", "")).strip()
+    if title and text:
+        return f"{title}\n\n{text}"
+    return title or text
+
+
+def _load_nanobeir_records(dataset_names: list[str]) -> list[dict[str, str]]:
+    from kv_prepend_experiment.nano_beir import load_nanobeir_task
+
+    records: list[dict[str, str]] = []
+    for dataset_name in dataset_names:
+        task = load_nanobeir_task("zeta-alpha-ai/NanoBEIR", dataset_name)
+        for doc_id, row in task.corpus.items():
+            records.append(
+                {
+                    "text_id": str(doc_id),
+                    "kind": "doc",
+                    "dataset_name": task.dataset_name,
+                    "text": _doc_text(row),
+                }
+            )
+        for query_id, text in task.queries.items():
+            records.append(
+                {
+                    "text_id": str(query_id),
+                    "kind": "query",
+                    "dataset_name": task.dataset_name,
+                    "text": str(text),
+                }
+            )
+    return records
+
+
+def collect_smoke() -> dict[str, object]:
+    from kv_prepend_experiment.collection import InstrumentedQwen3MoeExperiment
+    from kv_prepend_experiment.config import load_experiment_spec
+    from kv_prepend_experiment.logging_utils import configure_logging
+
+    spec_path = ROOT / "spec_main_hf_teacher_forcing_l40s_3tasks.json"
+    records_path = ROOT / "smoke_records.json"
+    spec = load_experiment_spec(spec_path)
+    spec.model.preflight_max_used_memory_gib = None
+
+    run_root = ROOT / "cerebrium_smoke_output"
+    if run_root.exists():
+        shutil.rmtree(run_root)
+    run_root.mkdir(parents=True, exist_ok=True)
+    configure_logging(log_path=run_root / "artifacts" / "logs" / "collect_smoke.log", level="INFO")
+
+    records = json.loads(records_path.read_text(encoding="utf-8"))
+    start = time.perf_counter()
+    experiment = InstrumentedQwen3MoeExperiment(spec, run_root)
+    experiment.load()
+    spec_snapshot = experiment.save_spec_snapshot()
+    paths, _ = experiment.collect_examples(
+        records,
+        dataset_name="cerebrium_smoke",
+        retain_bundles=False,
+    )
+    experiment.flush_writes()
+    captures = []
+    for path in paths:
+        stat = path.stat()
+        captures.append(
+            {
+                "path": str(path.relative_to(run_root)),
+                "bytes": stat.st_size,
+            }
+        )
+    return {
+        "seconds": round(time.perf_counter() - start, 3),
+        "records": len(records),
+        "capture_count": len(paths),
+        "captures": captures,
+        "spec_snapshot": str(spec_snapshot.relative_to(run_root)),
+        "nvidia_smi_after_collect": _nvidia_smi(),
+    }
+
+
+def calibration_run() -> dict[str, object]:
+    from kv_prepend_experiment.collection import InstrumentedQwen3MoeExperiment
+    from kv_prepend_experiment.config import load_experiment_spec
+    from kv_prepend_experiment.logging_utils import configure_logging
+
+    spec_path = ROOT / "spec_calibration_hf_3tasks.json"
+    spec = load_experiment_spec(spec_path)
+    spec.model.preflight_max_used_memory_gib = None
+    spec.model.torch_dtype = "auto"
+
+    run_root = ROOT / "cerebrium_calibration_output"
+    if run_root.exists():
+        shutil.rmtree(run_root)
+    run_root.mkdir(parents=True, exist_ok=True)
+    configure_logging(log_path=run_root / "artifacts" / "logs" / "calibration_run.log", level="INFO")
+
+    records = _load_nanobeir_records(["scifact", "fiqa2018", "quoraretrieval"])
+    start = time.perf_counter()
+    experiment = InstrumentedQwen3MoeExperiment(spec, run_root)
+    experiment.load()
+    spec_snapshot = experiment.save_spec_snapshot()
+    paths, _ = experiment.collect_examples(
+        records,
+        dataset_name="nanobeir_3tasks",
+        retain_bundles=False,
+    )
+    experiment.flush_writes()
+    captures = []
+    total_bytes = 0
+    for path in paths:
+        stat = path.stat()
+        total_bytes += stat.st_size
+        captures.append(
+            {
+                "path": str(path.relative_to(run_root)),
+                "bytes": stat.st_size,
+            }
+        )
+    return {
+        "seconds": round(time.perf_counter() - start, 3),
+        "records": len(records),
+        "capture_count": len(paths),
+        "capture_bytes": total_bytes,
+        "captures": captures,
+        "spec_snapshot": str(spec_snapshot.relative_to(run_root)),
+        "nvidia_smi_after_collect": _nvidia_smi(),
     }
 
 
