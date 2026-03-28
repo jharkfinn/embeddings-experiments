@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .analysis import summarize_bundles
-from .capture_io import build_batched_capture_payload, split_pass_capture, trim_pass_capture
+from .capture_io import build_batched_capture_payload, slice_batch_value, split_pass_capture, trim_pass_capture
 from .config import ExperimentSpec
 from .prepend import (
     apply_rotary_pos_emb,
@@ -188,10 +188,10 @@ class CollectionWriter:
                 torch.save(payload, path)
                 save_s = time.perf_counter() - save_start
                 logger.info(
-                    "writer_saved batch_id=%s path=%s bundles=%s wait_s=%.3f save_s=%.3f staged_tensors=%s staged_groups=%s staged_bytes=%s",
+                    "writer_saved batch_id=%s path=%s rows=%s wait_s=%.3f save_s=%.3f staged_tensors=%s staged_groups=%s staged_bytes=%s",
                     write_metadata.get("batch_id"),
                     path,
-                    write_metadata.get("bundle_count"),
+                    write_metadata.get("row_count"),
                     wait_s,
                     save_s,
                     write_metadata.get("staged_tensors"),
@@ -228,7 +228,7 @@ class CollectionWriter:
                 transfer_event,
                 {
                     "batch_id": batch_id,
-                    "bundle_count": row_count,
+                    "row_count": row_count,
                     "staged_tensors": staged_tensors,
                     "staged_groups": staged_groups,
                     "staged_bytes": staged_bytes,
@@ -574,18 +574,6 @@ class InstrumentedQwen3MoeExperiment:
         if current:
             yield current
 
-    def _slice_batch_value(self, value, row_idx: int, batch_size: int):
-        if value is None:
-            return None
-        try:
-            import torch
-
-            if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] >= batch_size and row_idx < value.shape[0]:
-                return value[row_idx : row_idx + 1]
-        except ModuleNotFoundError:  # pragma: no cover
-            pass
-        return value
-
     def _split_pass_capture(self, pass_capture: PassCapture, batch_examples: list[PromptExample]) -> list[PassCapture]:
         return split_pass_capture(pass_capture, len(batch_examples))
 
@@ -595,7 +583,7 @@ class InstrumentedQwen3MoeExperiment:
         for layer_idx, layer_summary in summaries.items():
             for row_idx in range(batch_size):
                 outputs[row_idx][layer_idx] = {
-                    key: self._slice_batch_value(value, row_idx, batch_size)
+                    key: slice_batch_value(value, row_idx, batch_size)
                     for key, value in layer_summary.items()
                 }
         return outputs
@@ -711,7 +699,7 @@ class InstrumentedQwen3MoeExperiment:
         k_pre,
         k_rot,
         v_raw,
-        example_index: int,
+        token_counts,
         batch_rng: random.Random,
         external_summary: dict[str, Any] | None = None,
     ):
@@ -727,8 +715,14 @@ class InstrumentedQwen3MoeExperiment:
         if mode == "first_token":
             return k_rot[..., :1, :], v_raw[..., :1, :]
         if mode == "random_token":
-            token_index = batch_rng.randrange(k_rot.shape[2])
-            return k_rot[..., token_index : token_index + 1, :], v_raw[..., token_index : token_index + 1, :]
+            token_indices = [
+                batch_rng.randrange(max(1, min(int(count), k_rot.shape[2])))
+                for count in token_counts.detach().cpu().tolist()
+            ]
+            gather_index = torch.tensor(token_indices, device=k_rot.device, dtype=torch.long)
+            k_index = gather_index.view(-1, 1, 1, 1).expand(-1, k_rot.shape[1], 1, k_rot.shape[3])
+            v_index = gather_index.view(-1, 1, 1, 1).expand(-1, v_raw.shape[1], 1, v_raw.shape[3])
+            return k_rot.gather(2, k_index), v_raw.gather(2, v_index)
         if mode == "k_only":
             summary_k, summary_v = make_prepend_summary_kv(
                 k_pre,
@@ -789,6 +783,7 @@ class InstrumentedQwen3MoeExperiment:
         causal_headwise,
         prepend_result,
         resid_pre_attn,
+        token_counts,
     ) -> dict[str, Any]:
         torch = import_torch()
         import torch.nn.functional as F
@@ -865,14 +860,18 @@ class InstrumentedQwen3MoeExperiment:
             else:
                 beta_margin = margin0
             for row_idx in range(router_curve.shape[0]):
+                valid_tokens = max(0, min(int(token_counts[row_idx].item()), topk_curve.shape[1]))
+                row_beta_margin = beta_margin[row_idx]
+                if getattr(row_beta_margin, "ndim", 0) > 0:
+                    row_beta_margin = row_beta_margin[:valid_tokens]
                 transitions = []
-                first_transition = torch.full((topk_curve.shape[1],), float("nan"), device=topk_curve.device)
-                flip_count = torch.zeros((topk_curve.shape[1],), dtype=torch.int32, device=topk_curve.device)
-                row_baseline_topk = baseline_topk[row_idx]
+                first_transition = torch.full((valid_tokens,), float("nan"), device=topk_curve.device)
+                flip_count = torch.zeros((valid_tokens,), dtype=torch.int32, device=topk_curve.device)
+                row_baseline_topk = baseline_topk[row_idx, :valid_tokens]
                 for bias_index in range(topk_curve.shape[2]):
                     if bias_index == baseline_index:
                         continue
-                    current = topk_curve[row_idx, :, bias_index, :]
+                    current = topk_curve[row_idx, :valid_tokens, bias_index, :]
                     changed = (current != row_baseline_topk).any(dim=-1)
                     newly_changed = changed & torch.isnan(first_transition)
                     first_transition[newly_changed] = bias_values[bias_index]
@@ -897,13 +896,13 @@ class InstrumentedQwen3MoeExperiment:
                     {
                         "bias_spectrum_signature": {
                             "bias_values": [float(v) for v in bias_values.detach().cpu().tolist()],
-                            "sensitivity": grad[row_idx, :, baseline_index].detach().cpu().tolist(),
-                            "curvature": curvature[row_idx, :, baseline_index].detach().cpu().tolist(),
+                            "sensitivity": grad[row_idx, :valid_tokens, baseline_index].detach().cpu().tolist(),
+                            "curvature": curvature[row_idx, :valid_tokens, baseline_index].detach().cpu().tolist(),
                             "first_phase_transition": first_transition.detach().cpu().tolist(),
                             "flip_count": flip_count.detach().cpu().tolist(),
-                            "margin": margin[row_idx].detach().cpu().tolist(),
-                            "kl_terminal": kl[row_idx].detach().cpu().tolist(),
-                            "beta_margin": beta_margin[row_idx].detach().cpu().tolist(),
+                            "margin": margin[row_idx, :valid_tokens].detach().cpu().tolist(),
+                            "kl_terminal": kl[row_idx, :valid_tokens].detach().cpu().tolist(),
+                            "beta_margin": row_beta_margin.detach().cpu().tolist(),
                         },
                         "bias_spectrum_transitions": transitions,
                     }
@@ -983,7 +982,7 @@ class InstrumentedQwen3MoeExperiment:
                 k_pre,
                 k_rot,
                 v_raw,
-                0,
+                token_counts,
                 batch_rng,
                 external_summary=external_summary,
             )
@@ -1019,6 +1018,7 @@ class InstrumentedQwen3MoeExperiment:
                     causal_headwise=causal.attn_output.transpose(1, 2),
                     prepend_result=prepend_result,
                     resid_pre_attn=residual,
+                    token_counts=token_counts,
                 )
 
         captures: dict[str, LayerCapture] = {}

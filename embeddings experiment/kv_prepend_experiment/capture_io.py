@@ -19,6 +19,10 @@ def _slice_batch_value(value, row_idx: int, batch_size: int):
     return value
 
 
+def slice_batch_value(value, row_idx: int, batch_size: int):
+    return _slice_batch_value(value, row_idx, batch_size)
+
+
 def _trim_batch_value(value, batch_size: int):
     if value is None:
         return None
