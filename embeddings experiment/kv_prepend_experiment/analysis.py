@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from .evaluation import _find_layer_capture, _tensor_to_numpy, load_capture_payloads
+from .evaluation import _content_row_mask, _find_layer_capture, _tensor_to_numpy, load_capture_payloads
 from .quantization import cosine_similarity
 from .types import CaptureCondition, ExampleCaptureBundle
 
@@ -187,20 +187,25 @@ def summarize_bundles(bundles):
                 continue
             layer_key = str(layer_idx)
             summary["layers"].setdefault(layer_key, {"delta_norms": [], "router_entropy": [], "m_rank": [], "d_rank": []})
-            mask = np.asarray(bundle.content_token_mask, dtype=bool)
-            delta = _tensor_to_numpy(local.z_attn, dtype=np.float32)[0][mask] - _tensor_to_numpy(causal.z_attn, dtype=np.float32)[0][mask]
+            causal_z = _tensor_to_numpy(causal.z_attn, dtype=np.float32)[0]
+            local_z = _tensor_to_numpy(local.z_attn, dtype=np.float32)[0]
+            expected_len = min(causal_z.shape[0], local_z.shape[0])
+            mask = _content_row_mask(bundle, expected_len)
+            delta = local_z[:expected_len][mask] - causal_z[:expected_len][mask]
             mdu = compute_m_d_u(
-                _tensor_to_numpy(causal.z_attn, dtype=np.float32)[0][mask],
-                _tensor_to_numpy(local.z_attn, dtype=np.float32)[0][mask],
-                _tensor_to_numpy(local.beta, dtype=np.float32).squeeze(-1)[0][:, mask] if local.beta is not None else None,
+                causal_z[:expected_len][mask],
+                local_z[:expected_len][mask],
+                _tensor_to_numpy(local.beta, dtype=np.float32).squeeze(-1)[0][:, :expected_len][:, mask] if local.beta is not None else None,
             )
             summary["layers"][layer_key]["delta_norms"].append(float(np.linalg.norm(delta)))
             summary["layers"][layer_key]["m_rank"].append(token_collapse_panel(mdu["m"])["effective_rank"])
             summary["layers"][layer_key]["d_rank"].append(token_collapse_panel(mdu["d"])["effective_rank"])
             if local.router_logits_pre_softmax is not None and local.top_k_indices is not None:
+                local_router = _tensor_to_numpy(local.router_logits_pre_softmax, dtype=np.float32)[0]
+                local_topk = _tensor_to_numpy(local.top_k_indices, dtype=np.int16)[0]
                 routing = routing_entropy_and_divergence(
-                    _tensor_to_numpy(local.router_logits_pre_softmax, dtype=np.float32)[0][mask],
-                    _tensor_to_numpy(local.top_k_indices, dtype=np.int16)[0][mask],
+                    local_router[:expected_len][mask],
+                    local_topk[:expected_len][mask],
                 )
                 summary["layers"][layer_key]["router_entropy"].append(routing["entropy_mean"])
             if "bias_spectrum_signature" in local.metadata:
