@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import queue
 import random
+import shutil
 import threading
 import time
 import uuid
@@ -27,6 +29,7 @@ from .runtime import import_torch, load_model_and_tokenizer, runtime_stack_snaps
 from .types import CaptureCondition, ExampleCaptureBundle, LayerCapture, PassCapture, RopeMode
 
 logger = logging.getLogger(__name__)
+_PERSISTENT_STORAGE_PREFIX = "/persistent-storage/"
 
 
 @lru_cache(maxsize=64)
@@ -185,7 +188,29 @@ class CollectionWriter:
                 wait_s = time.perf_counter() - wait_start
                 path.parent.mkdir(parents=True, exist_ok=True)
                 save_start = time.perf_counter()
-                torch.save(payload, path)
+                if str(path).startswith(_PERSISTENT_STORAGE_PREFIX):
+                    staging_root = Path("/tmp/kv-prepend-writer")
+                    staging_root.mkdir(parents=True, exist_ok=True)
+                    local_tmp = staging_root / f"{path.stem}.{uuid.uuid4().hex}.pt"
+                    persistent_tmp = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+                    try:
+                        torch.save(payload, local_tmp)
+                        with local_tmp.open("rb") as src, persistent_tmp.open("wb") as dst:
+                            shutil.copyfileobj(src, dst, length=16 * 1024 * 1024)
+                            dst.flush()
+                            os.fsync(dst.fileno())
+                        os.replace(persistent_tmp, path)
+                    finally:
+                        try:
+                            local_tmp.unlink()
+                        except FileNotFoundError:
+                            pass
+                        try:
+                            persistent_tmp.unlink()
+                        except FileNotFoundError:
+                            pass
+                else:
+                    torch.save(payload, path)
                 save_s = time.perf_counter() - save_start
                 logger.info(
                     "writer_saved batch_id=%s path=%s rows=%s wait_s=%.3f save_s=%.3f staged_tensors=%s staged_groups=%s staged_bytes=%s",
