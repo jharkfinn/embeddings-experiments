@@ -18,6 +18,8 @@ CPU_CONFIG = ROOT / "cerebrium_analysis.toml"
 DEFAULT_STORAGE_APP = "kv-prepend-l40s-smoke"
 DEFAULT_GPU_APP = "kv-prepend-l40s-smoke"
 DEFAULT_CPU_APP = "kv-prepend-analysis-cpu"
+REST_BASE = "https://rest.cerebrium.ai/v2"
+FINAL_RUN_STATUSES = {"success", "failure", "cancelled", "timeout"}
 
 
 def _read_cli_config() -> dict[str, str]:
@@ -84,6 +86,113 @@ def _post_async(endpoint: str, token: str | None, payload: dict[str, object]) ->
         return json.loads(response.read().decode("utf-8"))
 
 
+def _api_get_json(url: str, token: str | None) -> object:
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}"} if token else {},
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _app_id(project: str, app_name: str) -> str:
+    return f"{project}-{app_name}"
+
+
+def _list_runs(project: str, app_name: str, token: str | None) -> list[dict[str, object]]:
+    payload = _api_get_json(
+        f"{REST_BASE}/projects/{urllib.parse.quote(project)}/apps/{urllib.parse.quote(_app_id(project, app_name))}/runs",
+        token,
+    )
+    if not isinstance(payload, dict):
+        return []
+    items = payload.get("items", [])
+    return items if isinstance(items, list) else []
+
+
+def _get_run(project: str, app_name: str, run_id: str, token: str | None) -> dict[str, object] | None:
+    for item in _list_runs(project, app_name, token):
+        if str(item.get("id", "")) == run_id:
+            return item
+    return None
+
+
+def _wait_for_run(
+    project: str,
+    app_name: str,
+    run_id: str,
+    token: str | None,
+    *,
+    poll_seconds: float,
+    timeout_seconds: float,
+) -> dict[str, object]:
+    deadline = time.time() + timeout_seconds
+    last_status = None
+    while time.time() < deadline:
+        run = _get_run(project, app_name, run_id, token)
+        if run is not None:
+            status = str(run.get("status", ""))
+            if status != last_status:
+                print(
+                    json.dumps(
+                        {
+                            "run_id": run_id,
+                            "app_name": app_name,
+                            "status": status,
+                            "completed_at": run.get("completedAt"),
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+                last_status = status
+            if run.get("completedAt") or status in FINAL_RUN_STATUSES:
+                return run
+        time.sleep(poll_seconds)
+    raise TimeoutError(f"timed out waiting for run {run_id} on {app_name}")
+
+
+def _delete_app(project: str, app_name: str) -> None:
+    subprocess.run(
+        ["cerebrium", "apps", "delete", _app_id(project, app_name)],
+        cwd=ROOT,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+def _is_run_active(run: dict[str, object]) -> bool:
+    status = str(run.get("status", ""))
+    return not run.get("completedAt") and status not in FINAL_RUN_STATUSES
+
+
+def _cleanup_idle_apps(project: str, token: str | None, app_names: list[str]) -> dict[str, object]:
+    results: list[dict[str, object]] = []
+    for app_name in app_names:
+        runs = _list_runs(project, app_name, token)
+        active = [run for run in runs if _is_run_active(run)]
+        deleted = False
+        error = ""
+        if not active:
+            try:
+                _delete_app(project, app_name)
+                deleted = True
+            except subprocess.CalledProcessError as exc:
+                error = (exc.stdout or str(exc)).strip()
+        results.append(
+            {
+                "app_name": app_name,
+                "active_runs": [str(run.get("id", "")) for run in active],
+                "deleted": deleted,
+                "error": error,
+            }
+        )
+    return {"project": project, "results": results}
+
+
 def _new_run_id() -> str:
     return f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
@@ -92,7 +201,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "function",
-        choices=["collect_smoke", "calibration_run", "analyze_latest_calibration"],
+        choices=["collect_smoke", "calibration_run", "analyze_latest_calibration", "cleanup_idle"],
     )
     parser.add_argument("--region", default=None)
     parser.add_argument("--storage-app", default=DEFAULT_STORAGE_APP)
@@ -103,6 +212,10 @@ def main() -> int:
     parser.add_argument("--analysis-run-id", default=None)
     parser.add_argument("--workers", type=int, default=10)
     parser.add_argument("--skip-deploy", action="store_true")
+    parser.add_argument("--detach", action="store_true")
+    parser.add_argument("--keep-app", action="store_true")
+    parser.add_argument("--poll-seconds", type=float, default=10.0)
+    parser.add_argument("--timeout-seconds", type=float, default=43200.0)
     args = parser.parse_args()
 
     cli_config = _read_cli_config()
@@ -111,6 +224,11 @@ def main() -> int:
     token = cli_config.get("accesstoken")
     if not project:
         raise RuntimeError("missing project in ~/.cerebrium/config.yaml")
+
+    if args.function == "cleanup_idle":
+        result = _cleanup_idle_apps(project, token, [args.gpu_app, args.cpu_app])
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
 
     if args.function == "collect_smoke":
         app_name = args.gpu_app
@@ -161,6 +279,7 @@ def main() -> int:
         f"{args.function}?async=true"
     )
     response = _post_async(endpoint, token, function_payload)
+    run_id = str(response.get("run_id", ""))
     result = {
         "function": args.function,
         "endpoint": endpoint,
@@ -169,6 +288,21 @@ def main() -> int:
         **function_payload,
         **remote_paths,
     }
+    if not args.detach and run_id:
+        final_run = _wait_for_run(
+            project,
+            app_name,
+            run_id,
+            token,
+            poll_seconds=args.poll_seconds,
+            timeout_seconds=args.timeout_seconds,
+        )
+        result["final_run"] = final_run
+        if not args.keep_app:
+            _delete_app(project, app_name)
+            result["app_deleted_after_run"] = True
+        else:
+            result["app_deleted_after_run"] = False
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 

@@ -135,6 +135,25 @@ Each async launch returns a Cerebrium `run_id` plus deterministic persisted
 remote paths. The GPU collect endpoints now also write a top-level `status.json`
 for the run, so all long jobs have a single status artifact to poll.
 
+By default, `launch_cerebrium_async.py`:
+
+- deploys the required app
+- submits the run asynchronously
+- waits for the run to reach a final status
+- deletes the app afterward
+
+That makes the app lifecycle explicitly ephemeral instead of relying on
+Cerebrium scale-to-zero behavior alone.
+
+Use `--detach` if you want fire-and-forget behavior, or `--keep-app` if you want
+the deployed app left in place after the run finishes.
+
+To explicitly delete the project apps when nothing is running:
+
+```bash
+python launch_cerebrium_async.py cleanup_idle
+```
+
 The older analysis-only wrapper remains available:
 
 ```bash

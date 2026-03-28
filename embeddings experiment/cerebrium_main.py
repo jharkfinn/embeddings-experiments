@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import gc
 import json
 import logging
@@ -388,7 +386,7 @@ def _load_nanobeir_records(dataset_names: list[str]) -> list[dict[str, str]]:
     return records
 
 
-def collect_smoke(smoke_run_id: str = "") -> dict[str, object]:
+def collect_smoke(smoke_run_id=""):
     from kv_prepend_experiment.collection import InstrumentedQwen3MoeExperiment
     from kv_prepend_experiment.config import load_experiment_spec
     from kv_prepend_experiment.logging_utils import configure_logging
@@ -472,7 +470,7 @@ def collect_smoke(smoke_run_id: str = "") -> dict[str, object]:
         _best_effort_runtime_cleanup("collect_smoke")
 
 
-def calibration_run(calibration_run_id: str = "") -> dict[str, object]:
+def calibration_run(calibration_run_id=""):
     from kv_prepend_experiment.collection import InstrumentedQwen3MoeExperiment
     from kv_prepend_experiment.config import load_experiment_spec
     from kv_prepend_experiment.logging_utils import configure_logging
@@ -561,10 +559,10 @@ def calibration_run(calibration_run_id: str = "") -> dict[str, object]:
 
 
 def analyze_latest_calibration(
-    calibration_run_id: str = "",
-    analysis_run_id: str = "",
-    workers: int = 0,
-) -> dict[str, object]:
+    calibration_run_id="",
+    analysis_run_id="",
+    workers=0,
+):
     from kv_prepend_experiment.analysis import analyze_capture_directory
     from kv_prepend_experiment.config import load_experiment_spec
     from kv_prepend_experiment.logging_utils import configure_logging
