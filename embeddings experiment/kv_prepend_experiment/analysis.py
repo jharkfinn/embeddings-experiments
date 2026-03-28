@@ -19,6 +19,60 @@ from .types import CaptureCondition, ExampleCaptureBundle
 logger = logging.getLogger(__name__)
 
 
+def _memory_limit_bytes() -> int:
+    candidates = [
+        Path("/sys/fs/cgroup/memory.max"),
+        Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    ]
+    for path in candidates:
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not raw or raw == "max":
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        if value > 0:
+            return value
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        page_count = os.sysconf("SC_PHYS_PAGES")
+        return int(page_size * page_count)
+    except (OSError, ValueError, AttributeError):
+        return 0
+
+
+def _recommended_worker_cap(capture_paths: list[Path]) -> tuple[int, dict[str, float]]:
+    memory_limit = _memory_limit_bytes()
+    if memory_limit <= 0:
+        return max(1, min(4, len(capture_paths))), {
+            "memory_limit_gib": 0.0,
+            "largest_shard_gib": 0.0,
+            "estimated_worker_gib": 0.0,
+        }
+    largest_shard = max(path.stat().st_size for path in capture_paths)
+    estimated_worker_bytes = max(int(largest_shard * 1.35), 2 * 1024**3)
+    usable_bytes = int(memory_limit * 0.75)
+    worker_cap = max(1, usable_bytes // estimated_worker_bytes)
+    return int(max(1, min(len(capture_paths), worker_cap))), {
+        "memory_limit_gib": round(memory_limit / (1024**3), 2),
+        "largest_shard_gib": round(largest_shard / (1024**3), 2),
+        "estimated_worker_gib": round(estimated_worker_bytes / (1024**3), 2),
+    }
+
+
+def _analysis_start_method() -> str:
+    configured = os.environ.get("KV_PREPEND_ANALYSIS_START_METHOD", "").strip().lower()
+    if configured in {"fork", "spawn", "forkserver"}:
+        return configured
+    if os.name == "posix":
+        return "fork"
+    return "spawn"
+
+
 def _empty_layer_stats() -> dict[str, list[float]]:
     return {
         "delta_norms": [],
@@ -304,18 +358,27 @@ def analyze_capture_directory(
         worker_count = min(max(1, os.cpu_count() or 1), len(capture_paths))
         if configured_workers > 0:
             worker_count = min(len(capture_paths), configured_workers)
-        ctx = mp.get_context("spawn")
+        memory_cap, memory_meta = _recommended_worker_cap(capture_paths)
+        worker_count = max(1, min(worker_count, memory_cap))
+        start_method = _analysis_start_method()
+        ctx = mp.get_context(start_method)
         logger.info(
-            "analysis_parallel workers=%s shards=%s start_method=%s blas_threads=1",
+            "analysis_parallel workers=%s shards=%s start_method=%s blas_threads=1 memory_limit_gib=%s largest_shard_gib=%s estimated_worker_gib=%s",
             worker_count,
             len(capture_paths),
             ctx.get_start_method(),
+            memory_meta["memory_limit_gib"],
+            memory_meta["largest_shard_gib"],
+            memory_meta["estimated_worker_gib"],
         )
         if progress_callback is not None:
             progress_callback(
                 {
                     "stage": "analysis_parallel",
                     "worker_count": worker_count,
+                    "worker_count_memory_cap": memory_cap,
+                    "worker_start_method": ctx.get_start_method(),
+                    **memory_meta,
                     "total_shards": len(capture_paths),
                     "completed_shards": 0,
                 }
