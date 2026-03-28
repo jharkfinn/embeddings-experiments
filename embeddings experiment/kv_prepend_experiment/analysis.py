@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from .evaluation import _find_layer_capture, _tensor_to_numpy, iter_bundles
+from .evaluation import _find_layer_capture, _tensor_to_numpy, load_capture_payloads
 from .quantization import cosine_similarity
 from .types import CaptureCondition, ExampleCaptureBundle
+
+logger = logging.getLogger(__name__)
 
 
 def compute_m_d_u(base_tokens: np.ndarray, treated_tokens: np.ndarray, uptake: np.ndarray | None = None):
@@ -169,9 +172,13 @@ def sparse_transport_summary(local_delta: np.ndarray, final_delta: np.ndarray):
     }
 
 
-def summarize_bundles(bundles: list[ExampleCaptureBundle]):
-    summary: dict[str, Any] = {"num_bundles": len(bundles), "layers": {}}
+def summarize_bundles(bundles):
+    summary: dict[str, Any] = {"num_bundles": 0, "layers": {}}
+    bundle_count = 0
     for bundle in bundles:
+        bundle_count += 1
+        if bundle_count % 10 == 0:
+            logger.info("analysis_progress bundles=%s", bundle_count)
         for layer_idx in range(48):
             try:
                 causal = _find_layer_capture(bundle, "pass1", CaptureCondition.CAUSAL.value, layer_idx)
@@ -200,6 +207,7 @@ def summarize_bundles(bundles: list[ExampleCaptureBundle]):
                 bias_meta = local.metadata["bias_spectrum_signature"]
                 summary["layers"][layer_key].setdefault("bias_sensitivity", []).extend(bias_meta.get("sensitivity", []))
                 summary["layers"][layer_key].setdefault("bias_flip_count", []).extend(bias_meta.get("flip_count", []))
+    summary["num_bundles"] = bundle_count
     for layer_stats in summary["layers"].values():
         layer_stats["delta_norm_mean"] = float(np.mean(layer_stats["delta_norms"])) if layer_stats["delta_norms"] else 0.0
         layer_stats["router_entropy_mean"] = float(np.mean(layer_stats["router_entropy"])) if layer_stats["router_entropy"] else 0.0
@@ -211,9 +219,31 @@ def summarize_bundles(bundles: list[ExampleCaptureBundle]):
 
 
 def analyze_capture_directory(capture_dir: str | Path, output_path: str | Path):
-    bundles = list(iter_bundles(capture_dir))
-    summary = summarize_bundles(bundles)
+    capture_dir = Path(capture_dir)
+    logger.info("analysis_start capture_dir=%s", capture_dir)
+
+    def _bundle_stream():
+        shard_count = 0
+        for path, payload in load_capture_payloads(capture_dir):
+            shard_count += 1
+            bundles = payload.get("bundles", [])
+            logger.info(
+                "analysis_shard_loaded shard_index=%s path=%s bundles=%s",
+                shard_count,
+                path,
+                len(bundles),
+            )
+            for bundle in bundles:
+                yield bundle
+
+    summary = summarize_bundles(_bundle_stream())
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    logger.info(
+        "analysis_done output=%s bundles=%s layers=%s",
+        output_path,
+        summary["num_bundles"],
+        len(summary["layers"]),
+    )
     return summary
