@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -127,6 +128,58 @@ def model_load_smoke() -> dict[str, object]:
             "num_experts_per_tok": contract.num_experts_per_tok,
             "module_name": contract.module_name,
         },
+        "nvidia_smi_after_load": _nvidia_smi(),
+    }
+
+
+@contextmanager
+def _spoof_hopper_cc_for_fp8() -> object:
+    import torch
+
+    original = torch.cuda.get_device_capability
+
+    def patched(device: int | None = None) -> tuple[int, int]:
+        capability = original(device) if device is not None else original()
+        if capability == (8, 9):
+            return (9, 0)
+        return capability
+
+    torch.cuda.get_device_capability = patched
+    try:
+        yield
+    finally:
+        torch.cuda.get_device_capability = original
+
+
+def model_load_smoke_force_fp8() -> dict[str, object]:
+    import torch
+
+    from kv_prepend_experiment.config import load_experiment_spec
+    from kv_prepend_experiment.runtime import load_model_and_tokenizer, verify_model_contract
+
+    spec_path = ROOT / "spec_main_hf_teacher_forcing_l40s_3tasks.json"
+    spec = load_experiment_spec(spec_path)
+    spec.model.preflight_max_used_memory_gib = None
+    start = time.perf_counter()
+    with _spoof_hopper_cc_for_fp8():
+        config, model, tokenizer = load_model_and_tokenizer(spec.model)
+        contract = verify_model_contract(config, model)
+        inputs = tokenizer(["hello world"], return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            outputs = model(**inputs)
+    return {
+        "seconds": round(time.perf_counter() - start, 3),
+        "tokenizer_vocab_size": int(tokenizer.vocab_size),
+        "verified_contract": {
+            "num_hidden_layers": contract.num_hidden_layers,
+            "hidden_size": contract.hidden_size,
+            "num_attention_heads": contract.num_attention_heads,
+            "num_key_value_heads": contract.num_key_value_heads,
+            "num_experts": contract.num_experts,
+            "num_experts_per_tok": contract.num_experts_per_tok,
+            "module_name": contract.module_name,
+        },
+        "logits_shape": list(outputs.logits.shape),
         "nvidia_smi_after_load": _nvidia_smi(),
     }
 
