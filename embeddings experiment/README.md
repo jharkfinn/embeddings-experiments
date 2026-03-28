@@ -45,6 +45,9 @@ revalidate the runtime contract.
 `default_experiment.json` is now aligned with the active teacher-forcing main path.
 Use the explicit split specs when you want calibration, controls, or bridge runs.
 
+Every CLI run now writes a timestamped log under `artifacts/logs/` by default.
+Use `--log-path` or `--log-level` to override that behavior.
+
 ## CLI
 
 ### Verify model contract

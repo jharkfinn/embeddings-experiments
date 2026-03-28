@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class MissingDependencyError(RuntimeError):
@@ -100,6 +104,7 @@ def build_fp8_quantization_config(transformers: Any):
 def load_model_and_tokenizer(model_spec):
     torch = import_torch()
     transformers, module = resolve_qwen3_moe_module()
+    start = time.perf_counter()
 
     AutoConfig = transformers.AutoConfig
     AutoTokenizer = transformers.AutoTokenizer
@@ -115,6 +120,14 @@ def load_model_and_tokenizer(model_spec):
             )
         if device_map in {"cuda", "cuda:0"}:
             device_map = {"": 0}
+    logger.info(
+        "load_model_and_tokenizer_start model=%s dtype=%s quantization=%s device_map=%s attn_impl=%s",
+        model_spec.model_name,
+        model_spec.torch_dtype,
+        model_spec.quantization,
+        device_map,
+        model_spec.attn_implementation,
+    )
     model_kwargs: dict[str, Any] = {
         "trust_remote_code": model_spec.trust_remote_code,
         "attn_implementation": model_spec.attn_implementation,
@@ -132,12 +145,21 @@ def load_model_and_tokenizer(model_spec):
         model_kwargs["quantization_config"] = quantization_config
 
     tokenizer_name = model_spec.tokenizer_name or model_spec.model_name
+    tokenizer_start = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=model_spec.trust_remote_code)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    logger.info("tokenizer_loaded name=%s seconds=%.3f", tokenizer_name, time.perf_counter() - tokenizer_start)
 
+    model_start = time.perf_counter()
     model = model_cls.from_pretrained(model_spec.model_name, **model_kwargs)
     model.eval()
+    logger.info(
+        "model_loaded model=%s seconds=%.3f total_seconds=%.3f",
+        model_spec.model_name,
+        time.perf_counter() - model_start,
+        time.perf_counter() - start,
+    )
     return config, model, tokenizer
 
 

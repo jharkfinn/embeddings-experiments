@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import queue
 import random
 import threading
+import time
 import uuid
 from dataclasses import asdict
 from functools import lru_cache
@@ -23,6 +25,8 @@ from .prepend import (
 from .prompts import PromptExample, build_prompt_examples, calibration_manifest, prompt_affixes, sample_calibration_ids
 from .runtime import import_torch, load_model_and_tokenizer, runtime_stack_snapshot, verify_model_contract
 from .types import CaptureCondition, ExampleCaptureBundle, LayerCapture, PassCapture, RopeMode
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=64)
@@ -102,10 +106,60 @@ def _gather_last_kv(seq_tensor, last_positions):
     return seq_tensor.gather(2, index).squeeze(2)
 
 
+class AsyncTransferSession:
+    def __init__(self):
+        self._copy_stream = None
+        self._device = None
+        self.staged_bytes = 0
+        self.staged_tensors = 0
+
+    def stage_tensor(self, tensor, dtype=None):
+        if tensor is None:
+            return None
+        torch = import_torch()
+        if not isinstance(tensor, torch.Tensor):
+            return tensor
+        src = tensor.detach()
+        if dtype is not None and src.dtype != dtype:
+            src = src.to(dtype=dtype)
+        if src.device.type != "cuda":
+            out = src.cpu()
+            if dtype is not None and out.dtype != dtype:
+                out = out.to(dtype=dtype)
+            return out
+        if self._copy_stream is None:
+            self._device = src.device
+            self._copy_stream = torch.cuda.Stream(device=src.device)
+        current_stream = torch.cuda.current_stream(device=src.device)
+        self._copy_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self._copy_stream):
+            dst = torch.empty(src.shape, dtype=src.dtype, device="cpu", pin_memory=True)
+            dst.copy_(src, non_blocking=True)
+        self.staged_tensors += 1
+        self.staged_bytes += int(src.numel() * src.element_size())
+        return dst
+
+    def finalize_event(self):
+        torch = import_torch()
+        if self._copy_stream is None:
+            return None
+        event = torch.cuda.Event()
+        event.record(self._copy_stream)
+        return event
+
+    def synchronize(self):
+        event = self.finalize_event()
+        if event is not None:
+            event.synchronize()
+        return event
+
+
 class CollectionWriter:
     def __init__(self, root: str | Path, queue_size: int = 4):
         self.root = Path(root)
-        self._queue: queue.Queue[tuple[Path, dict[str, Any]] | None] = queue.Queue(maxsize=max(1, queue_size))
+        self._queue: queue.Queue[tuple[Path, dict[str, Any], Any | None, dict[str, Any]] | None] = queue.Queue(
+            maxsize=max(1, queue_size)
+        )
         self._error: BaseException | None = None
         self._thread = threading.Thread(target=self._writer_loop, name="kv-prepend-writer", daemon=True)
         self._thread.start()
@@ -117,10 +171,26 @@ class CollectionWriter:
             if item is None:
                 self._queue.task_done()
                 return
-            path, payload = item
+            path, payload, transfer_event, write_metadata = item
             try:
+                wait_start = time.perf_counter()
+                if transfer_event is not None:
+                    transfer_event.synchronize()
+                wait_s = time.perf_counter() - wait_start
                 path.parent.mkdir(parents=True, exist_ok=True)
+                save_start = time.perf_counter()
                 torch.save(payload, path)
+                save_s = time.perf_counter() - save_start
+                logger.info(
+                    "writer_saved batch_id=%s path=%s bundles=%s wait_s=%.3f save_s=%.3f staged_tensors=%s staged_bytes=%s",
+                    write_metadata.get("batch_id"),
+                    path,
+                    write_metadata.get("bundle_count"),
+                    wait_s,
+                    save_s,
+                    write_metadata.get("staged_tensors"),
+                    write_metadata.get("staged_bytes"),
+                )
             except BaseException as exc:  # pragma: no cover - async path
                 self._error = exc
             finally:
@@ -136,6 +206,9 @@ class CollectionWriter:
         bundles: list[ExampleCaptureBundle],
         extra_metadata: dict[str, Any] | None = None,
         target_subdir: str = "captures",
+        transfer_event=None,
+        staged_tensors: int = 0,
+        staged_bytes: int = 0,
     ):
         self._raise_if_error()
         payload = {
@@ -145,12 +218,26 @@ class CollectionWriter:
             "bundles": bundles,
         }
         path = self.root / target_subdir / f"{batch_id}.pt"
-        self._queue.put((path, payload))
+        self._queue.put(
+            (
+                path,
+                payload,
+                transfer_event,
+                {
+                    "batch_id": batch_id,
+                    "bundle_count": len(bundles),
+                    "staged_tensors": staged_tensors,
+                    "staged_bytes": staged_bytes,
+                },
+            )
+        )
         return path
 
     def flush(self):
+        start = time.perf_counter()
         self._queue.join()
         self._raise_if_error()
+        logger.info("writer_flushed wait_s=%.3f", time.perf_counter() - start)
 
     def close(self):
         self.flush()
@@ -173,8 +260,18 @@ class InstrumentedQwen3MoeExperiment:
         self._attention_weight_layers = set(int(layer) for layer in self.spec.collection.attention_weight_layers)
         self._prompt_affix_cache: dict[str, tuple[list[int], list[int]]] = {}
         self._sequence_length_buckets = sorted(int(bucket) for bucket in self.spec.collection.sequence_length_buckets)
+        self._transfer_session: AsyncTransferSession | None = None
 
     def load(self):
+        start = time.perf_counter()
+        logger.info(
+            "model_load_start model=%s dtype=%s quantization=%s device_map=%s attn_impl=%s",
+            self.spec.model.model_name,
+            self.spec.model.torch_dtype,
+            self.spec.model.quantization,
+            self.spec.model.device_map,
+            self.spec.model.attn_implementation,
+        )
         self.config, self.model, self.tokenizer = load_model_and_tokenizer(self.spec.model)
         self.contract = verify_model_contract(self.config, self.model)
         self.runtime_stack = runtime_stack_snapshot()
@@ -183,6 +280,12 @@ class InstrumentedQwen3MoeExperiment:
             mode=self.spec.collection.attention_compile_mode,
             fullgraph=self.spec.collection.attention_compile_fullgraph,
             backend=self.spec.collection.attention_backend,
+        )
+        logger.info(
+            "model_load_done seconds=%.3f runtime_backend=%s attention_backend=%s",
+            time.perf_counter() - start,
+            self.spec.collection.runtime_backend,
+            self.spec.collection.attention_backend,
         )
         return self
 
@@ -195,7 +298,32 @@ class InstrumentedQwen3MoeExperiment:
         return self.model.model.embed_tokens.weight.device
 
     def flush_writes(self):
+        logger.info("flush_writes_start")
         self.writer.flush()
+        logger.info("flush_writes_done")
+
+    def _begin_transfer_session(self):
+        self._transfer_session = AsyncTransferSession()
+
+    def _finalize_transfer_session(self):
+        session = self._transfer_session
+        self._transfer_session = None
+        if session is None:
+            return None, 0, 0
+        return session.finalize_event(), session.staged_tensors, session.staged_bytes
+
+    def _synchronize_transfer_session(self):
+        session = self._transfer_session
+        self._transfer_session = None
+        if session is None:
+            return 0, 0
+        session.synchronize()
+        return session.staged_tensors, session.staged_bytes
+
+    def _stage_tensor(self, tensor, dtype=None):
+        if self._transfer_session is None:
+            return _to_cpu(tensor, dtype=dtype)
+        return self._transfer_session.stage_tensor(tensor, dtype=dtype)
 
     def annotate_examples(self, examples: list[PromptExample]):
         self._ensure_loaded()
@@ -294,6 +422,7 @@ class InstrumentedQwen3MoeExperiment:
         return {"input_ids": input_ids, "attention_mask": attention_mask, "real_batch_size": real_batch_size}
 
     def prepare_examples(self, records: list[dict[str, Any]]):
+        start = time.perf_counter()
         provisional = build_prompt_examples(records, self.spec.prompts)
         calibration_ids = sample_calibration_ids(
             provisional,
@@ -305,7 +434,15 @@ class InstrumentedQwen3MoeExperiment:
             calibration_ids=calibration_ids,
             seed=self.spec.collection.random_seed,
         )
-        return build_prompt_examples(records, self.spec.prompts, calibration_ids=calibration_ids)
+        examples = build_prompt_examples(records, self.spec.prompts, calibration_ids=calibration_ids)
+        logger.info(
+            "prepare_examples_done records=%s examples=%s calibration_selected=%s seconds=%.3f",
+            len(records),
+            len(examples),
+            len(calibration_ids),
+            time.perf_counter() - start,
+        )
+        return examples
 
     def _restrict_to_calibration_subset(self) -> bool:
         return self.spec.collection.runtime_backend == "hf" and int(self.spec.collection.calibration_subset_size) > 0
@@ -479,11 +616,11 @@ class InstrumentedQwen3MoeExperiment:
         return LayerCapture(
             layer_idx=layer_idx,
             condition=condition.value,
-            resid_pre_attn=_to_cpu(
+            resid_pre_attn=self._stage_tensor(
                 resid_pre_attn if self._signal_enabled_for_layer("resid_pre_attn", layer_idx, calibration) else None,
                 dtype=_storage_dtype("resid_pre_attn", calibration),
             ),
-            q_pre_rope=_to_cpu(
+            q_pre_rope=self._stage_tensor(
                 (
                     q_pre
                     if calibration and self.spec.collection.capture_q_vectors and self._signal_enabled_for_layer("q_pre_rope", layer_idx, calibration)
@@ -491,47 +628,49 @@ class InstrumentedQwen3MoeExperiment:
                 ),
                 dtype=_storage_dtype("q_pre_rope", calibration),
             ),
-            v_raw=_to_cpu(
+            v_raw=self._stage_tensor(
                 v_raw if self._signal_enabled_for_layer("v_raw", layer_idx, calibration) else None,
                 dtype=_storage_dtype("v_raw", calibration),
             ),
-            attention_weights=_to_cpu(
+            attention_weights=self._stage_tensor(
                 attn_weights if self._signal_enabled_for_layer("attention_weights", layer_idx, calibration) else None,
                 dtype=_storage_dtype("attention_weights", calibration),
             ),
-            beta=_to_cpu(
+            beta=self._stage_tensor(
                 beta if self._signal_enabled_for_layer("beta", layer_idx, calibration) else None,
                 dtype=_storage_dtype("beta", calibration),
             ),
-            z_attn=_to_cpu(
+            z_attn=self._stage_tensor(
                 z_attn if self._signal_enabled_for_layer("attention_output", layer_idx, calibration) else None,
                 dtype=_storage_dtype("z_attn", calibration),
             ),
-            h_pre_moe=_to_cpu(
+            h_pre_moe=self._stage_tensor(
                 h_pre_moe if self._signal_enabled_for_layer("pre_moe", layer_idx, calibration) else None,
                 dtype=_storage_dtype("h_pre_moe", calibration),
             ),
-            router_logits_pre_softmax=_to_cpu(
+            router_logits_pre_softmax=self._stage_tensor(
                 router_logits if self._signal_enabled_for_layer("router_logits", layer_idx, calibration) else None,
                 dtype=_storage_dtype("router_logits_pre_softmax", calibration),
             ),
-            top_k_indices=_to_cpu(
+            top_k_indices=self._stage_tensor(
                 top_k_indices if self._signal_enabled_for_layer("top_k_binary", layer_idx, calibration) else None,
                 dtype=_storage_dtype("top_k_indices", calibration),
             ),
-            final_token_k_rot=_to_cpu(
+            final_token_k_rot=self._stage_tensor(
                 final_token_k_rot if self._signal_enabled_for_layer("final_token_k_rot", layer_idx, calibration) else None,
                 dtype=_storage_dtype("final_token_k_rot", calibration),
             ),
-            final_token_v=_to_cpu(
+            final_token_v=self._stage_tensor(
                 final_token_v if self._signal_enabled_for_layer("final_token_v", layer_idx, calibration) else None,
                 dtype=_storage_dtype("final_token_v", calibration),
             ),
-            final_token_k_raw=_to_cpu(
+            final_token_k_raw=self._stage_tensor(
                 final_token_k_raw if self._signal_enabled_for_layer("final_token_k_raw", layer_idx, calibration) else None,
                 dtype=_storage_dtype("final_token_k_raw", calibration),
             ),
-            position_ids=_to_cpu(position_ids if self._signal_enabled_for_layer("position_ids", layer_idx, calibration) else None),
+            position_ids=self._stage_tensor(
+                position_ids if self._signal_enabled_for_layer("position_ids", layer_idx, calibration) else None
+            ),
             metadata=metadata,
         )
 
@@ -991,6 +1130,7 @@ class InstrumentedQwen3MoeExperiment:
 
     def _forward_summary_only(self, input_ids, attention_mask):
         torch = import_torch()
+        start = time.perf_counter()
         with torch.inference_mode():
             if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
                 torch.compiler.cudagraph_mark_step_begin()
@@ -1008,15 +1148,15 @@ class InstrumentedQwen3MoeExperiment:
                 normed_hidden = layer.input_layernorm(hidden_states)
                 q_pre, k_pre, q_rot, k_rot, v_raw, _, _ = self._project_qkv(layer.self_attn, normed_hidden, position_embeddings)
                 summaries[layer_idx] = {
-                    "final_token_k_rot": _to_cpu(
+                    "final_token_k_rot": self._stage_tensor(
                         _gather_last_kv(k_rot, last_positions),
                         dtype=_storage_dtype("final_token_k_rot", calibration=False),
                     ),
-                    "final_token_k_raw": _to_cpu(
+                    "final_token_k_raw": self._stage_tensor(
                         _gather_last_kv(k_pre, last_positions),
                         dtype=_storage_dtype("final_token_k_raw", calibration=False),
                     ),
-                    "final_token_v": _to_cpu(
+                    "final_token_v": self._stage_tensor(
                         _gather_last_kv(v_raw, last_positions),
                         dtype=_storage_dtype("final_token_v", calibration=False),
                     ),
@@ -1036,6 +1176,12 @@ class InstrumentedQwen3MoeExperiment:
                 mlp_out, _, _ = self._run_moe(layer.mlp, layer.post_attention_layernorm(post))
                 hidden_states = post + mlp_out
             hidden_states = model_core.norm(hidden_states)
+            logger.info(
+                "summary_only_done batch_size=%s seq_len=%s seconds=%.3f",
+                batch_size,
+                seq_len,
+                time.perf_counter() - start,
+            )
             return summaries, _gather_last_hidden(hidden_states, last_positions)
 
     def collect_multi_slot_summaries_batch(self, batch_examples: list[PromptExample]):
@@ -1043,6 +1189,7 @@ class InstrumentedQwen3MoeExperiment:
         torch = import_torch()
         if not batch_examples:
             return []
+        start = time.perf_counter()
         for example in batch_examples:
             if example.prompt_token_ids is None:
                 self.annotate_examples([example])
@@ -1070,6 +1217,12 @@ class InstrumentedQwen3MoeExperiment:
             next_tokens = next_logits.argmax(dim=-1).tolist()
             for token_ids, next_token in zip(sequences, next_tokens):
                 token_ids.append(int(next_token))
+        logger.info(
+            "multi_slot_batch_done examples=%s decode_steps=%s seconds=%.3f",
+            len(batch_examples),
+            1 + self.spec.collection.multi_slot_decode_steps,
+            time.perf_counter() - start,
+        )
         return all_slots
 
     def collect_multi_slot_summaries(self, example: PromptExample):
@@ -1128,10 +1281,12 @@ class InstrumentedQwen3MoeExperiment:
         retain_bundles: bool = True,
     ):
         self._ensure_loaded()
+        collect_start = time.perf_counter()
         examples = self.prepare_examples(records)
         self._write_calibration_manifest(dataset_name)
         if self._restrict_to_calibration_subset():
             examples = [example for example in examples if example.calibration]
+            logger.info("collect_examples_restricted_to_calibration_subset dataset=%s examples=%s", dataset_name, len(examples))
         self.annotate_examples(examples)
         path_list: list[Path] = []
         all_bundles: list[ExampleCaptureBundle] = []
@@ -1144,22 +1299,55 @@ class InstrumentedQwen3MoeExperiment:
             if external_lookup is not None
             else list(self._iter_example_batches(examples))
         )
+        logger.info(
+            "collect_examples_start dataset=%s records=%s examples=%s batches=%s target_subdir=%s write_batches=%s retain_bundles=%s external=%s control=%s",
+            dataset_name,
+            len(records),
+            len(examples),
+            len(batched_examples),
+            target,
+            write_batches,
+            retain_bundles,
+            external_lookup is not None,
+            control_summary_mode,
+        )
 
         for batch_index, batch_examples in enumerate(batched_examples):
+            batch_start = time.perf_counter()
+            self._begin_transfer_session()
             is_lean_main_batch = (
                 external_lookup is None
                 and control_summary_mode is None
                 and not any(example.calibration for example in batch_examples)
                 and self.spec.collection.runtime_backend == "hf_teacher_forcing"
             )
+            logger.info(
+                "batch_start dataset=%s batch_index=%s batch_size=%s max_tokens=%s lean_main=%s calibration_batch=%s",
+                dataset_name,
+                batch_index,
+                len(batch_examples),
+                max(int(example.token_count or 0) for example in batch_examples),
+                is_lean_main_batch,
+                all(example.calibration for example in batch_examples),
+            )
+            encode_start = time.perf_counter()
             encoded = self.tokenize_examples(
                 batch_examples,
                 bucket_for_main=is_lean_main_batch,
                 pad_batch_for_main=is_lean_main_batch and self.spec.collection.pad_main_batches_to_streaming_size,
             )
+            logger.info(
+                "batch_tokenized dataset=%s batch_index=%s seconds=%.3f padded_shape=%s real_batch=%s",
+                dataset_name,
+                batch_index,
+                time.perf_counter() - encode_start,
+                tuple(encoded["input_ids"].shape),
+                encoded["real_batch_size"],
+            )
             input_ids = encoded["input_ids"].to(self._model_input_device())
             attention_mask = encoded["attention_mask"].to(self._model_input_device())
             example_external = None if external_lookup is None else external_lookup[batch_examples[0].text_id]
+            pass1_start = time.perf_counter()
             pass1_batched, propagate_hidden_states = self._run_pass(
                 input_ids,
                 attention_mask,
@@ -1167,6 +1355,12 @@ class InstrumentedQwen3MoeExperiment:
                 pass_name="pass1",
                 control_summary_mode=control_summary_mode,
                 external_summary_by_layer=example_external,
+            )
+            logger.info(
+                "batch_pass_done dataset=%s batch_index=%s pass=pass1 seconds=%.3f",
+                dataset_name,
+                batch_index,
+                time.perf_counter() - pass1_start,
             )
             propagate_from_layer = int(self.spec.collection.propagate_from_layer)
             pass2_prefix_captures: dict[str, list[LayerCapture]] = {}
@@ -1178,6 +1372,7 @@ class InstrumentedQwen3MoeExperiment:
                 ]
                 if prefix_captures:
                     pass2_prefix_captures[condition] = prefix_captures
+            pass2_start = time.perf_counter()
             pass2_batched, _ = self._run_pass(
                 input_ids,
                 attention_mask,
@@ -1189,6 +1384,13 @@ class InstrumentedQwen3MoeExperiment:
                 initial_hidden_states=propagate_hidden_states,
                 initial_captures_by_condition=pass2_prefix_captures,
             )
+            logger.info(
+                "batch_pass_done dataset=%s batch_index=%s pass=pass2 seconds=%.3f",
+                dataset_name,
+                batch_index,
+                time.perf_counter() - pass2_start,
+            )
+            split_start = time.perf_counter()
             pass1_split = self._split_pass_capture(pass1_batched, batch_examples)
             pass2_split = self._split_pass_capture(pass2_batched, batch_examples)
             batch_multi_slot = {}
@@ -1196,6 +1398,13 @@ class InstrumentedQwen3MoeExperiment:
             if calibration_examples:
                 for example, multi_slot in zip(calibration_examples, self.collect_multi_slot_summaries_batch(calibration_examples)):
                     batch_multi_slot[example.text_id] = multi_slot
+            logger.info(
+                "batch_postprocess_done dataset=%s batch_index=%s seconds=%.3f calibration_examples=%s",
+                dataset_name,
+                batch_index,
+                time.perf_counter() - split_start,
+                len(calibration_examples),
+            )
             batch_bundles: list[ExampleCaptureBundle] = []
             for row_idx, example in enumerate(batch_examples):
                 bundle = ExampleCaptureBundle(
@@ -1212,6 +1421,7 @@ class InstrumentedQwen3MoeExperiment:
                     bundle.metadata["multi_slot_summaries"] = batch_multi_slot[example.text_id]
                 batch_bundles.append(bundle)
             batch_id = f"{dataset_name}_{control_summary_mode or 'main'}_{batch_index}_{len(batch_bundles)}_{uuid.uuid4().hex[:8]}"
+            transfer_event, staged_tensors, staged_bytes = self._finalize_transfer_session()
             if write_batches:
                 path = self.writer.write_batch(
                     batch_id,
@@ -1225,10 +1435,41 @@ class InstrumentedQwen3MoeExperiment:
                         "batch_size": len(batch_examples),
                     },
                     target_subdir=target,
+                    transfer_event=transfer_event,
+                    staged_tensors=staged_tensors,
+                    staged_bytes=staged_bytes,
                 )
                 path_list.append(path)
+            if not write_batches or retain_bundles:
+                sync_start = time.perf_counter()
+                if transfer_event is not None:
+                    transfer_event.synchronize()
+                logger.info(
+                    "batch_transfer_synced dataset=%s batch_index=%s seconds=%.3f staged_tensors=%s staged_bytes=%s",
+                    dataset_name,
+                    batch_index,
+                    time.perf_counter() - sync_start,
+                    staged_tensors,
+                    staged_bytes,
+                )
             if retain_bundles:
                 all_bundles.extend(batch_bundles)
+            logger.info(
+                "batch_done dataset=%s batch_index=%s total_seconds=%.3f staged_tensors=%s staged_bytes=%s wrote_batch=%s",
+                dataset_name,
+                batch_index,
+                time.perf_counter() - batch_start,
+                staged_tensors,
+                staged_bytes,
+                write_batches,
+            )
+        logger.info(
+            "collect_examples_done dataset=%s seconds=%.3f wrote_batches=%s retained_bundles=%s",
+            dataset_name,
+            time.perf_counter() - collect_start,
+            len(path_list),
+            len(all_bundles),
+        )
         return path_list, all_bundles
 
     def run_controls(self, records: list[dict[str, Any]], dataset_name: str = "custom_controls"):

@@ -2,20 +2,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 
 from .analysis import analyze_capture_directory
 from .collection import InstrumentedQwen3MoeExperiment
 from .config import ExperimentSpec, load_experiment_spec
 from .evaluation import evaluate_signal, evaluate_task_suite, save_json
+from .logging_utils import configure_logging, default_log_path
 from .profiles import describe_run, named_run_specs, write_named_specs
 from .runtime import import_torch
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="KV-prepend probing experiment")
     parser.add_argument("--spec", type=Path, default=Path(__file__).resolve().parents[1] / "default_experiment.json")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--log-path", type=Path, default=None)
+    parser.add_argument("--log-level", type=str, default="INFO")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("verify-model")
@@ -157,6 +163,17 @@ def cmd_evaluate_suite(spec: ExperimentSpec, root: Path, args):
 
 def main():
     args = parse_args()
+    resolved_log_path = configure_logging(
+        log_path=args.log_path or default_log_path(args.root, args.command),
+        level=args.log_level,
+    )
+    logger.info(
+        "cli_start command=%s spec=%s root=%s log_path=%s",
+        args.command,
+        args.spec,
+        args.root,
+        resolved_log_path,
+    )
     spec = _load_spec(args.spec)
     root = args.root
     if args.command == "verify-model":
