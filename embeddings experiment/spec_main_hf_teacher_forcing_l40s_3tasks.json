@@ -194,7 +194,7 @@
     "model_name": "Qwen/Qwen3-30B-A3B",
     "output_attentions": true,
     "preflight_max_used_memory_gib": 8.0,
-    "quantization": "fp8",
+    "quantization": "torchao_fp8_weight_only",
     "tokenizer_name": null,
     "torch_dtype": "auto",
     "trust_remote_code": true

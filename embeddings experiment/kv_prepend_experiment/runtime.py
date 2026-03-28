@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import importlib.metadata
 import logging
 import os
 import subprocess
@@ -76,6 +77,10 @@ def runtime_stack_snapshot(transformers: Any | None = None) -> dict[str, Any]:
     torch = import_torch()
     if transformers is None:
         transformers = import_transformers()
+    try:
+        torchao_version = importlib.metadata.version("torchao")
+    except importlib.metadata.PackageNotFoundError:
+        torchao_version = None
     return {
         "python": inspect.sys.version,
         "torch_version": torch.__version__,
@@ -83,6 +88,7 @@ def runtime_stack_snapshot(transformers: Any | None = None) -> dict[str, Any]:
         "cuda_device_count": int(torch.cuda.device_count()),
         "cuda_device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "transformers_version": transformers.__version__,
+        "torchao_version": torchao_version,
     }
 
 
@@ -100,6 +106,33 @@ def build_fp8_quantization_config(transformers: Any):
         if hasattr(transformers, attr):
             return getattr(transformers, attr)()
     return None
+
+
+def build_torchao_quantization_config(transformers: Any, quantization_mode: str):
+    try:
+        from torchao.quantization import (
+            Float8DynamicActivationFloat8WeightConfig,
+            Float8WeightOnlyConfig,
+        )
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "TorchAO quantization was requested but torchao is not installed. "
+            "Install torchao in the runtime environment before running this profile."
+        ) from exc
+
+    if not hasattr(transformers, "TorchAoConfig"):
+        raise RuntimeError(
+            "TorchAO quantization was requested but this Transformers build does not expose TorchAoConfig."
+        )
+
+    quantization_mode = quantization_mode.lower()
+    if quantization_mode == "torchao_fp8_weight_only":
+        quant_type = Float8WeightOnlyConfig()
+    elif quantization_mode in {"torchao_fp8_dynamic", "torchao_fp8"}:
+        quant_type = Float8DynamicActivationFloat8WeightConfig()
+    else:
+        raise ValueError(f"Unsupported TorchAO quantization mode: {quantization_mode}")
+    return transformers.TorchAoConfig(quant_type=quant_type)
 
 
 def _query_gpu_snapshot() -> dict[str, float | str] | None:
@@ -166,7 +199,8 @@ def load_model_and_tokenizer(model_spec):
 
     config = AutoConfig.from_pretrained(model_spec.model_name, trust_remote_code=model_spec.trust_remote_code)
     device_map = model_spec.device_map
-    if model_spec.quantization.lower() == "fp8":
+    quantization_mode = model_spec.quantization.lower()
+    if quantization_mode == "fp8":
         if device_map == "auto":
             raise ValueError(
                 "FP8 runs must use an explicit CUDA-only device_map for this experiment. "
@@ -192,7 +226,7 @@ def load_model_and_tokenizer(model_spec):
             model_kwargs["torch_dtype"] = "auto"
         else:
             model_kwargs["torch_dtype"] = getattr(torch, model_spec.torch_dtype)
-    if model_spec.quantization.lower() == "fp8":
+    if quantization_mode == "fp8":
         quantization_config = build_fp8_quantization_config(transformers)
         if quantization_config is None:
             raise RuntimeError(
@@ -200,6 +234,10 @@ def load_model_and_tokenizer(model_spec):
                 "Install a build that exposes FBGEMM FP8 support on Thunder."
             )
         model_kwargs["quantization_config"] = quantization_config
+    elif quantization_mode.startswith("torchao_"):
+        model_kwargs["quantization_config"] = build_torchao_quantization_config(
+            transformers, quantization_mode
+        )
 
     tokenizer_name = model_spec.tokenizer_name or model_spec.model_name
     tokenizer_start = time.perf_counter()
