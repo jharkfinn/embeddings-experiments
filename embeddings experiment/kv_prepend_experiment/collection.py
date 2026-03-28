@@ -815,6 +815,7 @@ class InstrumentedQwen3MoeExperiment:
 
         start = time.perf_counter()
         try:
+            activation_dtype = resid_pre_attn.dtype
             summary_value = prepend_result.summary_value
             summary_headwise = summary_value.repeat_interleave(layer.self_attn.num_key_value_groups, dim=1).expand(
                 -1, -1, causal_headwise.shape[2], -1
@@ -826,7 +827,12 @@ class InstrumentedQwen3MoeExperiment:
             router_rows = []
             topk_rows = []
             gate_weight = layer.mlp.gate.weight
-            hidden_dim = resid_pre_attn.shape[-1]
+            attn_hidden_dim = int(getattr(layer.self_attn.o_proj, "in_features", 0) or 0)
+            if attn_hidden_dim <= 0:
+                attn_hidden_dim = int(causal_headwise.shape[1] * causal_headwise.shape[-1])
+            model_hidden_dim = int(getattr(layer.self_attn.o_proj, "out_features", 0) or 0)
+            if model_hidden_dim <= 0:
+                model_hidden_dim = int(resid_pre_attn.shape[-1])
 
             for start_idx in range(0, bias_values.shape[0], bias_chunk_size):
                 bias_chunk = bias_values[start_idx : start_idx + bias_chunk_size]
@@ -834,22 +840,26 @@ class InstrumentedQwen3MoeExperiment:
                     margin0.unsqueeze(1) + bias_chunk.view(1, -1, 1, 1)
                 ).unsqueeze(-1)
                 mixed_headwise = (
-                    (1.0 - beta_chunk) * causal_headwise.unsqueeze(1)
-                    + beta_chunk * summary_headwise.unsqueeze(1)
-                )
-                concat = mixed_headwise.permute(0, 1, 3, 2, 4).reshape(-1, hidden_dim)
-                z_b = layer.self_attn.o_proj(concat).reshape(
+                    (1.0 - beta_chunk) * causal_headwise.unsqueeze(1).float()
+                    + beta_chunk * summary_headwise.unsqueeze(1).float()
+                ).to(dtype=activation_dtype)
+                project_input = mixed_headwise.permute(0, 1, 3, 2, 4).reshape(
+                    resid_pre_attn.shape[0] * bias_chunk.shape[0],
+                    resid_pre_attn.shape[1],
+                    attn_hidden_dim,
+                ).contiguous()
+                z_b = layer.self_attn.o_proj(project_input).reshape(
                     resid_pre_attn.shape[0],
                     bias_chunk.shape[0],
                     resid_pre_attn.shape[1],
-                    hidden_dim,
+                    model_hidden_dim,
                 )
-                h_base = resid_pre_attn.unsqueeze(1) + z_b
+                h_base = resid_pre_attn.unsqueeze(1).to(dtype=z_b.dtype) + z_b
                 h_pre_moe = layer.post_attention_layernorm(
-                    h_base.reshape(-1, hidden_dim)
+                    h_base.reshape(-1, model_hidden_dim).contiguous()
                 ).reshape_as(h_base)
                 router_logits = F.linear(
-                    h_pre_moe.reshape(-1, hidden_dim),
+                    h_pre_moe.reshape(-1, model_hidden_dim).contiguous(),
                     gate_weight,
                 ).reshape(
                     resid_pre_attn.shape[0],
@@ -941,7 +951,14 @@ class InstrumentedQwen3MoeExperiment:
             )
             return {"_per_example_metadata": per_example_metadata}
         except Exception as exc:  # pragma: no cover - runtime/model specific
-            return {"bias_spectrum_error": str(exc)}
+            logger.exception(
+                "bias_sweep_failed layer=%s residual_dtype=%s causal_dtype=%s summary_dtype=%s",
+                layer_idx,
+                resid_pre_attn.dtype,
+                causal_headwise.dtype,
+                prepend_result.summary_value.dtype,
+            )
+            return {"bias_spectrum_error": f"{type(exc).__name__}: {exc!r}"}
 
     def _layer_forward_variants(
         self,
@@ -1036,7 +1053,7 @@ class InstrumentedQwen3MoeExperiment:
             else:
                 prepend_router_logits, prepend_topk = self._run_router_only(layer.mlp, prepend_pre_moe)
                 prepend_next = None
-            if calibration:
+            if calibration and main_condition == CaptureCondition.CAUSAL:
                 bias_metadata = self._compute_bias_sweep_metadata(
                     layer=layer,
                     layer_idx=layer_idx,
