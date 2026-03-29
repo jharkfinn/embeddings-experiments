@@ -64,6 +64,23 @@ def _find_layer_capture(bundle: ExampleCaptureBundle, pass_name: str, condition:
     raise KeyError(f"Missing {pass_name}/{condition}/layer {layer_idx} for {bundle.text_id}")
 
 
+def _resolve_v_raw_capture(bundle: ExampleCaptureBundle, pass_name: str, condition: str, layer_idx: int):
+    capture = _find_layer_capture(bundle, pass_name, condition, layer_idx)
+    if capture.v_raw is not None:
+        return capture
+    fallback_by_condition = {
+        CaptureCondition.LOCAL_PREPEND_CAUSAL_BASE.value: CaptureCondition.CAUSAL.value,
+        CaptureCondition.LOCAL_NOPREPEND_PROPAGATED_BASE.value: CaptureCondition.PROPAGATED.value,
+    }
+    fallback_condition = fallback_by_condition.get(condition)
+    if fallback_condition is None:
+        return capture
+    fallback_capture = _find_layer_capture(bundle, pass_name, fallback_condition, layer_idx)
+    if fallback_capture.v_raw is not None:
+        return fallback_capture
+    return capture
+
+
 def _has_layer_capture(bundle: ExampleCaptureBundle, pass_name: str, condition: str, layer_idx: int) -> bool:
     try:
         _find_layer_capture(bundle, pass_name, condition, layer_idx)
@@ -125,7 +142,8 @@ def _raw_signal_tokens(
         elif signal_name == "top_k_binary":
             tensor = _topk_to_indicator(_tensor_to_numpy(capture.top_k_indices, dtype=np.int16)[0])
         elif signal_name == "value_vectors":
-            raw = _tensor_to_numpy(capture.v_raw, dtype=np.float32)[0]
+            raw_capture = _resolve_v_raw_capture(bundle, pass_name, condition, layer_idx)
+            raw = _tensor_to_numpy(raw_capture.v_raw, dtype=np.float32)[0]
             tensor = raw.transpose(1, 0, 2).reshape(raw.shape[1], -1)
         elif signal_name == "summary_value":
             tensor = _tensor_to_numpy(capture.final_token_v, dtype=np.float32)[0]

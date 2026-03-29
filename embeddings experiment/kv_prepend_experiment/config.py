@@ -65,10 +65,11 @@ class CollectionSpec:
     bias_sweep_min: float = -6.0
     bias_sweep_max: float = 6.0
     main_capture_signals: list[str] = field(
-        default_factory=lambda: ["attention_output", "pre_moe", "router_logits", "top_k_binary"]
+        default_factory=lambda: ["attention_output", "v_raw", "router_logits", "top_k_binary"]
     )
     main_dense_layers: list[int] = field(default_factory=lambda: [15, 23, 31, 39, 47])
     main_router_layers: list[int] = field(default_factory=lambda: list(range(48)))
+    main_value_layers: list[int] = field(default_factory=lambda: list(range(48)))
 
 
 @dataclass

@@ -389,6 +389,7 @@ class InstrumentedQwen3MoeExperiment:
         self.writer = CollectionWriter(self.root, queue_size=self.spec.collection.writer_queue_size)
         self._main_dense_layers = set(int(layer) for layer in self.spec.collection.main_dense_layers)
         self._main_router_layers = set(int(layer) for layer in self.spec.collection.main_router_layers)
+        self._main_value_layers = set(int(layer) for layer in getattr(self.spec.collection, "main_value_layers", []))
         self._main_capture_signals = set(self.spec.collection.main_capture_signals)
         self._attention_weight_layers = set(int(layer) for layer in self.spec.collection.attention_weight_layers)
         self._prompt_affix_cache: dict[str, tuple[list[int], list[int]]] = {}
@@ -507,6 +508,9 @@ class InstrumentedQwen3MoeExperiment:
     def _main_router_layer_set(self) -> set[int]:
         return self._main_router_layers
 
+    def _main_value_layer_set(self) -> set[int]:
+        return self._main_value_layers
+
     def _main_capture_signal_set(self) -> set[str]:
         return self._main_capture_signals
 
@@ -515,11 +519,19 @@ class InstrumentedQwen3MoeExperiment:
             return True
         if signal_name not in self._main_capture_signal_set():
             return False
+        if signal_name == "v_raw":
+            value_layers = self._main_value_layer_set()
+            return not value_layers or layer_idx in value_layers
         if signal_name in {"router_logits", "top_k_binary"}:
             router_layers = self._main_router_layer_set()
             return not router_layers or layer_idx in router_layers
         dense_layers = self._main_dense_layer_set()
         return not dense_layers or layer_idx in dense_layers
+
+    def _store_main_deduped_v_raw(self, condition: CaptureCondition, calibration: bool) -> bool:
+        if calibration:
+            return True
+        return condition in {CaptureCondition.CAUSAL, CaptureCondition.PROPAGATED}
 
     def _should_capture_layer(self, layer_idx: int, calibration: bool) -> bool:
         if calibration:
@@ -788,7 +800,12 @@ class InstrumentedQwen3MoeExperiment:
                     _storage_dtype("q_pre_rope", calibration),
                 ),
                 "v_raw": (
-                    v_raw if self._signal_enabled_for_layer("v_raw", layer_idx, calibration) else None,
+                    (
+                        v_raw
+                        if self._signal_enabled_for_layer("v_raw", layer_idx, calibration)
+                        and self._store_main_deduped_v_raw(condition, calibration)
+                        else None
+                    ),
                     _storage_dtype("v_raw", calibration),
                 ),
                 "attention_weights": (

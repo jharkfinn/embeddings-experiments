@@ -9,7 +9,8 @@ from .config import ExperimentSpec
 THREE_TASKS = ["scifact", "fiqa2018", "quoraretrieval"]
 MAIN_DENSE_LAYERS = [15, 23, 31, 39, 47]
 MAIN_ROUTER_LAYERS = list(range(48))
-MAIN_SIGNALS = ["attention_output", "pre_moe", "router_logits", "top_k_binary"]
+MAIN_VALUE_LAYERS = list(range(48))
+MAIN_SIGNALS = ["attention_output", "v_raw", "router_logits", "top_k_binary"]
 
 
 def _clone_spec(spec: ExperimentSpec) -> ExperimentSpec:
@@ -34,6 +35,7 @@ def build_main_hf_teacher_forcing_spec(base: ExperimentSpec) -> ExperimentSpec:
     spec.collection.attention_compile_fullgraph = False
     spec.collection.main_dense_layers = list(MAIN_DENSE_LAYERS)
     spec.collection.main_router_layers = list(MAIN_ROUTER_LAYERS)
+    spec.collection.main_value_layers = list(MAIN_VALUE_LAYERS)
     spec.collection.main_capture_signals = list(MAIN_SIGNALS)
     spec.evaluation.dataset_names = list(THREE_TASKS)
     spec.evaluation.selected_layers = list(MAIN_ROUTER_LAYERS)
