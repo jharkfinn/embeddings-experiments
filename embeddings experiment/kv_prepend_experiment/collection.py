@@ -202,24 +202,24 @@ class AdaptiveBatchTokenBudget:
             rounded = int(math.floor(tokens / self._step) * self._step)
         return max(self.min_budget, min(rounded, self.max_budget))
 
-    def observe_success(self, *, batch_size: int, max_tokens: int, peak_reserved_bytes: int) -> tuple[int, str] | None:
+    def observe_success(self, *, batch_size: int, max_tokens: int, peak_allocated_bytes: int) -> tuple[int, str] | None:
         batch_size = max(1, int(batch_size))
         max_tokens = max(1, int(max_tokens))
-        peak_reserved_bytes = max(1, int(peak_reserved_bytes))
+        peak_allocated_bytes = max(1, int(peak_allocated_bytes))
         previous_budget = self.current_budget
         effective_tokens = max(1, batch_size * max_tokens)
 
-        if peak_reserved_bytes > self.target_peak_bytes:
-            scale = max(0.60, min(self.target_peak_bytes / peak_reserved_bytes, 0.95))
+        if peak_allocated_bytes > self.target_peak_bytes:
+            scale = max(0.60, min(self.target_peak_bytes / peak_allocated_bytes, 0.95))
             proposed = self._clamp(previous_budget * scale, round_up=False)
             reason = "shrink"
         else:
-            scale = self.target_peak_bytes / peak_reserved_bytes
+            scale = self.target_peak_bytes / peak_allocated_bytes
             growth_cap = 1.50 if batch_size < self.streaming_batch_size else 1.20
             proposed = self._clamp(previous_budget * min(scale, growth_cap), round_up=True)
             if batch_size < self.streaming_batch_size:
                 next_row_budget = (batch_size + 1) * max_tokens
-                predicted_peak = peak_reserved_bytes * (next_row_budget / effective_tokens)
+                predicted_peak = peak_allocated_bytes * (next_row_budget / effective_tokens)
                 if next_row_budget <= self.max_budget and predicted_peak <= self.target_peak_bytes * 0.98:
                     proposed = max(proposed, self._clamp(next_row_budget, round_up=True))
             reason = "grow"
@@ -706,7 +706,7 @@ class InstrumentedQwen3MoeExperiment:
             device=device,
         )
         logger.info(
-            "adaptive_batch_budget_init initial_tokens=%s min_tokens=%s max_tokens=%s target_peak_gib=%.2f total_gib=%.2f",
+            "adaptive_batch_budget_init initial_tokens=%s min_tokens=%s max_tokens=%s target_allocated_gib=%.2f total_gib=%.2f",
             budget.current_budget,
             budget.min_budget,
             budget.max_budget,
@@ -1725,8 +1725,11 @@ class InstrumentedQwen3MoeExperiment:
                                 bundle.metadata["multi_slot_summaries"] = batch_multi_slot[example.text_id]
                             batch_bundles.append(bundle)
                     peak_reserved_bytes = 0
+                    peak_allocated_bytes = 0
                     if adaptive_budget is not None and is_lean_main_batch:
                         torch = import_torch()
+                        if hasattr(torch.cuda, "max_memory_allocated"):
+                            peak_allocated_bytes = int(torch.cuda.max_memory_allocated(self._model_input_device()))
                         if hasattr(torch.cuda, "max_memory_reserved"):
                             peak_reserved_bytes = int(torch.cuda.max_memory_reserved(self._model_input_device()))
                     batch_id = f"{dataset_name}_{control_summary_mode or 'main'}_{batch_index}_{len(batch_bundles) or len(batch_examples)}_{uuid.uuid4().hex[:8]}"
@@ -1818,32 +1821,34 @@ class InstrumentedQwen3MoeExperiment:
                     )
                 if retain_bundles:
                     all_bundles.extend(batch_bundles)
-                if adaptive_budget is not None and is_lean_main_batch and peak_reserved_bytes > 0:
+                if adaptive_budget is not None and is_lean_main_batch and peak_allocated_bytes > 0:
                     update = adaptive_budget.observe_success(
                         batch_size=len(batch_examples),
                         max_tokens=attempted_tokens_for_retry,
-                        peak_reserved_bytes=peak_reserved_bytes,
+                        peak_allocated_bytes=peak_allocated_bytes,
                     )
                     if update is not None:
                         updated_budget, reason = update
                         logger.info(
-                            "adaptive_batch_budget_update dataset=%s batch_index=%s reason=%s current_tokens=%s peak_reserved_gib=%.2f batch_size=%s max_tokens=%s",
+                            "adaptive_batch_budget_update dataset=%s batch_index=%s reason=%s current_tokens=%s peak_allocated_gib=%.2f peak_reserved_gib=%.2f batch_size=%s max_tokens=%s",
                             dataset_name,
                             batch_index,
                             reason,
                             updated_budget,
+                            peak_allocated_bytes / (1024**3),
                             peak_reserved_bytes / (1024**3),
                             len(batch_examples),
                             max_batch_tokens,
                         )
                 logger.info(
-                    "batch_done dataset=%s batch_index=%s total_seconds=%.3f staged_tensors=%s staged_groups=%s staged_bytes=%s peak_reserved_gib=%.2f wrote_batch=%s",
+                    "batch_done dataset=%s batch_index=%s total_seconds=%.3f staged_tensors=%s staged_groups=%s staged_bytes=%s peak_allocated_gib=%.2f peak_reserved_gib=%.2f wrote_batch=%s",
                     dataset_name,
                     batch_index,
                     time.perf_counter() - batch_start,
                     staged_tensors,
                     staged_groups,
                     staged_bytes,
+                    peak_allocated_bytes / (1024**3),
                     peak_reserved_bytes / (1024**3),
                     write_batches,
                 )
