@@ -33,7 +33,7 @@ region = "us-east-1"
 [cerebrium.scaling]
 min_replicas = 0
 max_replicas = 1
-response_grace_period = 3600
+response_grace_period = 43200
 cooldown = 10
 replica_concurrency = 1
 scaling_metric = "concurrency_utilization"

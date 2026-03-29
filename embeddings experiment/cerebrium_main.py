@@ -558,6 +558,82 @@ def calibration_run(calibration_run_id=""):
         _best_effort_runtime_cleanup("calibration_run")
 
 
+def main_run(main_run_id=""):
+    from kv_prepend_experiment.collection import InstrumentedQwen3MoeExperiment
+    from kv_prepend_experiment.config import load_experiment_spec
+    from kv_prepend_experiment.logging_utils import configure_logging
+
+    spec_path = ROOT / "spec_main_hf_teacher_forcing_l40s_3tasks.json"
+    spec = load_experiment_spec(spec_path)
+    spec.model.preflight_max_used_memory_gib = None
+    spec.model.torch_dtype = "auto"
+
+    run_root = _new_persistent_run_root("main_runs", main_run_id or None)
+    status_path = run_root / "status.json"
+    configure_logging(log_path=run_root / "artifacts" / "logs" / "main_run.log", level="INFO")
+    LOGGER.info("main_run_setup spec=%s", spec_path.name)
+
+    records = _load_nanobeir_records(["scifact", "fiqa2018", "quoraretrieval"])
+    start = time.perf_counter()
+    LOGGER.info("main_run_records_loaded records=%s", len(records))
+    state: dict[str, object] = {
+        "run_id": run_root.name,
+        "stage": "setup",
+        "records": len(records),
+        "run_root": str(run_root),
+        "status_path": str(status_path),
+        "started_at": _iso_now(),
+    }
+
+    def update_state(**kwargs: object) -> None:
+        state.update(kwargs)
+        _write_json_atomic(status_path, dict(state, updated_at=_iso_now(), resource_snapshot=_resource_snapshot(run_root)))
+
+    try:
+        with _resource_heartbeat("main_run", run_root=run_root), _status_heartbeat(status_path, state, run_root=run_root):
+            experiment = InstrumentedQwen3MoeExperiment(spec, run_root)
+            update_state(stage="experiment_load_start")
+            LOGGER.info("main_run_experiment_load_start")
+            experiment.load()
+            update_state(stage="experiment_load_done")
+            LOGGER.info("main_run_experiment_load_done")
+            spec_snapshot = experiment.save_spec_snapshot()
+            update_state(stage="collect_examples")
+            paths, _ = experiment.collect_examples(
+                records,
+                dataset_name="nanobeir_3tasks",
+                retain_bundles=False,
+            )
+            LOGGER.info("main_run_collect_done paths=%s", len(paths))
+            update_state(stage="flush_writes", capture_count=len(paths))
+            experiment.flush_writes()
+            LOGGER.info("main_run_flush_done")
+        total_bytes = 0
+        for path in paths:
+            total_bytes += path.stat().st_size
+        update_state(
+            stage="completed",
+            finished_at=_iso_now(),
+            capture_count=len(paths),
+            output_bytes=total_bytes,
+        )
+        return {
+            "seconds": round(time.perf_counter() - start, 3),
+            "records": len(records),
+            "capture_count": len(paths),
+            "capture_bytes": total_bytes,
+            "run_root": str(run_root),
+            "status_path": str(status_path),
+            "spec_snapshot": str(spec_snapshot.relative_to(run_root)),
+            "nvidia_smi_after_collect": _nvidia_smi(),
+        }
+    except BaseException as exc:
+        update_state(stage="failed", finished_at=_iso_now(), error=repr(exc))
+        raise
+    finally:
+        _best_effort_runtime_cleanup("main_run")
+
+
 def analyze_latest_calibration(
     calibration_run_id="",
     analysis_run_id="",

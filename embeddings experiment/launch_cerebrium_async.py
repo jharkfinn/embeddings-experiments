@@ -228,7 +228,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "function",
-        choices=["collect_smoke", "calibration_run", "analyze_latest_calibration", "cleanup_idle"],
+        choices=["collect_smoke", "calibration_run", "main_run", "analyze_latest_calibration", "cleanup_idle"],
     )
     parser.add_argument("--region", default=None)
     parser.add_argument("--storage-app", default=DEFAULT_STORAGE_APP)
@@ -276,6 +276,15 @@ def main() -> int:
             "status_remote_path": f"{args.storage_app}/calibration_runs/{function_payload['calibration_run_id']}/status.json",
             "log_remote_path": f"{args.storage_app}/calibration_runs/{function_payload['calibration_run_id']}/artifacts/logs/calibration_run.log",
             "run_root_remote_path": f"{args.storage_app}/calibration_runs/{function_payload['calibration_run_id']}/",
+        }
+    elif args.function == "main_run":
+        app_name = args.gpu_app
+        config_path = GPU_CONFIG
+        function_payload = {"main_run_id": args.run_id or _new_run_id()}
+        remote_paths = {
+            "status_remote_path": f"{args.storage_app}/main_runs/{function_payload['main_run_id']}/status.json",
+            "log_remote_path": f"{args.storage_app}/main_runs/{function_payload['main_run_id']}/artifacts/logs/main_run.log",
+            "run_root_remote_path": f"{args.storage_app}/main_runs/{function_payload['main_run_id']}/",
         }
     else:
         app_name = args.cpu_app

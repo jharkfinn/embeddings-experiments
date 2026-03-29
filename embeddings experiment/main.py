@@ -4,6 +4,7 @@ from cerebrium_main import (
     collect_smoke,
     full_smoke,
     gpu_smoke,
+    main_run,
     model_load_smoke,
     repo_smoke,
     stack_smoke,
