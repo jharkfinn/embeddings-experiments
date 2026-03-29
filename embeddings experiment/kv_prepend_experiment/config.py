@@ -41,6 +41,9 @@ class CollectionSpec:
     multi_slot_decode_steps: int = 3
     streaming_batch_size: int = 16
     max_batch_tokens: int = 8192
+    adaptive_max_batch_tokens: bool = True
+    adaptive_target_gpu_utilization: float = 0.9
+    adaptive_gpu_reserve_gib: float = 2.0
     sequence_length_buckets: list[int] = field(default_factory=lambda: [128, 256, 384, 512, 768, 1024, 1536, 2048])
     pad_main_batches_to_streaming_size: bool = True
     attention_backend: str = "flex_packed"

@@ -3,6 +3,9 @@
     "attention_backend": "flex_packed",
     "attention_compile_fullgraph": false,
     "attention_compile_mode": "default",
+    "adaptive_gpu_reserve_gib": 2.0,
+    "adaptive_max_batch_tokens": true,
+    "adaptive_target_gpu_utilization": 0.9,
     "attention_weight_layers": [
       15,
       23,

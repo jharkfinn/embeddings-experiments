@@ -293,6 +293,9 @@ def repo_smoke() -> dict[str, object]:
         "runtime_backend": spec.collection.runtime_backend,
         "streaming_batch_size": spec.collection.streaming_batch_size,
         "max_batch_tokens": spec.collection.max_batch_tokens,
+        "adaptive_max_batch_tokens": spec.collection.adaptive_max_batch_tokens,
+        "adaptive_target_gpu_utilization": spec.collection.adaptive_target_gpu_utilization,
+        "adaptive_gpu_reserve_gib": spec.collection.adaptive_gpu_reserve_gib,
         "main_capture_signals": list(spec.collection.main_capture_signals),
     }
 

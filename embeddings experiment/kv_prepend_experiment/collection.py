@@ -7,6 +7,7 @@ import os
 import queue
 import random
 import shutil
+import gc
 import threading
 import time
 import uuid
@@ -161,6 +162,81 @@ class AsyncTransferSession:
         if event is not None:
             event.synchronize()
         return event
+
+
+class AdaptiveBatchTokenBudget:
+    def __init__(
+        self,
+        *,
+        initial_budget: int,
+        streaming_batch_size: int,
+        max_length: int,
+        target_utilization: float,
+        reserve_gib: float,
+        device,
+    ):
+        torch = import_torch()
+        self.device = torch.device(device)
+        if self.device.type != "cuda":
+            raise ValueError("Adaptive batch token budget requires a CUDA device.")
+        props = torch.cuda.get_device_properties(self.device)
+        self.total_memory_bytes = int(props.total_memory)
+        reserve_bytes = int(float(reserve_gib) * (1024**3))
+        target_by_fraction = int(self.total_memory_bytes * float(target_utilization))
+        target_by_reserve = max(1, self.total_memory_bytes - reserve_bytes)
+        self.target_peak_bytes = max(1, min(target_by_fraction, target_by_reserve))
+        self.streaming_batch_size = max(1, int(streaming_batch_size))
+        self.max_length = max(1, int(max_length))
+        self.min_budget = max(1, min(int(initial_budget), self.max_length))
+        self.max_budget = max(int(initial_budget), self.streaming_batch_size * self.max_length)
+        self.current_budget = max(self.min_budget, min(int(initial_budget), self.max_budget))
+        self._step = 128
+
+    def _clamp(self, tokens: int, *, round_up: bool) -> int:
+        tokens = max(self.min_budget, min(int(tokens), self.max_budget))
+        if tokens <= self.min_budget:
+            return self.min_budget
+        if round_up:
+            rounded = int(math.ceil(tokens / self._step) * self._step)
+        else:
+            rounded = int(math.floor(tokens / self._step) * self._step)
+        return max(self.min_budget, min(rounded, self.max_budget))
+
+    def observe_success(self, *, batch_size: int, max_tokens: int, peak_reserved_bytes: int) -> tuple[int, str] | None:
+        batch_size = max(1, int(batch_size))
+        max_tokens = max(1, int(max_tokens))
+        peak_reserved_bytes = max(1, int(peak_reserved_bytes))
+        previous_budget = self.current_budget
+        effective_tokens = max(1, batch_size * max_tokens)
+
+        if peak_reserved_bytes > self.target_peak_bytes:
+            scale = max(0.60, min(self.target_peak_bytes / peak_reserved_bytes, 0.95))
+            proposed = self._clamp(previous_budget * scale, round_up=False)
+            reason = "shrink"
+        else:
+            scale = self.target_peak_bytes / peak_reserved_bytes
+            growth_cap = 1.50 if batch_size < self.streaming_batch_size else 1.20
+            proposed = self._clamp(previous_budget * min(scale, growth_cap), round_up=True)
+            if batch_size < self.streaming_batch_size:
+                next_row_budget = (batch_size + 1) * max_tokens
+                predicted_peak = peak_reserved_bytes * (next_row_budget / effective_tokens)
+                if next_row_budget <= self.max_budget and predicted_peak <= self.target_peak_bytes * 0.98:
+                    proposed = max(proposed, self._clamp(next_row_budget, round_up=True))
+            reason = "grow"
+
+        if proposed == previous_budget:
+            return None
+        self.current_budget = proposed
+        return proposed, reason
+
+    def reduce_after_oom(self, *, attempted_batch_size: int, max_tokens: int) -> int:
+        attempted_batch_size = max(1, int(attempted_batch_size))
+        max_tokens = max(1, int(max_tokens))
+        previous_budget = self.current_budget
+        fallback_budget = max_tokens if attempted_batch_size <= 1 else (attempted_batch_size - 1) * max_tokens
+        proposed = min(previous_budget - self._step, int(previous_budget * 0.75), fallback_budget)
+        self.current_budget = self._clamp(proposed, round_up=False)
+        return self.current_budget
 
 
 class CollectionWriter:
@@ -574,30 +650,88 @@ class InstrumentedQwen3MoeExperiment:
             )
         return None, None
 
-    def _iter_example_batches(self, examples: list[PromptExample]):
+    def _ordered_examples(self, examples: list[PromptExample]) -> list[PromptExample]:
         ordered = list(examples)
         if self.spec.collection.sort_by_length:
             ordered.sort(key=lambda ex: int(ex.token_count or 0), reverse=True)
+        return ordered
+
+    def _take_batch_from_ordered(
+        self,
+        ordered: list[PromptExample],
+        start_index: int,
+        *,
+        max_batch_tokens: int | None = None,
+    ) -> list[PromptExample]:
+        if start_index >= len(ordered):
+            return []
+        token_budget = int(self.spec.collection.max_batch_tokens if max_batch_tokens is None else max_batch_tokens)
         current: list[PromptExample] = []
         current_max = 0
-        for example in ordered:
-            if current and bool(current[0].calibration) != bool(example.calibration):
-                yield current
-                current = []
-                current_max = 0
+        calibration = bool(ordered[start_index].calibration)
+        for example in ordered[start_index:]:
+            if bool(example.calibration) != calibration:
+                break
             proposed_max = max(current_max, int(example.token_count or 0))
             proposed_size = len(current) + 1
             exceeds_size = proposed_size > self.spec.collection.streaming_batch_size
-            exceeds_tokens = proposed_size * proposed_max > self.spec.collection.max_batch_tokens
+            exceeds_tokens = proposed_size * proposed_max > token_budget
             if current and (exceeds_size or exceeds_tokens):
-                yield current
-                current = [example]
-                current_max = int(example.token_count or 0)
-            else:
-                current.append(example)
-                current_max = proposed_max
-        if current:
-            yield current
+                break
+            current.append(example)
+            current_max = proposed_max
+        return current
+
+    def _iter_example_batches(self, examples: list[PromptExample], *, max_batch_tokens: int | None = None):
+        ordered = self._ordered_examples(examples)
+        cursor = 0
+        while cursor < len(ordered):
+            batch = self._take_batch_from_ordered(ordered, cursor, max_batch_tokens=max_batch_tokens)
+            if not batch:
+                break
+            yield batch
+            cursor += len(batch)
+
+    def _build_adaptive_batch_budget(self) -> AdaptiveBatchTokenBudget | None:
+        torch = import_torch()
+        device = self._model_input_device()
+        if device.type != "cuda" or not bool(self.spec.collection.adaptive_max_batch_tokens):
+            return None
+        budget = AdaptiveBatchTokenBudget(
+            initial_budget=int(self.spec.collection.max_batch_tokens),
+            streaming_batch_size=int(self.spec.collection.streaming_batch_size),
+            max_length=int(self.spec.model.max_length),
+            target_utilization=float(self.spec.collection.adaptive_target_gpu_utilization),
+            reserve_gib=float(self.spec.collection.adaptive_gpu_reserve_gib),
+            device=device,
+        )
+        logger.info(
+            "adaptive_batch_budget_init initial_tokens=%s min_tokens=%s max_tokens=%s target_peak_gib=%.2f total_gib=%.2f",
+            budget.current_budget,
+            budget.min_budget,
+            budget.max_budget,
+            budget.target_peak_bytes / (1024**3),
+            budget.total_memory_bytes / (1024**3),
+        )
+        if hasattr(torch.cuda, "empty_cache"):
+            torch.cuda.empty_cache()
+        return budget
+
+    def _is_cuda_oom(self, exc: BaseException) -> bool:
+        torch = import_torch()
+        oom_type = getattr(getattr(torch, "cuda", None), "OutOfMemoryError", RuntimeError)
+        return isinstance(exc, oom_type) or "out of memory" in str(exc).lower()
+
+    def _clear_cuda_after_oom(self):
+        torch = import_torch()
+        gc.collect()
+        if hasattr(torch.cuda, "empty_cache"):
+            torch.cuda.empty_cache()
+        if hasattr(torch.cuda, "reset_peak_memory_stats"):
+            try:
+                torch.cuda.reset_peak_memory_stats(self._model_input_device())
+            except Exception:  # pragma: no cover - device/runtime specific
+                pass
 
     def _split_pass_capture(self, pass_capture: PassCapture, batch_examples: list[PromptExample]) -> list[PassCapture]:
         return split_pass_capture(pass_capture, len(batch_examples))
@@ -1412,206 +1546,310 @@ class InstrumentedQwen3MoeExperiment:
         external_lookup = None
         if external_summaries is not None:
             external_lookup = {example.text_id: summary for example, summary in zip(examples, external_summaries)}
-        batched_examples = (
-            [[example] for example in examples]
-            if external_lookup is not None
-            else list(self._iter_example_batches(examples))
-        )
+        ordered_examples = list(examples) if external_lookup is not None else self._ordered_examples(examples)
+        adaptive_budget = None
+        if (
+            external_lookup is None
+            and control_summary_mode is None
+            and self.spec.collection.runtime_backend == "hf_teacher_forcing"
+            and ordered_examples
+            and not any(example.calibration for example in ordered_examples)
+        ):
+            adaptive_budget = self._build_adaptive_batch_budget()
+        planned_batches: int | str
+        if external_lookup is not None:
+            planned_batches = len(ordered_examples)
+        elif adaptive_budget is not None:
+            planned_batches = "dynamic"
+        else:
+            planned_batches = 0
+            cursor = 0
+            while cursor < len(ordered_examples):
+                batch = self._take_batch_from_ordered(ordered_examples, cursor)
+                if not batch:
+                    break
+                planned_batches += 1
+                cursor += len(batch)
         logger.info(
-            "collect_examples_start dataset=%s records=%s examples=%s batches=%s target_subdir=%s write_batches=%s retain_bundles=%s external=%s control=%s",
+            "collect_examples_start dataset=%s records=%s examples=%s batches=%s target_subdir=%s write_batches=%s retain_bundles=%s external=%s control=%s adaptive_tokens=%s",
             dataset_name,
             len(records),
             len(examples),
-            len(batched_examples),
+            planned_batches,
             target,
             write_batches,
             retain_bundles,
             external_lookup is not None,
             control_summary_mode,
+            adaptive_budget is not None,
         )
 
-        for batch_index, batch_examples in enumerate(batched_examples):
-            batch_start = time.perf_counter()
-            self._begin_transfer_session()
-            is_lean_main_batch = (
-                external_lookup is None
-                and control_summary_mode is None
-                and not any(example.calibration for example in batch_examples)
-                and self.spec.collection.runtime_backend == "hf_teacher_forcing"
-            )
-            logger.info(
-                "batch_start dataset=%s batch_index=%s batch_size=%s max_tokens=%s lean_main=%s calibration_batch=%s",
-                dataset_name,
-                batch_index,
-                len(batch_examples),
-                max(int(example.token_count or 0) for example in batch_examples),
-                is_lean_main_batch,
-                all(example.calibration for example in batch_examples),
-            )
-            encode_start = time.perf_counter()
-            encoded = self.tokenize_examples(
-                batch_examples,
-                bucket_for_main=is_lean_main_batch,
-                pad_batch_for_main=is_lean_main_batch and self.spec.collection.pad_main_batches_to_streaming_size,
-            )
-            logger.info(
-                "batch_tokenized dataset=%s batch_index=%s seconds=%.3f padded_shape=%s real_batch=%s",
-                dataset_name,
-                batch_index,
-                time.perf_counter() - encode_start,
-                tuple(encoded["input_ids"].shape),
-                encoded["real_batch_size"],
-            )
-            input_ids = encoded["input_ids"].to(self._model_input_device())
-            attention_mask = encoded["attention_mask"].to(self._model_input_device())
-            example_external = None if external_lookup is None else external_lookup[batch_examples[0].text_id]
-            pass1_start = time.perf_counter()
-            pass1_batched, propagate_hidden_states = self._run_pass(
-                input_ids,
-                attention_mask,
-                calibration=all(example.calibration for example in batch_examples),
-                pass_name="pass1",
-                control_summary_mode=control_summary_mode,
-                external_summary_by_layer=example_external,
-            )
-            logger.info(
-                "batch_pass_done dataset=%s batch_index=%s pass=pass1 seconds=%.3f",
-                dataset_name,
-                batch_index,
-                time.perf_counter() - pass1_start,
-            )
-            propagate_from_layer = int(self.spec.collection.propagate_from_layer)
-            pass2_prefix_captures: dict[str, list[LayerCapture]] = {}
-            for condition in (CaptureCondition.CAUSAL.value, CaptureCondition.LOCAL_PREPEND_CAUSAL_BASE.value):
-                prefix_captures = [
-                    capture
-                    for capture in pass1_batched.captures_by_condition.get(condition, [])
-                    if capture.layer_idx < propagate_from_layer
-                ]
-                if prefix_captures:
-                    pass2_prefix_captures[condition] = prefix_captures
-            pass2_start = time.perf_counter()
-            pass2_batched, _ = self._run_pass(
-                input_ids,
-                attention_mask,
-                calibration=all(example.calibration for example in batch_examples),
-                pass_name="pass2",
-                control_summary_mode=control_summary_mode,
-                external_summary_by_layer=example_external,
-                start_layer=propagate_from_layer,
-                initial_hidden_states=propagate_hidden_states,
-                initial_captures_by_condition=pass2_prefix_captures,
-            )
-            logger.info(
-                "batch_pass_done dataset=%s batch_index=%s pass=pass2 seconds=%.3f",
-                dataset_name,
-                batch_index,
-                time.perf_counter() - pass2_start,
-            )
-            postprocess_start = time.perf_counter()
-            batch_multi_slot = {}
-            calibration_examples = [example for example in batch_examples if example.calibration]
-            if calibration_examples:
-                for example, multi_slot in zip(calibration_examples, self.collect_multi_slot_summaries_batch(calibration_examples)):
-                    batch_multi_slot[example.text_id] = multi_slot
-            needs_bundle_split = retain_bundles or not write_batches
-            if needs_bundle_split:
-                pass1_split = self._split_pass_capture(pass1_batched, batch_examples)
-                pass2_split = self._split_pass_capture(pass2_batched, batch_examples)
-            logger.info(
-                "batch_postprocess_done dataset=%s batch_index=%s seconds=%.3f calibration_examples=%s split_bundles=%s",
-                dataset_name,
-                batch_index,
-                time.perf_counter() - postprocess_start,
-                len(calibration_examples),
-                needs_bundle_split,
-            )
-            batch_bundles: list[ExampleCaptureBundle] = []
-            if needs_bundle_split:
-                for row_idx, example in enumerate(batch_examples):
-                    bundle = ExampleCaptureBundle(
-                        text_id=example.text_id,
-                        dataset_name=dataset_name,
-                        kind=example.kind,
-                        prompt=example.prompt,
-                        token_ids=list(example.prompt_token_ids or []),
-                        content_token_mask=list(example.content_token_mask or []),
-                        passes=[pass1_split[row_idx], pass2_split[row_idx]],
-                        metadata={"calibration": example.calibration, "tags": list(example.tags)},
-                    )
-                    if example.calibration:
-                        bundle.metadata["multi_slot_summaries"] = batch_multi_slot[example.text_id]
-                    batch_bundles.append(bundle)
-            batch_id = f"{dataset_name}_{control_summary_mode or 'main'}_{batch_index}_{len(batch_bundles) or len(batch_examples)}_{uuid.uuid4().hex[:8]}"
-            transfer_event, staged_tensors, staged_groups, staged_bytes = self._finalize_transfer_session()
-            if write_batches:
-                extra_metadata = {
-                    "dataset_name": dataset_name,
-                    "control": control_summary_mode,
-                    "runtime_stack": getattr(self, "runtime_stack", {}),
-                    "model_contract": None if self.contract is None else self.contract.__dict__,
-                    "batch_index": batch_index,
-                    "batch_size": len(batch_examples),
-                }
-                if needs_bundle_split:
-                    path = self.writer.write_batch(
-                        batch_id,
-                        batch_bundles,
-                        extra_metadata=extra_metadata,
-                        target_subdir=target,
-                        transfer_event=transfer_event,
-                        staged_tensors=staged_tensors,
-                        staged_groups=staged_groups,
-                        staged_bytes=staged_bytes,
-                    )
-                else:
-                    payload = build_batched_capture_payload(
-                        batch_id=batch_id,
-                        dataset_name=dataset_name,
-                        batch_examples=batch_examples,
-                        passes=[
-                            trim_pass_capture(pass1_batched, len(batch_examples)),
-                            trim_pass_capture(pass2_batched, len(batch_examples)),
-                        ],
-                        extra_metadata=extra_metadata,
-                        multi_slot_by_text_id=batch_multi_slot,
-                    )
-                    path = self.writer.write_payload(
-                        batch_id,
-                        payload,
-                        row_count=len(batch_examples),
-                        target_subdir=target,
-                        transfer_event=transfer_event,
-                        staged_tensors=staged_tensors,
-                        staged_groups=staged_groups,
-                        staged_bytes=staged_bytes,
-                    )
-                path_list.append(path)
-            if not write_batches or retain_bundles:
-                sync_start = time.perf_counter()
-                if transfer_event is not None:
-                    transfer_event.synchronize()
+        cursor = 0
+        batch_index = 0
+        while cursor < len(ordered_examples):
+            if external_lookup is not None:
+                batch_examples = [ordered_examples[cursor]]
+            elif adaptive_budget is not None:
+                batch_examples = self._take_batch_from_ordered(
+                    ordered_examples,
+                    cursor,
+                    max_batch_tokens=adaptive_budget.current_budget,
+                )
+            else:
+                batch_examples = self._take_batch_from_ordered(ordered_examples, cursor)
+            if not batch_examples:
+                break
+
+            while True:
+                batch_start = time.perf_counter()
+                self._begin_transfer_session()
+                is_lean_main_batch = (
+                    external_lookup is None
+                    and control_summary_mode is None
+                    and not any(example.calibration for example in batch_examples)
+                    and self.spec.collection.runtime_backend == "hf_teacher_forcing"
+                )
+                active_budget_tokens = (
+                    adaptive_budget.current_budget if adaptive_budget is not None and is_lean_main_batch else self.spec.collection.max_batch_tokens
+                )
+                max_batch_tokens = max(int(example.token_count or 0) for example in batch_examples)
+                attempted_tokens_for_retry = max_batch_tokens
                 logger.info(
-                    "batch_transfer_synced dataset=%s batch_index=%s seconds=%.3f staged_tensors=%s staged_groups=%s staged_bytes=%s",
+                    "batch_start dataset=%s batch_index=%s batch_size=%s max_tokens=%s token_budget=%s lean_main=%s calibration_batch=%s",
                     dataset_name,
                     batch_index,
-                    time.perf_counter() - sync_start,
+                    len(batch_examples),
+                    max_batch_tokens,
+                    active_budget_tokens,
+                    is_lean_main_batch,
+                    all(example.calibration for example in batch_examples),
+                )
+                try:
+                    encode_start = time.perf_counter()
+                    encoded = self.tokenize_examples(
+                        batch_examples,
+                        bucket_for_main=is_lean_main_batch,
+                        pad_batch_for_main=is_lean_main_batch and self.spec.collection.pad_main_batches_to_streaming_size,
+                    )
+                    logger.info(
+                        "batch_tokenized dataset=%s batch_index=%s seconds=%.3f padded_shape=%s real_batch=%s",
+                        dataset_name,
+                        batch_index,
+                        time.perf_counter() - encode_start,
+                        tuple(encoded["input_ids"].shape),
+                        encoded["real_batch_size"],
+                    )
+                    attempted_tokens_for_retry = int(encoded["input_ids"].shape[1])
+                    input_ids = encoded["input_ids"].to(self._model_input_device())
+                    attention_mask = encoded["attention_mask"].to(self._model_input_device())
+                    if adaptive_budget is not None and is_lean_main_batch:
+                        torch = import_torch()
+                        if hasattr(torch.cuda, "reset_peak_memory_stats"):
+                            torch.cuda.reset_peak_memory_stats(self._model_input_device())
+                    example_external = None if external_lookup is None else external_lookup[batch_examples[0].text_id]
+                    pass1_start = time.perf_counter()
+                    pass1_batched, propagate_hidden_states = self._run_pass(
+                        input_ids,
+                        attention_mask,
+                        calibration=all(example.calibration for example in batch_examples),
+                        pass_name="pass1",
+                        control_summary_mode=control_summary_mode,
+                        external_summary_by_layer=example_external,
+                    )
+                    logger.info(
+                        "batch_pass_done dataset=%s batch_index=%s pass=pass1 seconds=%.3f",
+                        dataset_name,
+                        batch_index,
+                        time.perf_counter() - pass1_start,
+                    )
+                    propagate_from_layer = int(self.spec.collection.propagate_from_layer)
+                    pass2_prefix_captures: dict[str, list[LayerCapture]] = {}
+                    for condition in (CaptureCondition.CAUSAL.value, CaptureCondition.LOCAL_PREPEND_CAUSAL_BASE.value):
+                        prefix_captures = [
+                            capture
+                            for capture in pass1_batched.captures_by_condition.get(condition, [])
+                            if capture.layer_idx < propagate_from_layer
+                        ]
+                        if prefix_captures:
+                            pass2_prefix_captures[condition] = prefix_captures
+                    pass2_start = time.perf_counter()
+                    pass2_batched, _ = self._run_pass(
+                        input_ids,
+                        attention_mask,
+                        calibration=all(example.calibration for example in batch_examples),
+                        pass_name="pass2",
+                        control_summary_mode=control_summary_mode,
+                        external_summary_by_layer=example_external,
+                        start_layer=propagate_from_layer,
+                        initial_hidden_states=propagate_hidden_states,
+                        initial_captures_by_condition=pass2_prefix_captures,
+                    )
+                    logger.info(
+                        "batch_pass_done dataset=%s batch_index=%s pass=pass2 seconds=%.3f",
+                        dataset_name,
+                        batch_index,
+                        time.perf_counter() - pass2_start,
+                    )
+                    postprocess_start = time.perf_counter()
+                    batch_multi_slot = {}
+                    calibration_examples = [example for example in batch_examples if example.calibration]
+                    if calibration_examples:
+                        for example, multi_slot in zip(calibration_examples, self.collect_multi_slot_summaries_batch(calibration_examples)):
+                            batch_multi_slot[example.text_id] = multi_slot
+                    needs_bundle_split = retain_bundles or not write_batches
+                    if needs_bundle_split:
+                        pass1_split = self._split_pass_capture(pass1_batched, batch_examples)
+                        pass2_split = self._split_pass_capture(pass2_batched, batch_examples)
+                    logger.info(
+                        "batch_postprocess_done dataset=%s batch_index=%s seconds=%.3f calibration_examples=%s split_bundles=%s",
+                        dataset_name,
+                        batch_index,
+                        time.perf_counter() - postprocess_start,
+                        len(calibration_examples),
+                        needs_bundle_split,
+                    )
+                    batch_bundles: list[ExampleCaptureBundle] = []
+                    if needs_bundle_split:
+                        for row_idx, example in enumerate(batch_examples):
+                            bundle = ExampleCaptureBundle(
+                                text_id=example.text_id,
+                                dataset_name=dataset_name,
+                                kind=example.kind,
+                                prompt=example.prompt,
+                                token_ids=list(example.prompt_token_ids or []),
+                                content_token_mask=list(example.content_token_mask or []),
+                                passes=[pass1_split[row_idx], pass2_split[row_idx]],
+                                metadata={"calibration": example.calibration, "tags": list(example.tags)},
+                            )
+                            if example.calibration:
+                                bundle.metadata["multi_slot_summaries"] = batch_multi_slot[example.text_id]
+                            batch_bundles.append(bundle)
+                    peak_reserved_bytes = 0
+                    if adaptive_budget is not None and is_lean_main_batch:
+                        torch = import_torch()
+                        if hasattr(torch.cuda, "max_memory_reserved"):
+                            peak_reserved_bytes = int(torch.cuda.max_memory_reserved(self._model_input_device()))
+                    batch_id = f"{dataset_name}_{control_summary_mode or 'main'}_{batch_index}_{len(batch_bundles) or len(batch_examples)}_{uuid.uuid4().hex[:8]}"
+                    transfer_event, staged_tensors, staged_groups, staged_bytes = self._finalize_transfer_session()
+                except Exception as exc:
+                    self._transfer_session = None
+                    if adaptive_budget is not None and is_lean_main_batch and self._is_cuda_oom(exc):
+                        previous_budget = adaptive_budget.current_budget
+                        new_budget = adaptive_budget.reduce_after_oom(
+                            attempted_batch_size=len(batch_examples),
+                            max_tokens=attempted_tokens_for_retry,
+                        )
+                        logger.warning(
+                            "adaptive_batch_budget_oom dataset=%s batch_index=%s previous_tokens=%s current_tokens=%s batch_size=%s max_tokens=%s",
+                            dataset_name,
+                            batch_index,
+                            previous_budget,
+                            new_budget,
+                            len(batch_examples),
+                            max_batch_tokens,
+                        )
+                        self._clear_cuda_after_oom()
+                        if new_budget >= previous_budget:
+                            raise
+                        batch_examples = self._take_batch_from_ordered(
+                            ordered_examples,
+                            cursor,
+                            max_batch_tokens=adaptive_budget.current_budget,
+                        )
+                        if not batch_examples:
+                            raise
+                        continue
+                    raise
+                if write_batches:
+                    extra_metadata = {
+                        "dataset_name": dataset_name,
+                        "control": control_summary_mode,
+                        "runtime_stack": getattr(self, "runtime_stack", {}),
+                        "model_contract": None if self.contract is None else self.contract.__dict__,
+                        "batch_index": batch_index,
+                        "batch_size": len(batch_examples),
+                    }
+                    if needs_bundle_split:
+                        path = self.writer.write_batch(
+                            batch_id,
+                            batch_bundles,
+                            extra_metadata=extra_metadata,
+                            target_subdir=target,
+                            transfer_event=transfer_event,
+                            staged_tensors=staged_tensors,
+                            staged_groups=staged_groups,
+                            staged_bytes=staged_bytes,
+                        )
+                    else:
+                        payload = build_batched_capture_payload(
+                            batch_id=batch_id,
+                            dataset_name=dataset_name,
+                            batch_examples=batch_examples,
+                            passes=[
+                                trim_pass_capture(pass1_batched, len(batch_examples)),
+                                trim_pass_capture(pass2_batched, len(batch_examples)),
+                            ],
+                            extra_metadata=extra_metadata,
+                            multi_slot_by_text_id=batch_multi_slot,
+                        )
+                        path = self.writer.write_payload(
+                            batch_id,
+                            payload,
+                            row_count=len(batch_examples),
+                            target_subdir=target,
+                            transfer_event=transfer_event,
+                            staged_tensors=staged_tensors,
+                            staged_groups=staged_groups,
+                            staged_bytes=staged_bytes,
+                        )
+                    path_list.append(path)
+                if not write_batches or retain_bundles:
+                    sync_start = time.perf_counter()
+                    if transfer_event is not None:
+                        transfer_event.synchronize()
+                    logger.info(
+                        "batch_transfer_synced dataset=%s batch_index=%s seconds=%.3f staged_tensors=%s staged_groups=%s staged_bytes=%s",
+                        dataset_name,
+                        batch_index,
+                        time.perf_counter() - sync_start,
+                        staged_tensors,
+                        staged_groups,
+                        staged_bytes,
+                    )
+                if retain_bundles:
+                    all_bundles.extend(batch_bundles)
+                if adaptive_budget is not None and is_lean_main_batch and peak_reserved_bytes > 0:
+                    update = adaptive_budget.observe_success(
+                        batch_size=len(batch_examples),
+                        max_tokens=attempted_tokens_for_retry,
+                        peak_reserved_bytes=peak_reserved_bytes,
+                    )
+                    if update is not None:
+                        updated_budget, reason = update
+                        logger.info(
+                            "adaptive_batch_budget_update dataset=%s batch_index=%s reason=%s current_tokens=%s peak_reserved_gib=%.2f batch_size=%s max_tokens=%s",
+                            dataset_name,
+                            batch_index,
+                            reason,
+                            updated_budget,
+                            peak_reserved_bytes / (1024**3),
+                            len(batch_examples),
+                            max_batch_tokens,
+                        )
+                logger.info(
+                    "batch_done dataset=%s batch_index=%s total_seconds=%.3f staged_tensors=%s staged_groups=%s staged_bytes=%s peak_reserved_gib=%.2f wrote_batch=%s",
+                    dataset_name,
+                    batch_index,
+                    time.perf_counter() - batch_start,
                     staged_tensors,
                     staged_groups,
                     staged_bytes,
+                    peak_reserved_bytes / (1024**3),
+                    write_batches,
                 )
-            if retain_bundles:
-                all_bundles.extend(batch_bundles)
-            logger.info(
-                "batch_done dataset=%s batch_index=%s total_seconds=%.3f staged_tensors=%s staged_groups=%s staged_bytes=%s wrote_batch=%s",
-                dataset_name,
-                batch_index,
-                time.perf_counter() - batch_start,
-                staged_tensors,
-                staged_groups,
-                staged_bytes,
-                write_batches,
-            )
+                break
+            cursor += len(batch_examples)
+            batch_index += 1
         logger.info(
             "collect_examples_done dataset=%s seconds=%.3f wrote_batches=%s retained_bundles=%s",
             dataset_name,
