@@ -10,7 +10,7 @@ THREE_TASKS = ["scifact", "fiqa2018", "quoraretrieval"]
 MAIN_DENSE_LAYERS = [15, 23, 31, 39, 47]
 MAIN_ROUTER_LAYERS = list(range(48))
 MAIN_VALUE_LAYERS = list(range(48))
-MAIN_SIGNALS = ["attention_output", "v_raw", "router_logits", "top_k_binary"]
+MAIN_SIGNALS = ["attention_output", "v_raw", "router_logits", "top_k_binary", "final_hidden_state"]
 
 
 def _clone_spec(spec: ExperimentSpec) -> ExperimentSpec:

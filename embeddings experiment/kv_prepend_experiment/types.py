@@ -43,6 +43,7 @@ class PassCapture:
     pass_name: str
     rope_mode: str
     captures_by_condition: dict[str, list[LayerCapture]] = field(default_factory=dict)
+    shared_tensors: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

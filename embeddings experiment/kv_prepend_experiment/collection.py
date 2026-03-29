@@ -514,6 +514,11 @@ class InstrumentedQwen3MoeExperiment:
     def _main_capture_signal_set(self) -> set[str]:
         return self._main_capture_signals
 
+    def _shared_signal_enabled(self, signal_name: str, calibration: bool) -> bool:
+        if calibration:
+            return True
+        return signal_name in self._main_capture_signal_set()
+
     def _signal_enabled_for_layer(self, signal_name: str, layer_idx: int, calibration: bool) -> bool:
         if calibration:
             return True
@@ -1385,12 +1390,24 @@ class InstrumentedQwen3MoeExperiment:
                     captures_by_condition.setdefault(condition, []).append(capture)
                 if propagate_hidden_states is None and layer_idx + 1 == propagate_start:
                     propagate_hidden_states = hidden_states
+            shared_tensors: dict[str, Any] = {}
+            if self._shared_signal_enabled("final_hidden_state", calibration):
+                final_hidden_state = model_core.norm(hidden_states)
+                shared_tensors = self._stage_tensor_group(
+                    {
+                        "final_hidden_state": (
+                            final_hidden_state,
+                            _storage_dtype("final_hidden_state", calibration),
+                        )
+                    }
+                )
 
             return (
                 PassCapture(
                     pass_name=pass_name,
                     rope_mode=self.spec.collection.default_rope_mode,
                     captures_by_condition=captures_by_condition,
+                    shared_tensors=shared_tensors,
                 ),
                 propagate_hidden_states,
             )

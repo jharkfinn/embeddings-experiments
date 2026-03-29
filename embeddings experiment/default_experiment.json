@@ -134,7 +134,8 @@
       "attention_output",
       "v_raw",
       "router_logits",
-      "top_k_binary"
+      "top_k_binary",
+      "final_hidden_state"
     ],
     "max_batch_tokens": 8192,
     "multi_slot_decode_steps": 3,

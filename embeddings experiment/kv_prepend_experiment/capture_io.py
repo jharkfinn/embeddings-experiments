@@ -47,7 +47,15 @@ def _trim_sequence_value(value, role: str, max_seq_len: int):
     except ModuleNotFoundError:  # pragma: no cover
         return value
 
-    if role in {"resid_pre_attn", "z_attn", "h_pre_moe", "router_logits_pre_softmax", "top_k_indices", "position_ids"}:
+    if role in {
+        "resid_pre_attn",
+        "z_attn",
+        "h_pre_moe",
+        "router_logits_pre_softmax",
+        "top_k_indices",
+        "position_ids",
+        "final_hidden_state",
+    }:
         if value.ndim >= 2 and value.shape[1] > max_seq_len:
             return value[:, :max_seq_len, ...].clone()
         return value
@@ -164,11 +172,15 @@ def split_pass_capture(pass_capture: PassCapture, batch_size: int) -> list[PassC
         captures_by_condition: dict[str, list[LayerCapture]] = {}
         for condition, captures in pass_capture.captures_by_condition.items():
             captures_by_condition[condition] = [slice_layer_capture(capture, row_idx, batch_size) for capture in captures]
+        shared_tensors = {
+            name: _slice_batch_value(value, row_idx, batch_size) for name, value in pass_capture.shared_tensors.items()
+        }
         outputs.append(
             PassCapture(
                 pass_name=pass_capture.pass_name,
                 rope_mode=pass_capture.rope_mode,
                 captures_by_condition=captures_by_condition,
+                shared_tensors=shared_tensors,
             )
         )
     return outputs
@@ -178,10 +190,12 @@ def trim_pass_capture(pass_capture: PassCapture, batch_size: int) -> PassCapture
     captures_by_condition: dict[str, list[LayerCapture]] = {}
     for condition, captures in pass_capture.captures_by_condition.items():
         captures_by_condition[condition] = [trim_layer_capture(capture, batch_size) for capture in captures]
+    shared_tensors = {name: _trim_batch_value(value, batch_size) for name, value in pass_capture.shared_tensors.items()}
     return PassCapture(
         pass_name=pass_capture.pass_name,
         rope_mode=pass_capture.rope_mode,
         captures_by_condition=captures_by_condition,
+        shared_tensors=shared_tensors,
     )
 
 
@@ -191,10 +205,16 @@ def trim_pass_capture_for_storage(pass_capture: PassCapture, batch_size: int, ma
         captures_by_condition[condition] = [
             trim_layer_capture_for_storage(capture, batch_size, max_seq_len=max_seq_len) for capture in captures
         ]
+    shared_tensors = {name: _trim_batch_value(value, batch_size) for name, value in pass_capture.shared_tensors.items()}
+    if max_seq_len is not None:
+        shared_tensors = {
+            name: _trim_sequence_value(value, name, max_seq_len) for name, value in shared_tensors.items()
+        }
     return PassCapture(
         pass_name=pass_capture.pass_name,
         rope_mode=pass_capture.rope_mode,
         captures_by_condition=captures_by_condition,
+        shared_tensors=shared_tensors,
     )
 
 
@@ -248,6 +268,7 @@ def serialize_pass_capture(pass_capture: PassCapture) -> dict[str, Any]:
             condition: [serialize_layer_capture(capture) for capture in captures]
             for condition, captures in pass_capture.captures_by_condition.items()
         },
+        "shared_tensors": dict(pass_capture.shared_tensors),
     }
 
 
@@ -259,6 +280,7 @@ def deserialize_pass_capture(payload: dict[str, Any]) -> PassCapture:
             str(condition): [deserialize_layer_capture(capture) for capture in captures]
             for condition, captures in payload.get("captures_by_condition", {}).items()
         },
+        shared_tensors=dict(payload.get("shared_tensors", {})),
     )
 
 
@@ -316,11 +338,15 @@ def iter_payload_bundles(payload: dict[str, Any]):
             captures_by_condition: dict[str, list[LayerCapture]] = {}
             for condition, captures in pass_capture.captures_by_condition.items():
                 captures_by_condition[condition] = [slice_layer_capture(capture, row_idx, batch_size) for capture in captures]
+            shared_tensors = {
+                name: _slice_batch_value(value, row_idx, batch_size) for name, value in pass_capture.shared_tensors.items()
+            }
             passes.append(
                 PassCapture(
                     pass_name=pass_capture.pass_name,
                     rope_mode=pass_capture.rope_mode,
                     captures_by_condition=captures_by_condition,
+                    shared_tensors=shared_tensors,
                 )
             )
         yield ExampleCaptureBundle(
