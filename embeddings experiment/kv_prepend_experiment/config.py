@@ -46,7 +46,7 @@ class CollectionSpec:
     adaptive_gpu_reserve_gib: float = 2.0
     sequence_length_buckets: list[int] = field(default_factory=lambda: [128, 256, 384, 512, 768, 1024, 1536, 2048])
     pad_main_batches_to_streaming_size: bool = True
-    attention_backend: str = "flex_packed"
+    attention_backend: str = "hybrid"
     enable_attention_compile: bool = True
     attention_compile_mode: str = "default"
     attention_compile_fullgraph: bool = False

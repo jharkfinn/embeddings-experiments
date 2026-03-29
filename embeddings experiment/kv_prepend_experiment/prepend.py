@@ -33,6 +33,7 @@ def configure_attention_runtime(
     _ATTENTION_BACKEND = str(backend)
     _get_plain_sdpa_kernel.cache_clear()
     _get_prepend_sdpa_kernel.cache_clear()
+    _get_flex_packed_kernel.cache_clear()
 
 
 def configure_attention_compile(*, enabled: bool, mode: str = "default", fullgraph: bool = False):
@@ -362,6 +363,8 @@ def attention_forward(
     else:
         compile_enabled = bool(_ATTENTION_COMPILE_ENABLED and query_states.is_cuda)
         backend = _ATTENTION_BACKEND
+        if backend == "hybrid":
+            backend = "sdpa" if prepend_mode is None else "flex_packed"
         if backend == "flex_packed":
             if token_counts is None:
                 raise RuntimeError("flex_packed attention backend requires token_counts.")

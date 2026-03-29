@@ -1307,7 +1307,7 @@ class InstrumentedQwen3MoeExperiment:
             position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1)
             token_counts = attention_mask.sum(dim=1).to(device=hidden_states.device, dtype=torch.int32)
             uses_dense_attention_mask = bool(
-                calibration or self.spec.collection.attention_backend == "sdpa"
+                calibration or self.spec.collection.attention_backend in {"sdpa", "hybrid"}
             )
             causal_mask = (
                 _causal_attention_mask(

@@ -12,7 +12,7 @@
     "bias_sweep_points": 51,
     "bridge_storage_mode": "summary_only",
     "calibration_subset_size": 0,
-    "attention_backend": "flex_packed",
+    "attention_backend": "hybrid",
     "adaptive_gpu_reserve_gib": 2.0,
     "adaptive_max_batch_tokens": true,
     "adaptive_target_gpu_utilization": 0.9,

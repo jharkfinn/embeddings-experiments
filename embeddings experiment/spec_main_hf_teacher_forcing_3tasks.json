@@ -1,6 +1,6 @@
 {
   "collection": {
-    "attention_backend": "flex_packed",
+    "attention_backend": "hybrid",
     "attention_compile_fullgraph": false,
     "attention_compile_mode": "default",
     "adaptive_gpu_reserve_gib": 2.0,
