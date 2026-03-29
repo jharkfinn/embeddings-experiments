@@ -900,7 +900,13 @@ def evaluate_latest_main(
                     router_layers=list(spec.collection.main_router_layers),
                     value_layers=list(spec.collection.main_value_layers),
                     top_k=spec.evaluation.top_k,
+                    candidate_pool_k=spec.evaluation.candidate_pool_k,
                     progress_callback=progress_update,
+                    prompt_spec=spec.prompts,
+                    model_name=spec.model.model_name,
+                    tokenizer_name=spec.model.tokenizer_name,
+                    trust_remote_code=spec.model.trust_remote_code,
+                    max_length=spec.model.max_length,
                 )
                 save_json(output_path, results)
         except BaseException as exc:

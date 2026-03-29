@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 
 from .nano_beir import build_synthetic_late_evidence_task, load_nanobeir_task
+from .prompts import prompt_affixes
 from .quantization import (
     cosine_similarity,
     fit_trinary_thresholds,
@@ -90,6 +91,29 @@ def _has_layer_capture(bundle: ExampleCaptureBundle, pass_name: str, condition: 
         return True
     except KeyError:
         return False
+
+
+def _available_signal_layer_indices(
+    bundle: ExampleCaptureBundle,
+    *,
+    pass_name: str,
+    condition: str,
+    signal_name: str,
+    layer_indices: list[int],
+) -> list[int]:
+    if signal_name == "final_hidden_state":
+        return []
+    available: list[int] = []
+    for layer_idx in layer_indices:
+        try:
+            if signal_name == "value_vectors":
+                _resolve_v_raw_capture(bundle, pass_name, condition, layer_idx)
+            else:
+                _find_layer_capture(bundle, pass_name, condition, layer_idx)
+        except KeyError:
+            continue
+        available.append(layer_idx)
+    return available
 
 
 def _topk_to_indicator(top_k_tensor, num_experts: int = 128):
@@ -649,8 +673,82 @@ def save_json(path: str | Path, payload: dict[str, Any]):
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def _resolve_bundle_task_names(bundle: ExampleCaptureBundle, tasks: dict[str, RetrievalTask]) -> list[str]:
-    dataset_name = (bundle.dataset_name or "").lower()
+def _doc_text(row: dict[str, Any]) -> str:
+    title = str(row.get("title", "")).strip()
+    text = str(row.get("text", "")).strip()
+    if title and text:
+        return f"{title}\n\n{text}"
+    return title or text
+
+
+def _build_task_signature_lookup(
+    *,
+    tasks: dict[str, RetrievalTask],
+    prompt_spec,
+    model_name: str,
+    tokenizer_name: str | None,
+    trust_remote_code: bool,
+    max_length: int,
+) -> dict[tuple[str, str, str], tuple[int, int]]:
+    try:
+        from transformers import AutoTokenizer
+    except ModuleNotFoundError:  # pragma: no cover - optional env
+        return {}
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name or model_name,
+        trust_remote_code=trust_remote_code,
+    )
+    affix_cache: dict[str, tuple[int, int]] = {}
+
+    def signature_for(kind: str, text: str) -> tuple[int, int]:
+        if kind not in affix_cache:
+            prefix, suffix = prompt_affixes(kind, prompt_spec)
+            prefix_ids = tokenizer(prefix, add_special_tokens=False)["input_ids"]
+            suffix_ids = tokenizer(suffix, add_special_tokens=False)["input_ids"]
+            affix_cache[kind] = (len(prefix_ids), len(suffix_ids))
+        prefix_len, suffix_len = affix_cache[kind]
+        text_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        max_text_tokens = max(0, int(max_length) - prefix_len - suffix_len)
+        content_len = min(len(text_ids), max_text_tokens)
+        return prefix_len + content_len + suffix_len, content_len
+
+    membership: dict[tuple[str, str], list[str]] = {}
+    for task_name, task in tasks.items():
+        for doc_id in task.corpus:
+            membership.setdefault(("doc", str(doc_id)), []).append(task_name)
+        for query_id in task.queries:
+            membership.setdefault(("query", str(query_id)), []).append(task_name)
+
+    ambiguous_keys = {key for key, matches in membership.items() if len(matches) > 1}
+    if not ambiguous_keys:
+        return {}
+
+    lookup: dict[tuple[str, str, str], tuple[int, int]] = {}
+    for kind, text_id in ambiguous_keys:
+        for task_name in membership[(kind, text_id)]:
+            task = tasks[task_name]
+            if kind == "doc":
+                text = _doc_text(task.corpus[text_id])
+            else:
+                text = str(task.queries[text_id])
+            lookup[(kind, text_id, task_name)] = signature_for(kind, text)
+    return lookup
+
+
+def _bundle_token_signature(bundle: ExampleCaptureBundle) -> tuple[int, int]:
+    mask = list(bundle.content_token_mask or [])
+    return len(mask), int(sum(1 for item in mask if int(item) != 0))
+
+
+def _resolve_bundle_task_names(
+    bundle: ExampleCaptureBundle,
+    tasks: dict[str, RetrievalTask],
+    *,
+    task_signature_lookup: dict[tuple[str, str, str], tuple[int, int]] | None = None,
+) -> list[str]:
+    metadata_dataset = bundle.metadata.get("dataset_name") if isinstance(bundle.metadata, dict) else None
+    dataset_name = (bundle.dataset_name or metadata_dataset or "").lower()
     if dataset_name in tasks:
         return [dataset_name]
     matches = []
@@ -661,6 +759,15 @@ def _resolve_bundle_task_names(bundle: ExampleCaptureBundle, tasks: dict[str, Re
             matches.append(task_name)
     if len(matches) == 1:
         return matches
+    if len(matches) > 1 and task_signature_lookup:
+        signature = _bundle_token_signature(bundle)
+        narrowed = [
+            task_name
+            for task_name in matches
+            if task_signature_lookup.get((bundle.kind, bundle.text_id, task_name)) == signature
+        ]
+        if len(narrowed) == 1:
+            return narrowed
     return []
 
 
@@ -674,7 +781,13 @@ def evaluate_main_feature_scoreboard(
     router_layers: list[int],
     value_layers: list[int],
     top_k: int = 10,
+    candidate_pool_k: int = 100,
     progress_callback: callable | None = None,
+    prompt_spec=None,
+    model_name: str = "",
+    tokenizer_name: str | None = None,
+    trust_remote_code: bool = True,
+    max_length: int = 2048,
 ):
     feature_specs = [
         {
@@ -754,6 +867,18 @@ def evaluate_main_feature_scoreboard(
         f"{spec['signal_name']}__{spec['pass_name']}__{spec['condition']}" for spec in feature_specs
     ]
     tasks = {name: load_nanobeir_task(repo_name, name) for name in task_names}
+    task_signature_lookup = (
+        _build_task_signature_lookup(
+            tasks=tasks,
+            prompt_spec=prompt_spec,
+            model_name=model_name,
+            tokenizer_name=tokenizer_name,
+            trust_remote_code=trust_remote_code,
+            max_length=max_length,
+        )
+        if prompt_spec is not None and model_name
+        else {}
+    )
     state: dict[str, Any] = {}
     for task_name, task in tasks.items():
         state[task_name] = {
@@ -763,6 +888,7 @@ def evaluate_main_feature_scoreboard(
                 feature_key: {
                     "doc_vectors": {},
                     "query_vectors": {},
+                    "query_tokens": {},
                 }
                 for feature_key in feature_keys
             },
@@ -770,10 +896,28 @@ def evaluate_main_feature_scoreboard(
 
     processed_bundles = 0
     unmatched_bundles = 0
+    unmatched_samples: list[dict[str, Any]] = []
     for bundle in iter_bundles(capture_dir):
-        task_names_for_bundle = _resolve_bundle_task_names(bundle, tasks)
+        task_names_for_bundle = _resolve_bundle_task_names(
+            bundle,
+            tasks,
+            task_signature_lookup=task_signature_lookup,
+        )
         if not task_names_for_bundle:
             unmatched_bundles += 1
+            if len(unmatched_samples) < 20:
+                unmatched_samples.append(
+                    {
+                        "kind": bundle.kind,
+                        "text_id": bundle.text_id,
+                        "dataset_name": bundle.dataset_name,
+                        "metadata_dataset_name": (
+                            bundle.metadata.get("dataset_name") if isinstance(bundle.metadata, dict) else None
+                        ),
+                        "mask_len": len(bundle.content_token_mask or []),
+                        "content_len": int(sum(1 for item in (bundle.content_token_mask or []) if int(item) != 0)),
+                    }
+                )
             continue
         processed_bundles += 1
         if progress_callback is not None and processed_bundles % 100 == 0:
@@ -800,13 +944,22 @@ def evaluate_main_feature_scoreboard(
             task_state["routed_bundles"] += 1
             for spec in feature_specs:
                 feature_key = f"{spec['signal_name']}__{spec['pass_name']}__{spec['condition']}"
+                layer_indices = _available_signal_layer_indices(
+                    bundle,
+                    pass_name=spec["pass_name"],
+                    condition=spec["condition"],
+                    signal_name=spec["signal_name"],
+                    layer_indices=spec["layer_indices"],
+                )
+                if spec["signal_name"] != "final_hidden_state" and not layer_indices:
+                    continue
                 try:
                     raw_tokens = _raw_signal_tokens(
                         bundle,
                         pass_name=spec["pass_name"],
                         condition=spec["condition"],
                         signal_name=spec["signal_name"],
-                        layer_indices=spec["layer_indices"],
+                        layer_indices=layer_indices,
                     )
                 except KeyError:
                     continue
@@ -814,13 +967,23 @@ def evaluate_main_feature_scoreboard(
                     continue
                 pooled = mean_pool_float(raw_tokens).astype(np.float32, copy=False)
                 task_state["features"][feature_key][target_name][bundle.text_id] = pooled
+                if target_name == "query_vectors":
+                    task_state["features"][feature_key]["query_tokens"][bundle.text_id] = raw_tokens.astype(
+                        np.float32, copy=False
+                    )
 
     results: dict[str, Any] = {
-        "evaluation_mode": "main_feature_scoreboard_v1",
+        "evaluation_mode": "main_feature_scoreboard_v2",
         "top_k": int(top_k),
+        "candidate_pool_k": int(candidate_pool_k),
         "processed_bundles": processed_bundles,
         "unmatched_bundles": unmatched_bundles,
+        "unmatched_samples": unmatched_samples,
         "tasks": {},
+    }
+    multivector_candidates: dict[str, dict[str, dict[str, list[str]]]] = {
+        feature_key: {task_name: {} for task_name in task_names}
+        for feature_key in feature_keys
     }
     for task_index, task_name in enumerate(task_names, start=1):
         task = tasks[task_name]
@@ -881,10 +1044,14 @@ def evaluate_main_feature_scoreboard(
             }
             float_scores = score_single_vector(query_vectors, doc_vectors)
             trinary_scores = score_single_vector(query_trinary, doc_trinary)
+            for query_id, ranked in float_scores.items():
+                top_docs = sorted(ranked.items(), key=lambda item: item[1], reverse=True)[:candidate_pool_k]
+                multivector_candidates[feature_key][task_name][query_id] = [doc_id for doc_id, _ in top_docs]
             result_row.update(
                 {
                     "float_single_vector_ndcg_at_10": ndcg_at_k(float_scores, task.qrels, k=top_k),
                     "trinary_single_vector_ndcg_at_10": ndcg_at_k(trinary_scores, task.qrels, k=top_k),
+                    "multivector_candidate_pool_k": int(candidate_pool_k),
                 }
             )
             task_results["features"][feature_key] = result_row
@@ -896,6 +1063,129 @@ def evaluate_main_feature_scoreboard(
                     "completed_tasks": task_index,
                     "total_tasks": len(task_names),
                     "last_task": task_name,
+                }
+            )
+
+    for feature_index, spec in enumerate(feature_specs, start=1):
+        feature_key = f"{spec['signal_name']}__{spec['pass_name']}__{spec['condition']}"
+        candidate_doc_ids_by_task = {
+            task_name: {
+                doc_id
+                for candidate_doc_ids in candidate_lookup.values()
+                for doc_id in candidate_doc_ids
+            }
+            for task_name, candidate_lookup in multivector_candidates[feature_key].items()
+            if candidate_lookup
+        }
+        if not candidate_doc_ids_by_task:
+            continue
+        raw_state: dict[str, dict[str, dict[str, np.ndarray]]] = {
+            task_name: {"doc_tokens": {}, "query_tokens": {}}
+            for task_name in task_names
+        }
+        for bundle in iter_bundles(capture_dir):
+            task_names_for_bundle = _resolve_bundle_task_names(
+                bundle,
+                tasks,
+                task_signature_lookup=task_signature_lookup,
+            )
+            if not task_names_for_bundle:
+                continue
+            layer_indices = _available_signal_layer_indices(
+                bundle,
+                pass_name=spec["pass_name"],
+                condition=spec["condition"],
+                signal_name=spec["signal_name"],
+                layer_indices=spec["layer_indices"],
+            )
+            if spec["signal_name"] != "final_hidden_state" and not layer_indices:
+                continue
+            for task_name in task_names_for_bundle:
+                task = tasks[task_name]
+                if bundle.kind == "doc":
+                    if bundle.text_id not in candidate_doc_ids_by_task.get(task_name, set()):
+                        continue
+                    target = raw_state[task_name]["doc_tokens"]
+                elif bundle.kind == "query":
+                    if bundle.text_id not in task.queries:
+                        continue
+                    target = raw_state[task_name]["query_tokens"]
+                else:
+                    continue
+                if bundle.text_id in target:
+                    continue
+                try:
+                    raw_tokens = _raw_signal_tokens(
+                        bundle,
+                        pass_name=spec["pass_name"],
+                        condition=spec["condition"],
+                        signal_name=spec["signal_name"],
+                        layer_indices=layer_indices,
+                    )
+                except KeyError:
+                    continue
+                if raw_tokens.size == 0:
+                    continue
+                target[bundle.text_id] = raw_tokens.astype(np.float32, copy=False)
+        for task_name in task_names:
+            task = tasks[task_name]
+            row = results["tasks"][task_name]["features"].get(feature_key)
+            if not row or row.get("skipped"):
+                continue
+            doc_tokens = raw_state[task_name]["doc_tokens"]
+            query_tokens = raw_state[task_name]["query_tokens"]
+            candidate_lookup = multivector_candidates[feature_key].get(task_name, {})
+            if not doc_tokens or not query_tokens:
+                row["float_multivector_candidate_rerank_ndcg_at_10"] = 0.0
+                row["multivector_scoring_mode"] = "candidate_rerank_from_float_single_vector"
+                continue
+            float_multi_scores: dict[str, dict[str, float]] = {}
+            scored_pairs = 0
+            for query_id, candidate_doc_ids in candidate_lookup.items():
+                query_token_vectors = query_tokens.get(query_id)
+                if query_token_vectors is None:
+                    continue
+                candidate_doc_tokens = {
+                    doc_id: doc_tokens[doc_id]
+                    for doc_id in candidate_doc_ids
+                    if doc_id in doc_tokens
+                }
+                if not candidate_doc_tokens:
+                    continue
+                float_multi_scores[query_id] = {
+                    doc_id: maxsim(query_token_vectors, candidate_token_vectors)
+                    for doc_id, candidate_token_vectors in candidate_doc_tokens.items()
+                }
+                scored_pairs += len(float_multi_scores[query_id])
+            row["float_multivector_candidate_rerank_ndcg_at_10"] = ndcg_at_k(
+                float_multi_scores,
+                task.qrels,
+                k=top_k,
+            )
+            row["multivector_scoring_mode"] = "candidate_rerank_from_float_single_vector"
+            row["multivector_doc_count"] = len(doc_tokens)
+            row["multivector_query_count"] = len(query_tokens)
+            row["multivector_scored_pairs"] = int(scored_pairs)
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "stage": "evaluation_multivector_task",
+                        "completed_features": feature_index,
+                        "total_features": len(feature_specs),
+                        "last_feature": feature_key,
+                        "task_name": task_name,
+                        "multivector_doc_count": len(doc_tokens),
+                        "multivector_query_count": len(query_tokens),
+                        "multivector_scored_pairs": int(scored_pairs),
+                    }
+                )
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "stage": "evaluation_multivector",
+                    "completed_features": feature_index,
+                    "total_features": len(feature_specs),
+                    "last_feature": feature_key,
                 }
             )
     return results

@@ -1573,6 +1573,18 @@ class InstrumentedQwen3MoeExperiment:
         if self._restrict_to_calibration_subset():
             examples = [example for example in examples if example.calibration]
             logger.info("collect_examples_restricted_to_calibration_subset dataset=%s examples=%s", dataset_name, len(examples))
+        unique_example_datasets = sorted({example.dataset_name for example in examples if example.dataset_name})
+        missing_example_dataset_count = sum(1 for example in examples if not example.dataset_name)
+        logger.info(
+            "collect_examples_dataset_labels dataset=%s unique_example_datasets=%s missing_example_dataset_count=%s",
+            dataset_name,
+            unique_example_datasets,
+            missing_example_dataset_count,
+        )
+        if len(unique_example_datasets) > 1 and missing_example_dataset_count:
+            raise ValueError(
+                "Mixed-dataset collection requires per-example dataset_name for every record."
+            )
         self.annotate_examples(examples)
         path_list: list[Path] = []
         all_bundles: list[ExampleCaptureBundle] = []
@@ -1747,13 +1759,17 @@ class InstrumentedQwen3MoeExperiment:
                         for row_idx, example in enumerate(batch_examples):
                             bundle = ExampleCaptureBundle(
                                 text_id=example.text_id,
-                                dataset_name=dataset_name,
+                                dataset_name=example.dataset_name or dataset_name,
                                 kind=example.kind,
                                 prompt=example.prompt,
                                 token_ids=list(example.prompt_token_ids or []),
                                 content_token_mask=list(example.content_token_mask or []),
                                 passes=[pass1_split[row_idx], pass2_split[row_idx]],
-                                metadata={"calibration": example.calibration, "tags": list(example.tags)},
+                                metadata={
+                                    "calibration": example.calibration,
+                                    "tags": list(example.tags),
+                                    "dataset_name": example.dataset_name or dataset_name,
+                                },
                             )
                             if example.calibration:
                                 bundle.metadata["multi_slot_summaries"] = batch_multi_slot[example.text_id]

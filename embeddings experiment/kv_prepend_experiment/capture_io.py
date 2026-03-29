@@ -301,11 +301,13 @@ def build_batched_capture_payload(
         metadata = {"calibration": example.calibration, "tags": list(example.tags)}
         if example.calibration and example.text_id in multi_slot_by_text_id:
             metadata["multi_slot_summaries"] = multi_slot_by_text_id[example.text_id]
+        example_dataset_name = example.dataset_name if example.dataset_name is not None else dataset_name
+        metadata["dataset_name"] = example_dataset_name
         examples_payload.append(
             {
                 "text_id": example.text_id,
                 "kind": example.kind,
-                **({"dataset_name": example.dataset_name} if example.dataset_name else {}),
+                "dataset_name": example_dataset_name,
                 "content_token_mask": list(example.content_token_mask or []),
                 "metadata": metadata,
                 **({"prompt": example.prompt} if include_prompt_text else {}),
