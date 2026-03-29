@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .analysis import summarize_bundles
-from .capture_io import build_batched_capture_payload, slice_batch_value, split_pass_capture, trim_pass_capture
+from .capture_io import build_batched_capture_payload, slice_batch_value, split_pass_capture, trim_pass_capture_for_storage
 from .config import ExperimentSpec
 from .prepend import (
     apply_rotary_pos_emb,
@@ -1784,16 +1784,29 @@ class InstrumentedQwen3MoeExperiment:
                             staged_bytes=staged_bytes,
                         )
                     else:
+                        storage_seq_len = None
+                        if bool(self.spec.collection.trim_stored_sequence_length):
+                            storage_seq_len = max(int(example.token_count or 0) for example in batch_examples)
                         payload = build_batched_capture_payload(
                             batch_id=batch_id,
                             dataset_name=dataset_name,
                             batch_examples=batch_examples,
                             passes=[
-                                trim_pass_capture(pass1_batched, len(batch_examples)),
-                                trim_pass_capture(pass2_batched, len(batch_examples)),
+                                trim_pass_capture_for_storage(
+                                    pass1_batched,
+                                    len(batch_examples),
+                                    max_seq_len=storage_seq_len,
+                                ),
+                                trim_pass_capture_for_storage(
+                                    pass2_batched,
+                                    len(batch_examples),
+                                    max_seq_len=storage_seq_len,
+                                ),
                             ],
                             extra_metadata=extra_metadata,
                             multi_slot_by_text_id=batch_multi_slot,
+                            include_prompt_text=bool(self.spec.collection.store_prompt_text_in_payload),
+                            include_token_ids=bool(self.spec.collection.store_token_ids_in_payload),
                         )
                         path = self.writer.write_payload(
                             batch_id,

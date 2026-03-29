@@ -30,9 +30,45 @@ def _trim_batch_value(value, batch_size: int):
         import torch
 
         if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] > batch_size:
-            return value[:batch_size]
+            return value[:batch_size].clone()
     except ModuleNotFoundError:  # pragma: no cover
         pass
+    return value
+
+
+def _trim_sequence_value(value, role: str, max_seq_len: int):
+    if value is None or max_seq_len <= 0:
+        return value
+    try:
+        import torch
+
+        if not isinstance(value, torch.Tensor):
+            return value
+    except ModuleNotFoundError:  # pragma: no cover
+        return value
+
+    if role in {"resid_pre_attn", "z_attn", "h_pre_moe", "router_logits_pre_softmax", "top_k_indices", "position_ids"}:
+        if value.ndim >= 2 and value.shape[1] > max_seq_len:
+            return value[:, :max_seq_len, ...].clone()
+        return value
+    if role in {"q_pre_rope", "v_raw"}:
+        if value.ndim >= 3 and value.shape[2] > max_seq_len:
+            return value[:, :, :max_seq_len, ...].clone()
+        return value
+    if role == "beta":
+        if value.ndim >= 3 and value.shape[2] > max_seq_len:
+            return value[:, :, :max_seq_len, ...].clone()
+        if value.ndim >= 2 and value.shape[1] > max_seq_len:
+            return value[:, :max_seq_len, ...].clone()
+        return value
+    if role == "attention_weights":
+        if value.ndim >= 4:
+            extra_k = max(0, int(value.shape[3]) - int(value.shape[2]))
+            key_len = min(int(value.shape[3]), max_seq_len + extra_k)
+            if value.shape[2] > max_seq_len or value.shape[3] > key_len:
+                return value[:, :, :max_seq_len, :key_len].clone()
+            return value
+        return value
     return value
 
 
@@ -96,6 +132,32 @@ def trim_layer_capture(capture: LayerCapture, batch_size: int) -> LayerCapture:
     )
 
 
+def trim_layer_capture_for_storage(capture: LayerCapture, batch_size: int, max_seq_len: int | None = None) -> LayerCapture:
+    trimmed = trim_layer_capture(capture, batch_size)
+    if max_seq_len is None:
+        return trimmed
+    return LayerCapture(
+        layer_idx=trimmed.layer_idx,
+        condition=trimmed.condition,
+        resid_pre_attn=_trim_sequence_value(trimmed.resid_pre_attn, "resid_pre_attn", max_seq_len),
+        q_pre_rope=_trim_sequence_value(trimmed.q_pre_rope, "q_pre_rope", max_seq_len),
+        v_raw=_trim_sequence_value(trimmed.v_raw, "v_raw", max_seq_len),
+        attention_weights=_trim_sequence_value(trimmed.attention_weights, "attention_weights", max_seq_len),
+        beta=_trim_sequence_value(trimmed.beta, "beta", max_seq_len),
+        z_attn=_trim_sequence_value(trimmed.z_attn, "z_attn", max_seq_len),
+        h_pre_moe=_trim_sequence_value(trimmed.h_pre_moe, "h_pre_moe", max_seq_len),
+        router_logits_pre_softmax=_trim_sequence_value(
+            trimmed.router_logits_pre_softmax, "router_logits_pre_softmax", max_seq_len
+        ),
+        top_k_indices=_trim_sequence_value(trimmed.top_k_indices, "top_k_indices", max_seq_len),
+        final_token_k_rot=trimmed.final_token_k_rot,
+        final_token_v=trimmed.final_token_v,
+        final_token_k_raw=trimmed.final_token_k_raw,
+        position_ids=_trim_sequence_value(trimmed.position_ids, "position_ids", max_seq_len),
+        metadata=trimmed.metadata,
+    )
+
+
 def split_pass_capture(pass_capture: PassCapture, batch_size: int) -> list[PassCapture]:
     outputs: list[PassCapture] = []
     for row_idx in range(batch_size):
@@ -116,6 +178,19 @@ def trim_pass_capture(pass_capture: PassCapture, batch_size: int) -> PassCapture
     captures_by_condition: dict[str, list[LayerCapture]] = {}
     for condition, captures in pass_capture.captures_by_condition.items():
         captures_by_condition[condition] = [trim_layer_capture(capture, batch_size) for capture in captures]
+    return PassCapture(
+        pass_name=pass_capture.pass_name,
+        rope_mode=pass_capture.rope_mode,
+        captures_by_condition=captures_by_condition,
+    )
+
+
+def trim_pass_capture_for_storage(pass_capture: PassCapture, batch_size: int, max_seq_len: int | None = None) -> PassCapture:
+    captures_by_condition: dict[str, list[LayerCapture]] = {}
+    for condition, captures in pass_capture.captures_by_condition.items():
+        captures_by_condition[condition] = [
+            trim_layer_capture_for_storage(capture, batch_size, max_seq_len=max_seq_len) for capture in captures
+        ]
     return PassCapture(
         pass_name=pass_capture.pass_name,
         rope_mode=pass_capture.rope_mode,
@@ -195,6 +270,8 @@ def build_batched_capture_payload(
     passes: list[PassCapture],
     extra_metadata: dict[str, Any] | None = None,
     multi_slot_by_text_id: dict[str, Any] | None = None,
+    include_prompt_text: bool = True,
+    include_token_ids: bool = True,
 ) -> dict[str, Any]:
     examples_payload = []
     multi_slot_by_text_id = multi_slot_by_text_id or {}
@@ -205,18 +282,17 @@ def build_batched_capture_payload(
         examples_payload.append(
             {
                 "text_id": example.text_id,
-                "dataset_name": dataset_name,
                 "kind": example.kind,
-                "prompt": example.prompt,
-                "token_ids": list(example.prompt_token_ids or []),
                 "content_token_mask": list(example.content_token_mask or []),
                 "metadata": metadata,
+                **({"prompt": example.prompt} if include_prompt_text else {}),
+                **({"token_ids": list(example.prompt_token_ids or [])} if include_token_ids else {}),
             }
         )
     return {
         "schema_version": 3,
         "batch_id": batch_id,
-        "metadata": extra_metadata or {},
+        "metadata": {"dataset_name": dataset_name, **(extra_metadata or {})},
         "examples": examples_payload,
         "passes": [serialize_pass_capture(pass_capture) for pass_capture in passes],
     }
@@ -234,6 +310,7 @@ def iter_payload_bundles(payload: dict[str, Any]):
     pass_captures = [deserialize_pass_capture(pass_payload) for pass_payload in payload.get("passes", [])]
     batch_size = len(examples)
     for row_idx, example in enumerate(examples):
+        dataset_name = str(example.get("dataset_name") or payload.get("metadata", {}).get("dataset_name", ""))
         passes = []
         for pass_capture in pass_captures:
             captures_by_condition: dict[str, list[LayerCapture]] = {}
@@ -248,9 +325,9 @@ def iter_payload_bundles(payload: dict[str, Any]):
             )
         yield ExampleCaptureBundle(
             text_id=str(example["text_id"]),
-            dataset_name=str(example["dataset_name"]),
+            dataset_name=dataset_name,
             kind=str(example["kind"]),
-            prompt=str(example["prompt"]),
+            prompt=str(example.get("prompt", "")),
             token_ids=list(example.get("token_ids", [])),
             content_token_mask=list(example.get("content_token_mask", [])),
             passes=passes,
