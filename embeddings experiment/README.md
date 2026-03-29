@@ -16,7 +16,7 @@ Everything created for this experiment lives in this folder:
 - `kv_prepend_experiment/`: collection, evaluation, analysis, and runtime modules
 - `cerebrium.toml`: GPU-backed Cerebrium app config for collection/model-load runs
 - `cerebrium_analysis.toml`: CPU-only Cerebrium app config for analysis runs
-- `launch_cerebrium_async.py`: generic async Cerebrium launcher for smoke, calibration, and analysis
+- `launch_cerebrium_async.py`: ephemeral Cerebrium app launcher for smoke, calibration, and analysis
 - `run_cerebrium_analysis_cpu.sh`: launcher for CPU-only Cerebrium analysis
 - `launch_cerebrium_analysis_async.py`: compatibility wrapper for async CPU-only analysis
 
@@ -113,40 +113,40 @@ python run_kv_prepend_experiment.py \
 For calibration, controls, and bridge, use the generated split specs instead of
 the default main spec.
 
-For a traceable async Cerebrium smoke run on the GPU app:
+For a traceable Cerebrium smoke run on the GPU app:
 
 ```bash
 python launch_cerebrium_async.py collect_smoke
 ```
 
-For a traceable async Cerebrium calibration run on the GPU app:
+For a traceable Cerebrium calibration run on the GPU app:
 
 ```bash
 python launch_cerebrium_async.py calibration_run
 ```
 
-For a traceable async Cerebrium analysis run on the CPU-only app:
+For a traceable Cerebrium analysis run on the CPU-only app:
 
 ```bash
 python launch_cerebrium_async.py analyze_latest_calibration --workers 10
 ```
 
-Each async launch returns a Cerebrium `run_id` plus deterministic persisted
-remote paths. The GPU collect endpoints now also write a top-level `status.json`
-for the run, so all long jobs have a single status artifact to poll.
+Each launch returns deterministic persisted remote paths. The GPU collect
+endpoints also write a top-level `status.json` for the run, so all long jobs
+have a single status artifact to inspect.
 
 By default, `launch_cerebrium_async.py`:
 
 - deploys the required app
-- submits the run asynchronously
-- waits for the run to reach a final status
+- executes the run synchronously through the app endpoint
 - deletes the app afterward
 
 That makes the app lifecycle explicitly ephemeral instead of relying on
 Cerebrium scale-to-zero behavior alone.
 
-Use `--detach` if you want fire-and-forget behavior, or `--keep-app` if you want
-the deployed app left in place after the run finishes.
+`--detach` and `--keep-app` are disabled intentionally. Long runs must stay
+attached to the launching process and every launcher-created app is deleted in a
+`finally` block after the request returns or fails.
 
 To explicitly delete the project apps when nothing is running:
 

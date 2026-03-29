@@ -20,9 +20,6 @@ CPU_CONFIG = ROOT / "cerebrium_analysis.toml"
 DEFAULT_STORAGE_APP = "kv-prepend-l40s-smoke"
 DEFAULT_GPU_APP = "kv-prepend-l40s-smoke"
 DEFAULT_CPU_APP = "kv-prepend-analysis-cpu"
-REST_BASE = "https://rest.cerebrium.ai/v2"
-FINAL_RUN_STATUSES = {"success", "failure", "cancelled", "timeout"}
-UNSAFE_GPU_FUNCTIONS = {"main_run", "calibration_run"}
 GPU_FUNCTIONS = {"collect_smoke", "calibration_run", "main_run"}
 LOCAL_GPU_LOCK = ROOT / ".cerebrium_gpu_run_lock.json"
 
@@ -76,7 +73,13 @@ def _deploy_app(config_path: Path, app_name: str) -> None:
     )
 
 
-def _post_async(endpoint: str, token: str | None, payload: dict[str, object]) -> dict[str, object]:
+def _post_sync(
+    endpoint: str,
+    token: str | None,
+    payload: dict[str, object],
+    *,
+    timeout_seconds: float,
+) -> dict[str, object]:
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         endpoint,
@@ -87,22 +90,23 @@ def _post_async(endpoint: str, token: str | None, payload: dict[str, object]) ->
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
-def _post_async_with_retry(
+def _post_sync_with_retry(
     endpoint: str,
     token: str | None,
     payload: dict[str, object],
     *,
+    timeout_seconds: float,
     retries: int,
     delay_seconds: float,
 ) -> dict[str, object]:
     last_error: Exception | None = None
     for attempt in range(retries + 1):
         try:
-            return _post_async(endpoint, token, payload)
+            return _post_sync(endpoint, token, payload, timeout_seconds=timeout_seconds)
         except urllib.error.HTTPError as exc:
             last_error = exc
             if exc.code != 404 or attempt >= retries:
@@ -117,105 +121,15 @@ def _post_async_with_retry(
     raise last_error
 
 
-def _api_get_json(url: str, token: str | None) -> object:
-    request = urllib.request.Request(
-        url,
-        headers={"Authorization": f"Bearer {token}"} if token else {},
-        method="GET",
-    )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def _app_id(project: str, app_name: str) -> str:
-    return f"{project}-{app_name}"
-
-
-def _list_runs(project: str, app_name: str, token: str | None) -> list[dict[str, object]]:
-    payload = _api_get_json(
-        f"{REST_BASE}/projects/{urllib.parse.quote(project)}/apps/{urllib.parse.quote(_app_id(project, app_name))}/runs",
-        token,
-    )
-    if not isinstance(payload, dict):
-        return []
-    items = payload.get("items", [])
-    return items if isinstance(items, list) else []
-
-
-def _get_run(project: str, app_name: str, run_id: str, token: str | None) -> dict[str, object] | None:
-    for item in _list_runs(project, app_name, token):
-        if str(item.get("id", "")) == run_id:
-            return item
-    return None
-
-
-def _wait_for_run(
-    project: str,
-    app_name: str,
-    run_id: str,
-    token: str | None,
-    *,
-    poll_seconds: float,
-    timeout_seconds: float,
-) -> dict[str, object]:
-    deadline = time.time() + timeout_seconds
-    last_status = None
-    while time.time() < deadline:
-        run = _get_run(project, app_name, run_id, token)
-        if run is not None:
-            status = str(run.get("status", ""))
-            if status != last_status:
-                print(
-                    json.dumps(
-                        {
-                            "run_id": run_id,
-                            "app_name": app_name,
-                            "status": status,
-                            "completed_at": run.get("completedAt"),
-                        },
-                        sort_keys=True,
-                    ),
-                    file=sys.stderr,
-                )
-                last_status = status
-            if run.get("completedAt") or status in FINAL_RUN_STATUSES:
-                return run
-        time.sleep(poll_seconds)
-    raise TimeoutError(f"timed out waiting for run {run_id} on {app_name}")
-
-
 def _delete_app(project: str, app_name: str) -> None:
     subprocess.run(
-        ["cerebrium", "apps", "delete", _app_id(project, app_name)],
+        ["cerebrium", "apps", "delete", f"{project}-{app_name}"],
         cwd=ROOT,
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
-
-
-def _management_access_preflight(app_name: str) -> None:
-    checks = [
-        ["cerebrium", "apps", "get", app_name],
-        ["cerebrium", "runs", "list", app_name, "--async"],
-    ]
-    failures: list[str] = []
-    for cmd in checks:
-        result = subprocess.run(
-            cmd,
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            message = (result.stderr or result.stdout or "").strip()
-            failures.append(f"{' '.join(cmd)} -> {message}")
-    if failures:
-        raise RuntimeError(
-            "Cerebrium management API access is insufficient for safe async control; "
-            "refusing to launch long-lived work.\n" + "\n".join(failures)
-        )
 
 
 def _acquire_local_gpu_lock(function_name: str, app_name: str) -> None:
@@ -241,30 +155,19 @@ def _release_local_gpu_lock() -> None:
         LOCAL_GPU_LOCK.unlink()
     except FileNotFoundError:
         pass
-
-
-def _is_run_active(run: dict[str, object]) -> bool:
-    status = str(run.get("status", ""))
-    return not run.get("completedAt") and status not in FINAL_RUN_STATUSES
-
-
-def _cleanup_idle_apps(project: str, token: str | None, app_names: list[str]) -> dict[str, object]:
+def _cleanup_idle_apps(project: str, app_names: list[str]) -> dict[str, object]:
     results: list[dict[str, object]] = []
     for app_name in app_names:
-        runs = _list_runs(project, app_name, token)
-        active = [run for run in runs if _is_run_active(run)]
         deleted = False
         error = ""
-        if not active:
-            try:
-                _delete_app(project, app_name)
-                deleted = True
-            except subprocess.CalledProcessError as exc:
-                error = (exc.stdout or str(exc)).strip()
+        try:
+            _delete_app(project, app_name)
+            deleted = True
+        except subprocess.CalledProcessError as exc:
+            error = (exc.stdout or str(exc)).strip()
         results.append(
             {
                 "app_name": app_name,
-                "active_runs": [str(run.get("id", "")) for run in active],
                 "deleted": deleted,
                 "error": error,
             }
@@ -297,7 +200,6 @@ def main() -> int:
     parser.add_argument("--timeout-seconds", type=float, default=43200.0)
     parser.add_argument("--submit-retries", type=int, default=8)
     parser.add_argument("--submit-retry-seconds", type=float, default=3.0)
-    parser.add_argument("--allow-unsafe-gpu", action="store_true")
     args = parser.parse_args()
 
     cli_config = _read_cli_config()
@@ -308,9 +210,14 @@ def main() -> int:
         raise RuntimeError("missing project in ~/.cerebrium/config.yaml")
 
     if args.function == "cleanup_idle":
-        result = _cleanup_idle_apps(project, token, [args.gpu_app, args.cpu_app])
+        result = _cleanup_idle_apps(project, [args.gpu_app, args.cpu_app])
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
+
+    if args.detach:
+        raise RuntimeError("Detached Cerebrium runs are disabled.")
+    if args.keep_app:
+        raise RuntimeError("Leaving Cerebrium apps deployed after a run is disabled.")
 
     if args.function == "collect_smoke":
         app_name = args.gpu_app
@@ -362,13 +269,6 @@ def main() -> int:
         }
 
     using_gpu = args.function in GPU_FUNCTIONS
-    if args.function in UNSAFE_GPU_FUNCTIONS and not args.allow_unsafe_gpu:
-        raise RuntimeError(
-            "Refusing to launch long-lived Cerebrium GPU work without explicit override. "
-            "Pass --allow-unsafe-gpu only after confirming app/runs kill visibility is working."
-        )
-    if args.function in UNSAFE_GPU_FUNCTIONS and args.detach:
-        raise RuntimeError("Detached long-lived Cerebrium GPU runs are disabled.")
     if using_gpu:
         _acquire_local_gpu_lock(args.function, app_name)
 
@@ -376,8 +276,6 @@ def main() -> int:
         if not args.skip_deploy:
             try:
                 _deploy_app(config_path, app_name)
-                if using_gpu:
-                    _management_access_preflight(app_name)
             except Exception:
                 try:
                     _delete_app(project, app_name)
@@ -388,16 +286,16 @@ def main() -> int:
         endpoint = (
             f"https://api.aws.{region}.cerebrium.ai/v4/"
             f"{urllib.parse.quote(project)}/{urllib.parse.quote(app_name)}/"
-            f"{args.function}?async=true"
+            f"{args.function}"
         )
-        response = _post_async_with_retry(
+        response = _post_sync_with_retry(
             endpoint,
             token,
             function_payload,
+            timeout_seconds=args.timeout_seconds,
             retries=args.submit_retries,
             delay_seconds=args.submit_retry_seconds,
         )
-        run_id = str(response.get("run_id", ""))
         result = {
             "function": args.function,
             "endpoint": endpoint,
@@ -406,24 +304,23 @@ def main() -> int:
             **function_payload,
             **remote_paths,
         }
-        if not args.detach and run_id:
-            final_run = _wait_for_run(
-                project,
-                app_name,
-                run_id,
-                token,
-                poll_seconds=args.poll_seconds,
-                timeout_seconds=args.timeout_seconds,
-            )
-            result["final_run"] = final_run
-            if not args.keep_app:
-                _delete_app(project, app_name)
-                result["app_deleted_after_run"] = True
-            else:
-                result["app_deleted_after_run"] = False
+        result["app_deleted_after_run"] = False
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     finally:
+        try:
+            _delete_app(project, app_name)
+        except Exception as exc:
+            print(
+                json.dumps(
+                    {
+                        "app_name": app_name,
+                        "delete_after_run_failed": str(exc),
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
         if using_gpu:
             _release_local_gpu_lock()
 
