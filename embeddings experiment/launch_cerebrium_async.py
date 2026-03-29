@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -21,6 +22,9 @@ DEFAULT_GPU_APP = "kv-prepend-l40s-smoke"
 DEFAULT_CPU_APP = "kv-prepend-analysis-cpu"
 REST_BASE = "https://rest.cerebrium.ai/v2"
 FINAL_RUN_STATUSES = {"success", "failure", "cancelled", "timeout"}
+UNSAFE_GPU_FUNCTIONS = {"main_run", "calibration_run"}
+GPU_FUNCTIONS = {"collect_smoke", "calibration_run", "main_run"}
+LOCAL_GPU_LOCK = ROOT / ".cerebrium_gpu_run_lock.json"
 
 
 def _read_cli_config() -> dict[str, str]:
@@ -191,6 +195,54 @@ def _delete_app(project: str, app_name: str) -> None:
     )
 
 
+def _management_access_preflight(app_name: str) -> None:
+    checks = [
+        ["cerebrium", "apps", "get", app_name],
+        ["cerebrium", "runs", "list", app_name, "--async"],
+    ]
+    failures: list[str] = []
+    for cmd in checks:
+        result = subprocess.run(
+            cmd,
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or "").strip()
+            failures.append(f"{' '.join(cmd)} -> {message}")
+    if failures:
+        raise RuntimeError(
+            "Cerebrium management API access is insufficient for safe async control; "
+            "refusing to launch long-lived work.\n" + "\n".join(failures)
+        )
+
+
+def _acquire_local_gpu_lock(function_name: str, app_name: str) -> None:
+    payload = {
+        "function": function_name,
+        "app_name": app_name,
+        "pid": os.getpid(),
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    if LOCAL_GPU_LOCK.exists():
+        existing = LOCAL_GPU_LOCK.read_text(encoding="utf-8")
+        raise RuntimeError(
+            "Refusing to launch Cerebrium GPU work while a local GPU lock exists. "
+            "Resolve the previous run first or remove "
+            f"{LOCAL_GPU_LOCK} after verifying no remote compute remains.\n"
+            f"Existing lock contents:\n{existing}"
+        )
+    LOCAL_GPU_LOCK.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _release_local_gpu_lock() -> None:
+    try:
+        LOCAL_GPU_LOCK.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def _is_run_active(run: dict[str, object]) -> bool:
     status = str(run.get("status", ""))
     return not run.get("completedAt") and status not in FINAL_RUN_STATUSES
@@ -245,6 +297,7 @@ def main() -> int:
     parser.add_argument("--timeout-seconds", type=float, default=43200.0)
     parser.add_argument("--submit-retries", type=int, default=8)
     parser.add_argument("--submit-retry-seconds", type=float, default=3.0)
+    parser.add_argument("--allow-unsafe-gpu", action="store_true")
     args = parser.parse_args()
 
     cli_config = _read_cli_config()
@@ -308,47 +361,71 @@ def main() -> int:
             ),
         }
 
-    if not args.skip_deploy:
-        _deploy_app(config_path, app_name)
-
-    endpoint = (
-        f"https://api.aws.{region}.cerebrium.ai/v4/"
-        f"{urllib.parse.quote(project)}/{urllib.parse.quote(app_name)}/"
-        f"{args.function}?async=true"
-    )
-    response = _post_async_with_retry(
-        endpoint,
-        token,
-        function_payload,
-        retries=args.submit_retries,
-        delay_seconds=args.submit_retry_seconds,
-    )
-    run_id = str(response.get("run_id", ""))
-    result = {
-        "function": args.function,
-        "endpoint": endpoint,
-        "app_name": app_name,
-        "request": response,
-        **function_payload,
-        **remote_paths,
-    }
-    if not args.detach and run_id:
-        final_run = _wait_for_run(
-            project,
-            app_name,
-            run_id,
-            token,
-            poll_seconds=args.poll_seconds,
-            timeout_seconds=args.timeout_seconds,
+    using_gpu = args.function in GPU_FUNCTIONS
+    if args.function in UNSAFE_GPU_FUNCTIONS and not args.allow_unsafe_gpu:
+        raise RuntimeError(
+            "Refusing to launch long-lived Cerebrium GPU work without explicit override. "
+            "Pass --allow-unsafe-gpu only after confirming app/runs kill visibility is working."
         )
-        result["final_run"] = final_run
-        if not args.keep_app:
-            _delete_app(project, app_name)
-            result["app_deleted_after_run"] = True
-        else:
-            result["app_deleted_after_run"] = False
-    print(json.dumps(result, indent=2, sort_keys=True))
-    return 0
+    if args.function in UNSAFE_GPU_FUNCTIONS and args.detach:
+        raise RuntimeError("Detached long-lived Cerebrium GPU runs are disabled.")
+    if using_gpu:
+        _acquire_local_gpu_lock(args.function, app_name)
+
+    try:
+        if not args.skip_deploy:
+            try:
+                _deploy_app(config_path, app_name)
+                if using_gpu:
+                    _management_access_preflight(app_name)
+            except Exception:
+                try:
+                    _delete_app(project, app_name)
+                except Exception:
+                    pass
+                raise
+
+        endpoint = (
+            f"https://api.aws.{region}.cerebrium.ai/v4/"
+            f"{urllib.parse.quote(project)}/{urllib.parse.quote(app_name)}/"
+            f"{args.function}?async=true"
+        )
+        response = _post_async_with_retry(
+            endpoint,
+            token,
+            function_payload,
+            retries=args.submit_retries,
+            delay_seconds=args.submit_retry_seconds,
+        )
+        run_id = str(response.get("run_id", ""))
+        result = {
+            "function": args.function,
+            "endpoint": endpoint,
+            "app_name": app_name,
+            "request": response,
+            **function_payload,
+            **remote_paths,
+        }
+        if not args.detach and run_id:
+            final_run = _wait_for_run(
+                project,
+                app_name,
+                run_id,
+                token,
+                poll_seconds=args.poll_seconds,
+                timeout_seconds=args.timeout_seconds,
+            )
+            result["final_run"] = final_run
+            if not args.keep_app:
+                _delete_app(project, app_name)
+                result["app_deleted_after_run"] = True
+            else:
+                result["app_deleted_after_run"] = False
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    finally:
+        if using_gpu:
+            _release_local_gpu_lock()
 
 
 if __name__ == "__main__":
