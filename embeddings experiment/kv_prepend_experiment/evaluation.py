@@ -269,6 +269,78 @@ def score_multivector(query_vectors, doc_vectors):
     return results
 
 
+def _vector_map_to_matrix(vectors: dict[str, np.ndarray]) -> tuple[list[str], np.ndarray]:
+    ids = list(vectors.keys())
+    if not ids:
+        return [], np.zeros((0, 0), dtype=np.float32)
+    matrix = np.stack([np.asarray(vectors[item_id], dtype=np.float32) for item_id in ids], axis=0)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms = np.where(norms > 0, norms, 1.0)
+    return ids, (matrix / norms).astype(np.float32, copy=False)
+
+
+def _topk_ranked_score_dicts(
+    query_ids: list[str],
+    doc_ids: list[str],
+    similarities: np.ndarray,
+    *,
+    top_k: int,
+) -> tuple[dict[str, dict[str, float]], dict[str, list[str]]]:
+    if not query_ids or not doc_ids:
+        return {}, {}
+    k = min(int(top_k), similarities.shape[1])
+    if k <= 0:
+        return {query_id: {} for query_id in query_ids}, {query_id: [] for query_id in query_ids}
+    if k == similarities.shape[1]:
+        top_indices = np.argsort(-similarities, axis=1)
+    else:
+        partition = np.argpartition(-similarities, kth=k - 1, axis=1)[:, :k]
+        partition_scores = np.take_along_axis(similarities, partition, axis=1)
+        ordering = np.argsort(-partition_scores, axis=1)
+        top_indices = np.take_along_axis(partition, ordering, axis=1)
+    ranked_scores: dict[str, dict[str, float]] = {}
+    ranked_doc_ids: dict[str, list[str]] = {}
+    for row_index, query_id in enumerate(query_ids):
+        indices = top_indices[row_index].tolist()
+        ranked_doc_ids[query_id] = [doc_ids[col_index] for col_index in indices]
+        ranked_scores[query_id] = {
+            doc_ids[col_index]: float(similarities[row_index, col_index]) for col_index in indices
+        }
+    return ranked_scores, ranked_doc_ids
+
+
+def _score_single_vector_topk(
+    query_vectors: dict[str, np.ndarray],
+    doc_vectors: dict[str, np.ndarray],
+    *,
+    top_k: int,
+) -> tuple[dict[str, dict[str, float]], dict[str, list[str]]]:
+    query_ids, query_matrix = _vector_map_to_matrix(query_vectors)
+    doc_ids, doc_matrix = _vector_map_to_matrix(doc_vectors)
+    if query_matrix.size == 0 or doc_matrix.size == 0:
+        return {}, {}
+    similarities = query_matrix @ doc_matrix.T
+    return _topk_ranked_score_dicts(query_ids, doc_ids, similarities, top_k=top_k)
+
+
+def _normalize_token_matrix(token_vectors: np.ndarray) -> np.ndarray:
+    token_vectors = np.asarray(token_vectors, dtype=np.float32)
+    if token_vectors.size == 0:
+        return np.zeros((0, 0), dtype=np.float32)
+    norms = np.linalg.norm(token_vectors, axis=1, keepdims=True)
+    norms = np.where(norms > 0, norms, 1.0)
+    return (token_vectors / norms).astype(np.float32, copy=False)
+
+
+def _maxsim_from_normalized(query_tokens: np.ndarray, doc_tokens: np.ndarray) -> float:
+    if query_tokens.size == 0 or doc_tokens.size == 0:
+        return 0.0
+    sims = query_tokens @ doc_tokens.T
+    if sims.size == 0:
+        return 0.0
+    return float(sims.max(axis=1).sum())
+
+
 def _split_doc_query_bundles(task: RetrievalTask, bundle_lookup: dict[str, ExampleCaptureBundle]):
     doc_bundles = {doc_id: bundle_lookup[doc_id] for doc_id in task.corpus if doc_id in bundle_lookup}
     query_bundles = {query_id: bundle_lookup[query_id] for query_id in task.queries if query_id in bundle_lookup}
@@ -879,20 +951,45 @@ def evaluate_main_feature_scoreboard(
         if prompt_spec is not None and model_name
         else {}
     )
-    state: dict[str, Any] = {}
-    for task_name, task in tasks.items():
-        state[task_name] = {
+    state: dict[str, Any] = {
+        task_name: {
             "task": task,
             "routed_bundles": 0,
             "features": {
                 feature_key: {
                     "doc_vectors": {},
                     "query_vectors": {},
-                    "query_tokens": {},
+                    "query_token_norms": {},
                 }
                 for feature_key in feature_keys
             },
         }
+        for task_name, task in tasks.items()
+    }
+
+    progress_state: dict[str, Any] = {
+        "stage": "evaluation_extract",
+        "processed_bundles": 0,
+        "unmatched_bundles": 0,
+        "completed_tasks": 0,
+        "total_tasks": len(task_names),
+        "task_name": None,
+        "last_task": None,
+        "completed_features": 0,
+        "total_features": len(feature_specs),
+        "last_feature": None,
+        "doc_count": 0,
+        "query_count": 0,
+        "scored_queries": 0,
+        "total_queries": 0,
+        "multivector_scored_pairs": 0,
+    }
+
+    def emit_progress(**updates: Any) -> None:
+        if progress_callback is None:
+            return
+        progress_state.update(updates)
+        progress_callback(dict(progress_state))
 
     processed_bundles = 0
     unmatched_bundles = 0
@@ -920,13 +1017,21 @@ def evaluate_main_feature_scoreboard(
                 )
             continue
         processed_bundles += 1
-        if progress_callback is not None and processed_bundles % 100 == 0:
-            progress_callback(
-                {
-                    "stage": "evaluation_extract",
-                    "processed_bundles": processed_bundles,
-                    "unmatched_bundles": unmatched_bundles,
-                }
+        if processed_bundles % 100 == 0:
+            emit_progress(
+                stage="evaluation_extract",
+                processed_bundles=processed_bundles,
+                unmatched_bundles=unmatched_bundles,
+                completed_tasks=0,
+                task_name=None,
+                last_task=None,
+                completed_features=0,
+                last_feature=None,
+                doc_count=0,
+                query_count=0,
+                scored_queries=0,
+                total_queries=0,
+                multivector_scored_pairs=0,
             )
         for task_name in task_names_for_bundle:
             task_state = state[task_name]
@@ -965,15 +1070,13 @@ def evaluate_main_feature_scoreboard(
                     continue
                 if raw_tokens.size == 0:
                     continue
-                pooled = mean_pool_float(raw_tokens).astype(np.float32, copy=False)
-                task_state["features"][feature_key][target_name][bundle.text_id] = pooled
+                feature_state = task_state["features"][feature_key]
+                feature_state[target_name][bundle.text_id] = mean_pool_float(raw_tokens).astype(np.float32, copy=False)
                 if target_name == "query_vectors":
-                    task_state["features"][feature_key]["query_tokens"][bundle.text_id] = raw_tokens.astype(
-                        np.float32, copy=False
-                    )
+                    feature_state["query_token_norms"][bundle.text_id] = _normalize_token_matrix(raw_tokens)
 
     results: dict[str, Any] = {
-        "evaluation_mode": "main_feature_scoreboard_v2",
+        "evaluation_mode": "main_feature_scoreboard_v3",
         "top_k": int(top_k),
         "candidate_pool_k": int(candidate_pool_k),
         "processed_bundles": processed_bundles,
@@ -982,9 +1085,12 @@ def evaluate_main_feature_scoreboard(
         "tasks": {},
     }
     multivector_candidates: dict[str, dict[str, dict[str, list[str]]]] = {
-        feature_key: {task_name: {} for task_name in task_names}
-        for feature_key in feature_keys
+        feature_key: {task_name: {} for task_name in task_names} for feature_key in feature_keys
     }
+    reverse_candidates: dict[str, dict[str, dict[str, list[str]]]] = {
+        feature_key: {task_name: {} for task_name in task_names} for feature_key in feature_keys
+    }
+    top_pool_k = max(int(top_k), int(candidate_pool_k))
     for task_index, task_name in enumerate(task_names, start=1):
         task = tasks[task_name]
         task_state = state[task_name]
@@ -996,8 +1102,9 @@ def evaluate_main_feature_scoreboard(
         }
         for spec in feature_specs:
             feature_key = f"{spec['signal_name']}__{spec['pass_name']}__{spec['condition']}"
-            doc_vectors = task_state["features"][feature_key]["doc_vectors"]
-            query_vectors = task_state["features"][feature_key]["query_vectors"]
+            feature_state = task_state["features"][feature_key]
+            doc_vectors = feature_state["doc_vectors"]
+            query_vectors = feature_state["query_vectors"]
             result_row: dict[str, Any] = {
                 "signal_name": spec["signal_name"],
                 "pass_name": spec["pass_name"],
@@ -1042,11 +1149,21 @@ def evaluate_main_feature_scoreboard(
                 )
                 for query_id, vector in query_vectors.items()
             }
-            float_scores = score_single_vector(query_vectors, doc_vectors)
-            trinary_scores = score_single_vector(query_trinary, doc_trinary)
-            for query_id, ranked in float_scores.items():
-                top_docs = sorted(ranked.items(), key=lambda item: item[1], reverse=True)[:candidate_pool_k]
-                multivector_candidates[feature_key][task_name][query_id] = [doc_id for doc_id, _ in top_docs]
+            float_scores, float_candidates = _score_single_vector_topk(
+                query_vectors,
+                doc_vectors,
+                top_k=top_pool_k,
+            )
+            trinary_scores, _ = _score_single_vector_topk(
+                query_trinary,
+                doc_trinary,
+                top_k=int(top_k),
+            )
+            multivector_candidates[feature_key][task_name] = float_candidates
+            reverse_lookup = reverse_candidates[feature_key][task_name]
+            for query_id, doc_ids in float_candidates.items():
+                for doc_id in doc_ids:
+                    reverse_lookup.setdefault(doc_id, []).append(query_id)
             result_row.update(
                 {
                     "float_single_vector_ndcg_at_10": ndcg_at_k(float_scores, task.qrels, k=top_k),
@@ -1055,41 +1172,89 @@ def evaluate_main_feature_scoreboard(
                 }
             )
             task_results["features"][feature_key] = result_row
-        results["tasks"][task_name] = task_results
-        if progress_callback is not None:
-            progress_callback(
-                {
-                    "stage": "evaluation_task_done",
-                    "completed_tasks": task_index,
-                    "total_tasks": len(task_names),
-                    "last_task": task_name,
-                }
+            emit_progress(
+                stage="evaluation_task_feature",
+                processed_bundles=processed_bundles,
+                unmatched_bundles=unmatched_bundles,
+                completed_tasks=task_index - 1,
+                task_name=task_name,
+                last_task=None,
+                completed_features=0,
+                last_feature=feature_key,
+                doc_count=len(doc_vectors),
+                query_count=len(query_vectors),
+                scored_queries=0,
+                total_queries=0,
+                multivector_scored_pairs=0,
             )
+        results["tasks"][task_name] = task_results
+        emit_progress(
+            stage="evaluation_task_done",
+            processed_bundles=processed_bundles,
+            unmatched_bundles=unmatched_bundles,
+            completed_tasks=task_index,
+            task_name=None,
+            last_task=task_name,
+            completed_features=0,
+            last_feature=None,
+            doc_count=0,
+            query_count=0,
+            scored_queries=0,
+            total_queries=0,
+            multivector_scored_pairs=0,
+        )
 
-    for feature_index, spec in enumerate(feature_specs, start=1):
-        feature_key = f"{spec['signal_name']}__{spec['pass_name']}__{spec['condition']}"
-        candidate_doc_ids_by_task = {
-            task_name: {
-                doc_id
-                for candidate_doc_ids in candidate_lookup.values()
-                for doc_id in candidate_doc_ids
-            }
-            for task_name, candidate_lookup in multivector_candidates[feature_key].items()
-            if candidate_lookup
-        }
-        if not candidate_doc_ids_by_task:
-            continue
-        raw_state: dict[str, dict[str, dict[str, np.ndarray]]] = {
-            task_name: {"doc_tokens": {}, "query_tokens": {}}
+    multivector_scores: dict[str, dict[str, dict[str, dict[str, float]]]] = {
+        feature_key: {task_name: {} for task_name in task_names} for feature_key in feature_keys
+    }
+    feature_pair_counts: dict[str, dict[str, int]] = {
+        feature_key: {task_name: 0 for task_name in task_names} for feature_key in feature_keys
+    }
+    candidate_doc_counts: dict[str, dict[str, int]] = {
+        feature_key: {
+            task_name: len(reverse_candidates[feature_key][task_name])
             for task_name in task_names
         }
-        for bundle in iter_bundles(capture_dir):
-            task_names_for_bundle = _resolve_bundle_task_names(
-                bundle,
-                tasks,
-                task_signature_lookup=task_signature_lookup,
+        for feature_key in feature_keys
+    }
+    multivector_processed_docs = 0
+    for bundle in iter_bundles(capture_dir):
+        if bundle.kind != "doc":
+            continue
+        task_names_for_bundle = _resolve_bundle_task_names(
+            bundle,
+            tasks,
+            task_signature_lookup=task_signature_lookup,
+        )
+        if not task_names_for_bundle:
+            continue
+        multivector_processed_docs += 1
+        if multivector_processed_docs % 100 == 0:
+            emit_progress(
+                stage="evaluation_multivector_extract",
+                processed_bundles=multivector_processed_docs,
+                unmatched_bundles=unmatched_bundles,
+                completed_tasks=len(task_names),
+                task_name=None,
+                last_task=None,
+                completed_features=0,
+                last_feature=None,
+                doc_count=0,
+                query_count=0,
+                scored_queries=0,
+                total_queries=0,
+                multivector_scored_pairs=sum(
+                    count for task_counts in feature_pair_counts.values() for count in task_counts.values()
+                ),
             )
-            if not task_names_for_bundle:
+        for feature_index, spec in enumerate(feature_specs, start=1):
+            feature_key = f"{spec['signal_name']}__{spec['pass_name']}__{spec['condition']}"
+            relevant_tasks = [
+                task_name
+                for task_name in task_names_for_bundle
+                if bundle.text_id in reverse_candidates[feature_key][task_name]
+            ]
+            if not relevant_tasks:
                 continue
             layer_indices = _available_signal_layer_indices(
                 bundle,
@@ -1100,92 +1265,101 @@ def evaluate_main_feature_scoreboard(
             )
             if spec["signal_name"] != "final_hidden_state" and not layer_indices:
                 continue
-            for task_name in task_names_for_bundle:
-                task = tasks[task_name]
-                if bundle.kind == "doc":
-                    if bundle.text_id not in candidate_doc_ids_by_task.get(task_name, set()):
+            try:
+                raw_tokens = _raw_signal_tokens(
+                    bundle,
+                    pass_name=spec["pass_name"],
+                    condition=spec["condition"],
+                    signal_name=spec["signal_name"],
+                    layer_indices=layer_indices,
+                )
+            except KeyError:
+                continue
+            if raw_tokens.size == 0:
+                continue
+            doc_token_norms = _normalize_token_matrix(raw_tokens)
+            for task_name in relevant_tasks:
+                query_lookup = state[task_name]["features"][feature_key]["query_token_norms"]
+                score_lookup = multivector_scores[feature_key][task_name]
+                for query_id in reverse_candidates[feature_key][task_name][bundle.text_id]:
+                    query_token_norms = query_lookup.get(query_id)
+                    if query_token_norms is None:
                         continue
-                    target = raw_state[task_name]["doc_tokens"]
-                elif bundle.kind == "query":
-                    if bundle.text_id not in task.queries:
-                        continue
-                    target = raw_state[task_name]["query_tokens"]
-                else:
-                    continue
-                if bundle.text_id in target:
-                    continue
-                try:
-                    raw_tokens = _raw_signal_tokens(
-                        bundle,
-                        pass_name=spec["pass_name"],
-                        condition=spec["condition"],
-                        signal_name=spec["signal_name"],
-                        layer_indices=layer_indices,
+                    score_lookup.setdefault(query_id, {})[bundle.text_id] = _maxsim_from_normalized(
+                        query_token_norms,
+                        doc_token_norms,
                     )
-                except KeyError:
-                    continue
-                if raw_tokens.size == 0:
-                    continue
-                target[bundle.text_id] = raw_tokens.astype(np.float32, copy=False)
+                    feature_pair_counts[feature_key][task_name] += 1
+            if multivector_processed_docs % 100 == 0:
+                emit_progress(
+                    stage="evaluation_multivector_score",
+                    processed_bundles=multivector_processed_docs,
+                    unmatched_bundles=unmatched_bundles,
+                    completed_tasks=len(task_names),
+                    task_name=None,
+                    last_task=None,
+                    completed_features=feature_index - 1,
+                    last_feature=feature_key,
+                    doc_count=sum(
+                        candidate_doc_counts[feature_key][task_name] for task_name in relevant_tasks
+                    ),
+                    query_count=sum(
+                        len(multivector_candidates[feature_key][task_name]) for task_name in relevant_tasks
+                    ),
+                    scored_queries=sum(
+                        len(multivector_scores[feature_key][task_name]) for task_name in relevant_tasks
+                    ),
+                    total_queries=sum(
+                        len(multivector_candidates[feature_key][task_name]) for task_name in relevant_tasks
+                    ),
+                    multivector_scored_pairs=sum(
+                        count for task_counts in feature_pair_counts.values() for count in task_counts.values()
+                    ),
+                )
+
+    for feature_index, spec in enumerate(feature_specs, start=1):
+        feature_key = f"{spec['signal_name']}__{spec['pass_name']}__{spec['condition']}"
         for task_name in task_names:
             task = tasks[task_name]
             row = results["tasks"][task_name]["features"].get(feature_key)
             if not row or row.get("skipped"):
                 continue
-            doc_tokens = raw_state[task_name]["doc_tokens"]
-            query_tokens = raw_state[task_name]["query_tokens"]
-            candidate_lookup = multivector_candidates[feature_key].get(task_name, {})
-            if not doc_tokens or not query_tokens:
-                row["float_multivector_candidate_rerank_ndcg_at_10"] = 0.0
-                row["multivector_scoring_mode"] = "candidate_rerank_from_float_single_vector"
-                continue
-            float_multi_scores: dict[str, dict[str, float]] = {}
-            scored_pairs = 0
-            for query_id, candidate_doc_ids in candidate_lookup.items():
-                query_token_vectors = query_tokens.get(query_id)
-                if query_token_vectors is None:
-                    continue
-                candidate_doc_tokens = {
-                    doc_id: doc_tokens[doc_id]
-                    for doc_id in candidate_doc_ids
-                    if doc_id in doc_tokens
-                }
-                if not candidate_doc_tokens:
-                    continue
-                float_multi_scores[query_id] = {
-                    doc_id: maxsim(query_token_vectors, candidate_token_vectors)
-                    for doc_id, candidate_token_vectors in candidate_doc_tokens.items()
-                }
-                scored_pairs += len(float_multi_scores[query_id])
-            row["float_multivector_candidate_rerank_ndcg_at_10"] = ndcg_at_k(
-                float_multi_scores,
-                task.qrels,
-                k=top_k,
-            )
+            scores = multivector_scores[feature_key][task_name]
+            row["float_multivector_candidate_rerank_ndcg_at_10"] = ndcg_at_k(scores, task.qrels, k=top_k)
             row["multivector_scoring_mode"] = "candidate_rerank_from_float_single_vector"
-            row["multivector_doc_count"] = len(doc_tokens)
-            row["multivector_query_count"] = len(query_tokens)
-            row["multivector_scored_pairs"] = int(scored_pairs)
-            if progress_callback is not None:
-                progress_callback(
-                    {
-                        "stage": "evaluation_multivector_task",
-                        "completed_features": feature_index,
-                        "total_features": len(feature_specs),
-                        "last_feature": feature_key,
-                        "task_name": task_name,
-                        "multivector_doc_count": len(doc_tokens),
-                        "multivector_query_count": len(query_tokens),
-                        "multivector_scored_pairs": int(scored_pairs),
-                    }
-                )
-        if progress_callback is not None:
-            progress_callback(
-                {
-                    "stage": "evaluation_multivector",
-                    "completed_features": feature_index,
-                    "total_features": len(feature_specs),
-                    "last_feature": feature_key,
-                }
+            row["multivector_doc_count"] = int(candidate_doc_counts[feature_key][task_name])
+            row["multivector_query_count"] = len(multivector_candidates[feature_key][task_name])
+            row["multivector_scored_pairs"] = int(feature_pair_counts[feature_key][task_name])
+            emit_progress(
+                stage="evaluation_multivector_task",
+                processed_bundles=multivector_processed_docs,
+                unmatched_bundles=unmatched_bundles,
+                completed_tasks=len(task_names),
+                task_name=task_name,
+                last_task=None,
+                completed_features=feature_index,
+                last_feature=feature_key,
+                doc_count=int(candidate_doc_counts[feature_key][task_name]),
+                query_count=len(multivector_candidates[feature_key][task_name]),
+                scored_queries=len(scores),
+                total_queries=len(multivector_candidates[feature_key][task_name]),
+                multivector_scored_pairs=int(feature_pair_counts[feature_key][task_name]),
             )
+        emit_progress(
+            stage="evaluation_multivector",
+            processed_bundles=multivector_processed_docs,
+            unmatched_bundles=unmatched_bundles,
+            completed_tasks=len(task_names),
+            task_name=None,
+            last_task=None,
+            completed_features=feature_index,
+            last_feature=feature_key,
+            doc_count=0,
+            query_count=0,
+            scored_queries=0,
+            total_queries=0,
+            multivector_scored_pairs=sum(
+                count for task_counts in feature_pair_counts.values() for count in task_counts.values()
+            ),
+        )
     return results

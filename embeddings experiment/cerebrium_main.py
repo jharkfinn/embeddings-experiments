@@ -1,3 +1,4 @@
+import faulthandler
 import gc
 import json
 import logging
@@ -244,6 +245,45 @@ def _status_heartbeat(
         stop_event.set()
         worker.join(timeout=1.0)
         emit()
+
+
+@contextmanager
+def _stall_watchdog(
+    label: str,
+    *,
+    state: dict[str, object],
+    last_progress: dict[str, float],
+    timeout_s: float,
+    interval_s: float = 5.0,
+) -> object:
+    stop_event = threading.Event()
+
+    def loop() -> None:
+        while not stop_event.wait(interval_s):
+            age_s = time.monotonic() - float(last_progress["ts"])
+            if age_s <= timeout_s:
+                continue
+            LOGGER.error(
+                "cerebrium_stall_detected label=%s age_s=%.1f timeout_s=%.1f state=%s",
+                label,
+                age_s,
+                timeout_s,
+                json.dumps(state, sort_keys=True, default=str),
+            )
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            try:
+                sys.stderr.flush()
+                sys.stdout.flush()
+            finally:
+                os._exit(124)
+
+    worker = threading.Thread(target=loop, name=f"{label}-stall-watchdog", daemon=True)
+    worker.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+        worker.join(timeout=1.0)
 
 
 def _nvidia_smi() -> dict[str, str] | None:
@@ -690,9 +730,11 @@ def analyze_latest_calibration(
         "total_shards": 0,
         "started_at": _iso_now(),
     }
+    last_progress = {"ts": time.monotonic()}
 
     def progress_update(update: dict[str, object]) -> None:
         state.update(update)
+        last_progress["ts"] = time.monotonic()
         _write_json_atomic(status_path, dict(state, updated_at=_iso_now(), resource_snapshot=_resource_snapshot(run_root)))
 
     LOGGER.info(
@@ -707,8 +749,15 @@ def analyze_latest_calibration(
     start = time.perf_counter()
     try:
         try:
-            with _resource_heartbeat("analysis_run", run_root=run_root), _status_heartbeat(
-                status_path, state, run_root=run_root
+            with (
+                _resource_heartbeat("analysis_run", run_root=run_root),
+                _status_heartbeat(status_path, state, run_root=run_root),
+                _stall_watchdog(
+                    "analysis_run",
+                    state=state,
+                    last_progress=last_progress,
+                    timeout_s=float(os.environ.get("KV_PREPEND_STALL_TIMEOUT_SECONDS", "300")),
+                ),
             ):
                 summary = analyze_capture_directory(capture_dir, output_path, progress_callback=progress_update)
         except BaseException as exc:
@@ -785,9 +834,11 @@ def analyze_latest_main(
         "total_shards": 0,
         "started_at": _iso_now(),
     }
+    last_progress = {"ts": time.monotonic()}
 
     def progress_update(update: dict[str, object]) -> None:
         state.update(update)
+        last_progress["ts"] = time.monotonic()
         _write_json_atomic(status_path, dict(state, updated_at=_iso_now(), resource_snapshot=_resource_snapshot(run_root)))
 
     LOGGER.info(
@@ -802,8 +853,15 @@ def analyze_latest_main(
     start = time.perf_counter()
     try:
         try:
-            with _resource_heartbeat("analysis_run", run_root=run_root), _status_heartbeat(
-                status_path, state, run_root=run_root
+            with (
+                _resource_heartbeat("analysis_run", run_root=run_root),
+                _status_heartbeat(status_path, state, run_root=run_root),
+                _stall_watchdog(
+                    "analysis_run",
+                    state=state,
+                    last_progress=last_progress,
+                    timeout_s=float(os.environ.get("KV_PREPEND_STALL_TIMEOUT_SECONDS", "300")),
+                ),
             ):
                 summary = analyze_capture_directory(capture_dir, output_path, progress_callback=progress_update)
         except BaseException as exc:
@@ -872,9 +930,11 @@ def evaluate_latest_main(
         "status_path": str(status_path),
         "started_at": _iso_now(),
     }
+    last_progress = {"ts": time.monotonic()}
 
     def progress_update(update: dict[str, object]) -> None:
         state.update(update)
+        last_progress["ts"] = time.monotonic()
         _write_json_atomic(status_path, dict(state, updated_at=_iso_now(), resource_snapshot=_resource_snapshot(run_root)))
 
     LOGGER.info(
@@ -888,8 +948,15 @@ def evaluate_latest_main(
     start = time.perf_counter()
     try:
         try:
-            with _resource_heartbeat("evaluation_run", run_root=run_root), _status_heartbeat(
-                status_path, state, run_root=run_root
+            with (
+                _resource_heartbeat("evaluation_run", run_root=run_root),
+                _status_heartbeat(status_path, state, run_root=run_root),
+                _stall_watchdog(
+                    "evaluation_run",
+                    state=state,
+                    last_progress=last_progress,
+                    timeout_s=float(os.environ.get("KV_PREPEND_STALL_TIMEOUT_SECONDS", "300")),
+                ),
             ):
                 results = evaluate_main_feature_scoreboard(
                     capture_dir=capture_dir,
