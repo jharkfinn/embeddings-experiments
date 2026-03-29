@@ -5,6 +5,7 @@ import multiprocessing as mp
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -59,9 +60,24 @@ def _iso_now() -> str:
 
 def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    tmp_path.replace(path)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        except OSError:
+            pass
 
 
 def _read_proc_status() -> dict[str, str]:
@@ -659,6 +675,8 @@ def analyze_latest_calibration(
     status_path = analysis_root / "status.json"
     requested_workers = workers if workers > 0 else max(8, os.cpu_count() or 1)
     os.environ["KV_PREPEND_ANALYSIS_WORKERS"] = str(requested_workers)
+    os.environ.setdefault("KV_PREPEND_ANALYSIS_START_METHOD", "spawn")
+    os.environ.setdefault("KV_PREPEND_ANALYSIS_BLAS_THREADS", "1")
     configure_logging(log_path=analysis_root / "analysis_run.log", level="INFO")
     state: dict[str, object] = {
         "analysis_run_id": analysis_root.name,
@@ -728,6 +746,194 @@ def analyze_latest_calibration(
         }
     finally:
         _best_effort_runtime_cleanup("analysis_run")
+
+
+def analyze_latest_main(
+    main_run_id="",
+    analysis_run_id="",
+    workers=0,
+):
+    from kv_prepend_experiment.analysis import analyze_capture_directory
+    from kv_prepend_experiment.config import load_experiment_spec
+    from kv_prepend_experiment.logging_utils import configure_logging
+
+    spec_path = ROOT / "spec_main_hf_teacher_forcing_l40s_3tasks.json"
+    spec = load_experiment_spec(spec_path)
+    run_root = (
+        _persistent_run_root("main_runs", main_run_id)
+        if main_run_id
+        else _latest_persistent_run_root("main_runs")
+    )
+    capture_dir = run_root / spec.output.captures_dir
+    analysis_root = _new_analysis_root(run_root, analysis_run_id=analysis_run_id or None)
+    output_path = analysis_root / "capture_analysis.json"
+    status_path = analysis_root / "status.json"
+    requested_workers = workers if workers > 0 else max(8, os.cpu_count() or 1)
+    os.environ["KV_PREPEND_ANALYSIS_WORKERS"] = str(requested_workers)
+    os.environ.setdefault("KV_PREPEND_ANALYSIS_START_METHOD", "spawn")
+    os.environ.setdefault("KV_PREPEND_ANALYSIS_BLAS_THREADS", "1")
+    configure_logging(log_path=analysis_root / "analysis_run.log", level="INFO")
+    state: dict[str, object] = {
+        "analysis_run_id": analysis_root.name,
+        "main_run_id": run_root.name,
+        "stage": "setup",
+        "capture_dir": str(capture_dir),
+        "output_path": str(output_path),
+        "status_path": str(status_path),
+        "worker_count_requested": requested_workers,
+        "completed_shards": 0,
+        "total_shards": 0,
+        "started_at": _iso_now(),
+    }
+
+    def progress_update(update: dict[str, object]) -> None:
+        state.update(update)
+        _write_json_atomic(status_path, dict(state, updated_at=_iso_now(), resource_snapshot=_resource_snapshot(run_root)))
+
+    LOGGER.info(
+        "analysis_run_setup spec=%s run_root=%s capture_dir=%s workers=%s output_path=%s status_path=%s",
+        spec_path.name,
+        run_root,
+        capture_dir,
+        os.environ.get("KV_PREPEND_ANALYSIS_WORKERS"),
+        output_path,
+        status_path,
+    )
+    start = time.perf_counter()
+    try:
+        try:
+            with _resource_heartbeat("analysis_run", run_root=run_root), _status_heartbeat(
+                status_path, state, run_root=run_root
+            ):
+                summary = analyze_capture_directory(capture_dir, output_path, progress_callback=progress_update)
+        except BaseException as exc:
+            state.update(
+                {
+                    "stage": "failed",
+                    "finished_at": _iso_now(),
+                    "error": repr(exc),
+                }
+            )
+            _write_json_atomic(status_path, dict(state, updated_at=_iso_now(), resource_snapshot=_resource_snapshot(run_root)))
+            raise
+        state.update(
+            {
+                "stage": "completed",
+                "finished_at": _iso_now(),
+                "completed_shards": state.get("total_shards", 0),
+                "output_bytes": output_path.stat().st_size if output_path.exists() else 0,
+                "num_bundles": int(summary.get("num_bundles", 0)),
+                "num_layers": len(summary.get("layers", {})),
+            }
+        )
+        _write_json_atomic(status_path, dict(state, updated_at=_iso_now(), resource_snapshot=_resource_snapshot(run_root)))
+        return {
+            "seconds": round(time.perf_counter() - start, 3),
+            "run_root": str(run_root),
+            "analysis_root": str(analysis_root),
+            "capture_dir": str(capture_dir),
+            "output_path": str(output_path),
+            "status_path": str(status_path),
+            "bundles": int(summary.get("num_bundles", 0)),
+            "layers": len(summary.get("layers", {})),
+            "output_bytes": output_path.stat().st_size if output_path.exists() else 0,
+            "nvidia_smi_after_analysis": _nvidia_smi(),
+        }
+    finally:
+        _best_effort_runtime_cleanup("analysis_run")
+
+
+def evaluate_latest_main(
+    main_run_id="",
+    evaluation_run_id="",
+):
+    from kv_prepend_experiment.config import load_experiment_spec
+    from kv_prepend_experiment.evaluation import evaluate_main_feature_scoreboard, save_json
+    from kv_prepend_experiment.logging_utils import configure_logging
+
+    spec_path = ROOT / "spec_main_hf_teacher_forcing_l40s_3tasks.json"
+    spec = load_experiment_spec(spec_path)
+    run_root = (
+        _persistent_run_root("main_runs", main_run_id)
+        if main_run_id
+        else _latest_persistent_run_root("main_runs")
+    )
+    evaluation_root = _new_analysis_root(run_root, analysis_run_id=evaluation_run_id or None)
+    output_path = evaluation_root / "main_feature_scoreboard.json"
+    status_path = evaluation_root / "status.json"
+    capture_dir = run_root / spec.output.captures_dir
+    configure_logging(log_path=evaluation_root / "evaluation_run.log", level="INFO")
+    state: dict[str, object] = {
+        "evaluation_run_id": evaluation_root.name,
+        "main_run_id": run_root.name,
+        "stage": "setup",
+        "capture_dir": str(capture_dir),
+        "output_path": str(output_path),
+        "status_path": str(status_path),
+        "started_at": _iso_now(),
+    }
+
+    def progress_update(update: dict[str, object]) -> None:
+        state.update(update)
+        _write_json_atomic(status_path, dict(state, updated_at=_iso_now(), resource_snapshot=_resource_snapshot(run_root)))
+
+    LOGGER.info(
+        "evaluation_run_setup spec=%s run_root=%s capture_dir=%s output_path=%s status_path=%s",
+        spec_path.name,
+        run_root,
+        capture_dir,
+        output_path,
+        status_path,
+    )
+    start = time.perf_counter()
+    try:
+        try:
+            with _resource_heartbeat("evaluation_run", run_root=run_root), _status_heartbeat(
+                status_path, state, run_root=run_root
+            ):
+                results = evaluate_main_feature_scoreboard(
+                    capture_dir=capture_dir,
+                    repo_name=spec.evaluation.nanobeir_repo,
+                    task_names=list(spec.evaluation.dataset_names),
+                    quantization_spec=spec.quantization,
+                    dense_layers=list(spec.collection.main_dense_layers),
+                    router_layers=list(spec.collection.main_router_layers),
+                    value_layers=list(spec.collection.main_value_layers),
+                    top_k=spec.evaluation.top_k,
+                    progress_callback=progress_update,
+                )
+                save_json(output_path, results)
+        except BaseException as exc:
+            state.update(
+                {
+                    "stage": "failed",
+                    "finished_at": _iso_now(),
+                    "error": repr(exc),
+                }
+            )
+            _write_json_atomic(status_path, dict(state, updated_at=_iso_now(), resource_snapshot=_resource_snapshot(run_root)))
+            raise
+        state.update(
+            {
+                "stage": "completed",
+                "finished_at": _iso_now(),
+                "output_bytes": output_path.stat().st_size if output_path.exists() else 0,
+                "num_tasks": len(results.get("tasks", {})),
+            }
+        )
+        _write_json_atomic(status_path, dict(state, updated_at=_iso_now(), resource_snapshot=_resource_snapshot(run_root)))
+        return {
+            "seconds": round(time.perf_counter() - start, 3),
+            "run_root": str(run_root),
+            "evaluation_root": str(evaluation_root),
+            "capture_dir": str(capture_dir),
+            "output_path": str(output_path),
+            "status_path": str(status_path),
+            "num_tasks": len(results.get("tasks", {})),
+            "output_bytes": output_path.stat().st_size if output_path.exists() else 0,
+        }
+    finally:
+        _best_effort_runtime_cleanup("evaluation_run")
 
 
 @contextmanager

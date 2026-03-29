@@ -10,6 +10,7 @@ include = [
   "./kv_prepend_experiment/**/*",
   "./default_experiment.json",
   "./spec_calibration_hf_3tasks.json",
+  "./spec_main_hf_teacher_forcing_l40s_3tasks.json",
 ]
 exclude = [
   "./legacy/**/*",
@@ -36,3 +37,4 @@ scaling_metric = "concurrency_utilization"
 [cerebrium.dependencies.pip]
 numpy = "latest"
 torch = "latest"
+datasets = "latest"

@@ -84,6 +84,12 @@ _METRIC_PREFIXES = (
     "bias_flip_count",
 )
 
+_FEATURE_METRICS: dict[str, tuple[str, ...]] = {
+    "router_entropy": ("entropy",),
+    "value_vectors": ("rank", "token_norm"),
+    "final_hidden_state": ("rank", "token_norm"),
+}
+
 
 def _analysis_rank_feature_width() -> int:
     configured = int(os.environ.get("KV_PREPEND_ANALYSIS_RANK_FEATURE_WIDTH", "32") or "32")
@@ -127,13 +133,14 @@ def _analysis_worker_initializer(blas_threads: int) -> None:
 
 def _empty_summary() -> dict[str, Any]:
     return {
-        "analysis_version": 2,
+        "analysis_version": 3,
         "analysis_mode": "batch_native_streaming",
         "rank_method": "subsampled_effective_rank",
         "rank_feature_width": _analysis_rank_feature_width(),
         "pairwise_cosine_enabled": _analysis_compute_pairwise_cosine(),
         "num_bundles": 0,
         "layers": {},
+        "feature_stats": {},
     }
 
 
@@ -190,6 +197,15 @@ def _finalize_summary(summary: dict[str, Any]) -> dict[str, Any]:
             count = int(layer_stats.get(f"{prefix}_count", 0))
             total = float(layer_stats.get(f"{prefix}_sum", 0.0))
             layer_stats[f"{prefix}_mean"] = (total / count) if count else 0.0
+    feature_stats = summary.get("feature_stats", {})
+    for feature_name, scopes in feature_stats.items():
+        metrics = _FEATURE_METRICS.get(feature_name, ())
+        for scoped_entries in scopes.values():
+            for stats in scoped_entries.values():
+                for metric in metrics:
+                    count = int(stats.get(f"{metric}_count", 0))
+                    total = float(stats.get(f"{metric}_sum", 0.0))
+                    stats[f"{metric}_mean"] = (total / count) if count else 0.0
     return summary
 
 
@@ -206,7 +222,41 @@ def _merge_summary_partials(partials: list[dict[str, Any]]) -> dict[str, Any]:
                 merged_layer[f"{prefix}_count"] = int(merged_layer.get(f"{prefix}_count", 0)) + int(
                     layer_stats.get(f"{prefix}_count", 0)
                 )
+        for feature_name, scopes in partial.get("feature_stats", {}).items():
+            merged_feature = merged["feature_stats"].setdefault(feature_name, {})
+            metrics = _FEATURE_METRICS.get(feature_name, ())
+            for scope_name, entries in scopes.items():
+                merged_scope = merged_feature.setdefault(scope_name, {})
+                for entry_key, stats in entries.items():
+                    merged_stats = merged_scope.setdefault(entry_key, _empty_feature_metric_bucket(metrics))
+                    for metric in metrics:
+                        merged_stats[f"{metric}_sum"] = float(merged_stats.get(f"{metric}_sum", 0.0)) + float(
+                            stats.get(f"{metric}_sum", 0.0)
+                        )
+                        merged_stats[f"{metric}_count"] = int(merged_stats.get(f"{metric}_count", 0)) + int(
+                            stats.get(f"{metric}_count", 0)
+                        )
     return _finalize_summary(merged)
+
+
+def _empty_feature_metric_bucket(metric_names: tuple[str, ...]) -> dict[str, float | int]:
+    stats: dict[str, float | int] = {}
+    for metric in metric_names:
+        stats[f"{metric}_sum"] = 0.0
+        stats[f"{metric}_count"] = 0
+    return stats
+
+
+def _ensure_feature_metric_bucket(
+    summary: dict[str, Any], feature_name: str, scope_name: str, entry_key: str, metric_names: tuple[str, ...]
+) -> dict[str, float | int]:
+    feature_stats = summary["feature_stats"].setdefault(feature_name, {})
+    scoped_entries = feature_stats.setdefault(scope_name, {})
+    bucket = scoped_entries.get(entry_key)
+    if bucket is None:
+        bucket = _empty_feature_metric_bucket(metric_names)
+        scoped_entries[entry_key] = bucket
+    return bucket
 
 
 def _torch_load_payload(path: Path):
@@ -357,6 +407,106 @@ def _summarize_schema3_payload(payload: dict[str, Any]) -> dict[str, Any]:
                         continue
                     _accumulate_metric_values(layer_stats, "bias_sensitivity", bias_meta.get("sensitivity", []))
                     _accumulate_metric_values(layer_stats, "bias_flip_count", bias_meta.get("flip_count", []))
+
+        for pass_name, main_condition in (
+            ("pass1", CaptureCondition.CAUSAL.value),
+            ("pass2", CaptureCondition.PROPAGATED.value),
+        ):
+            pass_payload = pass_map.get(pass_name)
+            if not isinstance(pass_payload, dict):
+                continue
+            shared_tensors = pass_payload.get("shared_tensors", {})
+            final_hidden = shared_tensors.get("final_hidden_state")
+            if final_hidden is not None:
+                seq_len = int(final_hidden.shape[1]) if final_hidden.ndim >= 2 else 0
+                if seq_len > 0:
+                    mask = mask_cache.get(seq_len)
+                    if mask is None:
+                        mask = _content_mask_batch(examples, seq_len)
+                        mask_cache[seq_len] = mask
+                    bucket = _ensure_feature_metric_bucket(
+                        summary,
+                        "final_hidden_state",
+                        pass_name,
+                        "shared",
+                        _FEATURE_METRICS["final_hidden_state"],
+                    )
+                    final_hidden_tokens = final_hidden[:, :seq_len].to(dtype=torch.float32)
+                    valid_rows = mask.any(dim=1)
+                    for row_idx in torch.nonzero(valid_rows, as_tuple=False).flatten().tolist():
+                        row_tokens = final_hidden_tokens[row_idx, :seq_len][mask[row_idx]]
+                        if row_tokens.numel() == 0:
+                            continue
+                        _accumulate_metric_values(bucket, "rank", [_effective_rank_tensor(row_tokens)])
+                        _accumulate_metric_values(
+                            bucket,
+                            "token_norm",
+                            torch.linalg.vector_norm(row_tokens, dim=1),
+                        )
+
+            main_by_layer = _capture_dicts_by_layer(pass_payload, main_condition)
+            for layer_idx, capture in main_by_layer.items():
+                v_raw = capture.get("v_raw")
+                if v_raw is not None:
+                    seq_len = int(v_raw.shape[2]) if v_raw.ndim >= 3 else 0
+                    if seq_len > 0:
+                        mask = mask_cache.get(seq_len)
+                        if mask is None:
+                            mask = _content_mask_batch(examples, seq_len)
+                            mask_cache[seq_len] = mask
+                        bucket = _ensure_feature_metric_bucket(
+                            summary,
+                            "value_vectors",
+                            pass_name,
+                            str(layer_idx),
+                            _FEATURE_METRICS["value_vectors"],
+                        )
+                        value_tokens = v_raw[:, :, :seq_len].to(dtype=torch.float32)
+                        valid_rows = mask.any(dim=1)
+                        for row_idx in torch.nonzero(valid_rows, as_tuple=False).flatten().tolist():
+                            row_tokens = (
+                                value_tokens[row_idx].transpose(1, 0).reshape(seq_len, -1)[mask[row_idx]]
+                            )
+                            if row_tokens.numel() == 0:
+                                continue
+                            _accumulate_metric_values(bucket, "rank", [_effective_rank_tensor(row_tokens)])
+                            _accumulate_metric_values(
+                                bucket,
+                                "token_norm",
+                                torch.linalg.vector_norm(row_tokens, dim=1),
+                            )
+
+            for condition, captures in pass_payload.get("captures_by_condition", {}).items():
+                for capture in captures:
+                    if not isinstance(capture, dict):
+                        continue
+                    layer_idx = int(capture.get("layer_idx", -1))
+                    logits = capture.get("router_logits_pre_softmax")
+                    if logits is None or layer_idx < 0:
+                        continue
+                    seq_len = int(logits.shape[1]) if logits.ndim >= 2 else 0
+                    if seq_len <= 0:
+                        continue
+                    mask = mask_cache.get(seq_len)
+                    if mask is None:
+                        mask = _content_mask_batch(examples, seq_len)
+                        mask_cache[seq_len] = mask
+                    if not bool(mask.any()):
+                        continue
+                    bucket = _ensure_feature_metric_bucket(
+                        summary,
+                        "router_entropy",
+                        f"{pass_name}__{condition}",
+                        str(layer_idx),
+                        _FEATURE_METRICS["router_entropy"],
+                    )
+                    logits = logits[:, :seq_len].to(dtype=torch.float32)
+                    logits = logits - logits.amax(dim=-1, keepdim=True)
+                    probs = torch.softmax(logits, dim=-1)
+                    entropy = -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1)
+                    token_counts = mask.sum(dim=1)
+                    row_entropy = (entropy * mask).sum(dim=1) / token_counts.clamp_min(1)
+                    _accumulate_metric_values(bucket, "entropy", row_entropy[token_counts > 0])
     return summary
 
 

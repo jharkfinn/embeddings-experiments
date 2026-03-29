@@ -27,7 +27,15 @@ def trinarize_array(
         else:
             threshold = np.quantile(abs_x, threshold_percentile / 100.0, axis=axis, keepdims=True)
     else:
-        threshold = thresholds
+        threshold = np.asarray(thresholds, dtype=np.float32)
+    if x.ndim == 1 and not np.isscalar(threshold):
+        threshold = np.asarray(threshold, dtype=np.float32)
+        if threshold.size == 1:
+            threshold = float(threshold.reshape(-1)[0])
+        elif threshold.size == x.size:
+            threshold = threshold.reshape(x.shape)
+        else:
+            threshold = np.squeeze(threshold)
     result = np.zeros_like(x, dtype=np.int8)
     result[x > threshold] = 1
     if not positive_only:

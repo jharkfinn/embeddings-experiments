@@ -305,6 +305,7 @@ def build_batched_capture_payload(
             {
                 "text_id": example.text_id,
                 "kind": example.kind,
+                **({"dataset_name": example.dataset_name} if example.dataset_name else {}),
                 "content_token_mask": list(example.content_token_mask or []),
                 "metadata": metadata,
                 **({"prompt": example.prompt} if include_prompt_text else {}),

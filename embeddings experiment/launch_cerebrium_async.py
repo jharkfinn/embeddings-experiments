@@ -183,7 +183,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "function",
-        choices=["collect_smoke", "calibration_run", "main_run", "analyze_latest_calibration", "cleanup_idle"],
+        choices=[
+            "collect_smoke",
+            "calibration_run",
+            "main_run",
+            "analyze_latest_calibration",
+            "analyze_latest_main",
+            "evaluate_latest_main",
+            "cleanup_idle",
+        ],
     )
     parser.add_argument("--region", default=None)
     parser.add_argument("--storage-app", default=DEFAULT_STORAGE_APP)
@@ -191,7 +199,9 @@ def main() -> int:
     parser.add_argument("--cpu-app", default=DEFAULT_CPU_APP)
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--calibration-run-id", default=None)
+    parser.add_argument("--main-run-id", default=None)
     parser.add_argument("--analysis-run-id", default=None)
+    parser.add_argument("--evaluation-run-id", default=None)
     parser.add_argument("--workers", type=int, default=10)
     parser.add_argument("--skip-deploy", action="store_true")
     parser.add_argument("--detach", action="store_true")
@@ -246,7 +256,7 @@ def main() -> int:
             "log_remote_path": f"{args.storage_app}/main_runs/{function_payload['main_run_id']}/artifacts/logs/main_run.log",
             "run_root_remote_path": f"{args.storage_app}/main_runs/{function_payload['main_run_id']}/",
         }
-    else:
+    elif args.function == "analyze_latest_calibration":
         app_name = args.cpu_app
         config_path = CPU_CONFIG
         calibration_run_id = args.calibration_run_id or _latest_remote_dir(f"{args.storage_app}/calibration_runs/")
@@ -265,6 +275,47 @@ def main() -> int:
             ),
             "output_remote_path": (
                 f"{args.storage_app}/calibration_runs/{calibration_run_id}/analysis_runs/{analysis_run_id}/capture_analysis.json"
+            ),
+        }
+    elif args.function == "analyze_latest_main":
+        app_name = args.cpu_app
+        config_path = CPU_CONFIG
+        main_run_id = args.main_run_id or _latest_remote_dir(f"{args.storage_app}/main_runs/")
+        analysis_run_id = args.analysis_run_id or _new_run_id()
+        function_payload = {
+            "main_run_id": main_run_id,
+            "analysis_run_id": analysis_run_id,
+            "workers": args.workers,
+        }
+        remote_paths = {
+            "status_remote_path": (
+                f"{args.storage_app}/main_runs/{main_run_id}/analysis_runs/{analysis_run_id}/status.json"
+            ),
+            "log_remote_path": (
+                f"{args.storage_app}/main_runs/{main_run_id}/analysis_runs/{analysis_run_id}/analysis_run.log"
+            ),
+            "output_remote_path": (
+                f"{args.storage_app}/main_runs/{main_run_id}/analysis_runs/{analysis_run_id}/capture_analysis.json"
+            ),
+        }
+    else:
+        app_name = args.cpu_app
+        config_path = CPU_CONFIG
+        main_run_id = args.main_run_id or _latest_remote_dir(f"{args.storage_app}/main_runs/")
+        evaluation_run_id = args.evaluation_run_id or _new_run_id()
+        function_payload = {
+            "main_run_id": main_run_id,
+            "evaluation_run_id": evaluation_run_id,
+        }
+        remote_paths = {
+            "status_remote_path": (
+                f"{args.storage_app}/main_runs/{main_run_id}/analysis_runs/{evaluation_run_id}/status.json"
+            ),
+            "log_remote_path": (
+                f"{args.storage_app}/main_runs/{main_run_id}/analysis_runs/{evaluation_run_id}/evaluation_run.log"
+            ),
+            "output_remote_path": (
+                f"{args.storage_app}/main_runs/{main_run_id}/analysis_runs/{evaluation_run_id}/main_feature_scoreboard.json"
             ),
         }
 

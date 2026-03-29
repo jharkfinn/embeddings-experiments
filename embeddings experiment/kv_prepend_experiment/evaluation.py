@@ -25,7 +25,10 @@ def load_capture_payloads(capture_dir: str | Path):
 
     capture_dir = Path(capture_dir)
     for path in sorted(capture_dir.glob("*.pt")):
-        payload = torch.load(path, map_location="cpu", weights_only=False)
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+        except TypeError:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
         yield path, payload
 
 
@@ -129,6 +132,15 @@ def _raw_signal_tokens(
     signal_name: str,
     layer_indices: list[int],
 ):
+    if signal_name == "final_hidden_state":
+        pass_capture = _get_pass(bundle, pass_name)
+        final_hidden = pass_capture.shared_tensors.get("final_hidden_state")
+        tensor = _tensor_to_numpy(final_hidden, dtype=np.float32)
+        if tensor is None:
+            raise KeyError(f"Missing {pass_name}/shared/final_hidden_state for {bundle.text_id}")
+        tensor = tensor[0]
+        mask = _content_row_mask(bundle, tensor.shape[0])
+        return tensor[mask]
     tokens = []
     summary_signal_names = {"summary_value", "summary_key_rot", "summary_key_raw", "summary_memory"}
     for layer_idx in layer_indices:
@@ -635,3 +647,255 @@ def save_json(path: str | Path, payload: dict[str, Any]):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _resolve_bundle_task_names(bundle: ExampleCaptureBundle, tasks: dict[str, RetrievalTask]) -> list[str]:
+    dataset_name = (bundle.dataset_name or "").lower()
+    if dataset_name in tasks:
+        return [dataset_name]
+    matches = []
+    for task_name, task in tasks.items():
+        if bundle.kind == "doc" and bundle.text_id in task.corpus:
+            matches.append(task_name)
+        elif bundle.kind == "query" and bundle.text_id in task.queries:
+            matches.append(task_name)
+    if len(matches) == 1:
+        return matches
+    return []
+
+
+def evaluate_main_feature_scoreboard(
+    *,
+    capture_dir: str | Path,
+    repo_name: str,
+    task_names: list[str],
+    quantization_spec,
+    dense_layers: list[int],
+    router_layers: list[int],
+    value_layers: list[int],
+    top_k: int = 10,
+    progress_callback: callable | None = None,
+):
+    feature_specs = [
+        {
+            "signal_name": "attention_output",
+            "pass_name": "pass1",
+            "condition": CaptureCondition.CAUSAL.value,
+            "layer_indices": list(dense_layers),
+        },
+        {
+            "signal_name": "attention_output",
+            "pass_name": "pass2",
+            "condition": CaptureCondition.PROPAGATED.value,
+            "layer_indices": list(dense_layers),
+        },
+        {
+            "signal_name": "value_vectors",
+            "pass_name": "pass1",
+            "condition": CaptureCondition.CAUSAL.value,
+            "layer_indices": list(value_layers),
+        },
+        {
+            "signal_name": "value_vectors",
+            "pass_name": "pass2",
+            "condition": CaptureCondition.PROPAGATED.value,
+            "layer_indices": list(value_layers),
+        },
+        {
+            "signal_name": "router_logits",
+            "pass_name": "pass1",
+            "condition": CaptureCondition.CAUSAL.value,
+            "layer_indices": list(router_layers),
+        },
+        {
+            "signal_name": "router_logits",
+            "pass_name": "pass2",
+            "condition": CaptureCondition.PROPAGATED.value,
+            "layer_indices": list(router_layers),
+        },
+        {
+            "signal_name": "router_logits_positive",
+            "pass_name": "pass1",
+            "condition": CaptureCondition.CAUSAL.value,
+            "layer_indices": list(router_layers),
+        },
+        {
+            "signal_name": "router_logits_positive",
+            "pass_name": "pass2",
+            "condition": CaptureCondition.PROPAGATED.value,
+            "layer_indices": list(router_layers),
+        },
+        {
+            "signal_name": "top_k_binary",
+            "pass_name": "pass1",
+            "condition": CaptureCondition.CAUSAL.value,
+            "layer_indices": list(router_layers),
+        },
+        {
+            "signal_name": "top_k_binary",
+            "pass_name": "pass2",
+            "condition": CaptureCondition.PROPAGATED.value,
+            "layer_indices": list(router_layers),
+        },
+        {
+            "signal_name": "final_hidden_state",
+            "pass_name": "pass1",
+            "condition": CaptureCondition.CAUSAL.value,
+            "layer_indices": [],
+        },
+        {
+            "signal_name": "final_hidden_state",
+            "pass_name": "pass2",
+            "condition": CaptureCondition.PROPAGATED.value,
+            "layer_indices": [],
+        },
+    ]
+    feature_keys = [
+        f"{spec['signal_name']}__{spec['pass_name']}__{spec['condition']}" for spec in feature_specs
+    ]
+    tasks = {name: load_nanobeir_task(repo_name, name) for name in task_names}
+    state: dict[str, Any] = {}
+    for task_name, task in tasks.items():
+        state[task_name] = {
+            "task": task,
+            "routed_bundles": 0,
+            "features": {
+                feature_key: {
+                    "doc_vectors": {},
+                    "query_vectors": {},
+                }
+                for feature_key in feature_keys
+            },
+        }
+
+    processed_bundles = 0
+    unmatched_bundles = 0
+    for bundle in iter_bundles(capture_dir):
+        task_names_for_bundle = _resolve_bundle_task_names(bundle, tasks)
+        if not task_names_for_bundle:
+            unmatched_bundles += 1
+            continue
+        processed_bundles += 1
+        if progress_callback is not None and processed_bundles % 100 == 0:
+            progress_callback(
+                {
+                    "stage": "evaluation_extract",
+                    "processed_bundles": processed_bundles,
+                    "unmatched_bundles": unmatched_bundles,
+                }
+            )
+        for task_name in task_names_for_bundle:
+            task_state = state[task_name]
+            task = task_state["task"]
+            if bundle.kind == "doc":
+                if bundle.text_id not in task.corpus:
+                    continue
+                target_name = "doc_vectors"
+            elif bundle.kind == "query":
+                if bundle.text_id not in task.queries:
+                    continue
+                target_name = "query_vectors"
+            else:
+                continue
+            task_state["routed_bundles"] += 1
+            for spec in feature_specs:
+                feature_key = f"{spec['signal_name']}__{spec['pass_name']}__{spec['condition']}"
+                try:
+                    raw_tokens = _raw_signal_tokens(
+                        bundle,
+                        pass_name=spec["pass_name"],
+                        condition=spec["condition"],
+                        signal_name=spec["signal_name"],
+                        layer_indices=spec["layer_indices"],
+                    )
+                except KeyError:
+                    continue
+                if raw_tokens.size == 0:
+                    continue
+                pooled = mean_pool_float(raw_tokens).astype(np.float32, copy=False)
+                task_state["features"][feature_key][target_name][bundle.text_id] = pooled
+
+    results: dict[str, Any] = {
+        "evaluation_mode": "main_feature_scoreboard_v1",
+        "top_k": int(top_k),
+        "processed_bundles": processed_bundles,
+        "unmatched_bundles": unmatched_bundles,
+        "tasks": {},
+    }
+    for task_index, task_name in enumerate(task_names, start=1):
+        task = tasks[task_name]
+        task_state = state[task_name]
+        task_results: dict[str, Any] = {
+            "num_docs": len(task.corpus),
+            "num_queries": len(task.queries),
+            "routed_bundles": int(task_state["routed_bundles"]),
+            "features": {},
+        }
+        for spec in feature_specs:
+            feature_key = f"{spec['signal_name']}__{spec['pass_name']}__{spec['condition']}"
+            doc_vectors = task_state["features"][feature_key]["doc_vectors"]
+            query_vectors = task_state["features"][feature_key]["query_vectors"]
+            result_row: dict[str, Any] = {
+                "signal_name": spec["signal_name"],
+                "pass_name": spec["pass_name"],
+                "condition": spec["condition"],
+                "layer_indices": list(spec["layer_indices"]),
+                "doc_count": len(doc_vectors),
+                "query_count": len(query_vectors),
+            }
+            if not doc_vectors or not query_vectors:
+                result_row.update({"skipped": True, "reason": "missing doc/query vectors"})
+                task_results["features"][feature_key] = result_row
+                continue
+            pooled_source = list(doc_vectors.values()) + list(query_vectors.values())
+            thresholds = None
+            if spec["signal_name"] != "top_k_binary" and pooled_source:
+                concat = np.stack(pooled_source, axis=0)
+                nonzero_fraction = 1.0 - (_signal_percentile(spec["signal_name"], quantization_spec) / 100.0)
+                thresholds = fit_trinary_thresholds(concat, nonzero_fraction=nonzero_fraction, axis=0)
+            doc_trinary = {
+                doc_id: (
+                    vector.astype(np.float32, copy=False)
+                    if spec["signal_name"] == "top_k_binary"
+                    else trinarize_array(
+                        vector,
+                        threshold_percentile=_signal_percentile(spec["signal_name"], quantization_spec),
+                        thresholds=thresholds,
+                        positive_only=spec["signal_name"] == "router_logits_positive",
+                    ).astype(np.float32, copy=False)
+                )
+                for doc_id, vector in doc_vectors.items()
+            }
+            query_trinary = {
+                query_id: (
+                    vector.astype(np.float32, copy=False)
+                    if spec["signal_name"] == "top_k_binary"
+                    else trinarize_array(
+                        vector,
+                        threshold_percentile=_signal_percentile(spec["signal_name"], quantization_spec),
+                        thresholds=thresholds,
+                        positive_only=spec["signal_name"] == "router_logits_positive",
+                    ).astype(np.float32, copy=False)
+                )
+                for query_id, vector in query_vectors.items()
+            }
+            float_scores = score_single_vector(query_vectors, doc_vectors)
+            trinary_scores = score_single_vector(query_trinary, doc_trinary)
+            result_row.update(
+                {
+                    "float_single_vector_ndcg_at_10": ndcg_at_k(float_scores, task.qrels, k=top_k),
+                    "trinary_single_vector_ndcg_at_10": ndcg_at_k(trinary_scores, task.qrels, k=top_k),
+                }
+            )
+            task_results["features"][feature_key] = result_row
+        results["tasks"][task_name] = task_results
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "stage": "evaluation_task_done",
+                    "completed_tasks": task_index,
+                    "total_tasks": len(task_names),
+                    "last_task": task_name,
+                }
+            )
+    return results
