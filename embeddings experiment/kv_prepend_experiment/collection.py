@@ -85,6 +85,16 @@ def _gather_last_kv(seq_tensor, last_positions):
     return seq_tensor.gather(2, index).squeeze(2)
 
 
+def _safe_median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[midpoint]
+    return 0.5 * (ordered[midpoint - 1] + ordered[midpoint])
+
+
 class AsyncTransferSession:
     def __init__(self):
         self._copy_stream = None
@@ -618,6 +628,216 @@ class InstrumentedQwen3MoeExperiment:
         path = artifacts_dir / f"{dataset_name}.json"
         path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
         return path
+
+    def _propagated_integrity_mode(self) -> str:
+        return str(os.environ.get("KV_PREPEND_PROPAGATED_INTEGRITY", "")).strip().lower()
+
+    def _propagated_integrity_enabled(self) -> bool:
+        return self._propagated_integrity_mode() in {"warn", "strict"}
+
+    def _propagated_integrity_is_strict(self) -> bool:
+        return self._propagated_integrity_mode() == "strict"
+
+    def _propagated_integrity_min_relative_mean_abs(self) -> float:
+        return float(os.environ.get("KV_PREPEND_PROPAGATED_MIN_RELATIVE_MEAN_ABS", "0.02"))
+
+    def _propagated_integrity_min_absolute_mean_abs(self) -> float:
+        return float(os.environ.get("KV_PREPEND_PROPAGATED_MIN_ABSOLUTE_MEAN_ABS", "1e-4"))
+
+    def _example_content_mask(self, example: PromptExample, expected_len: int):
+        torch = import_torch()
+        mask_list = list(example.content_token_mask or [])
+        if len(mask_list) < expected_len:
+            mask_list.extend([0] * (expected_len - len(mask_list)))
+        elif len(mask_list) > expected_len:
+            mask_list = mask_list[:expected_len]
+        mask = torch.tensor(mask_list, dtype=torch.bool)
+        if mask.any():
+            return mask
+        token_count = max(0, min(int(example.token_count or 0), expected_len))
+        mask = torch.zeros(expected_len, dtype=torch.bool)
+        if token_count > 0:
+            mask[:token_count] = True
+        return mask
+
+    def _row_content_mean_abs(self, row_tensor, example: PromptExample, *, seq_dim: int = 0) -> float:
+        torch = import_torch()
+        if row_tensor is None or not isinstance(row_tensor, torch.Tensor):
+            return 0.0
+        data = row_tensor.detach()
+        if seq_dim != 0:
+            data = data.movedim(seq_dim, 0)
+        seq_len = int(data.shape[0]) if data.ndim > 0 else 0
+        if seq_len <= 0:
+            return 0.0
+        mask = self._example_content_mask(example, seq_len).to(device=data.device)
+        if not mask.any():
+            return 0.0
+        selected = data[mask]
+        if selected.numel() == 0:
+            return 0.0
+        return float(selected.float().abs().mean().item())
+
+    def _find_pass_capture(self, pass_capture: PassCapture, condition: str, layer_idx: int) -> LayerCapture | None:
+        for capture in pass_capture.captures_by_condition.get(condition, []):
+            if int(capture.layer_idx) == int(layer_idx):
+                return capture
+        return None
+
+    def _verify_propagated_signal_pair(
+        self,
+        *,
+        signal_name: str,
+        batch_examples: list[PromptExample],
+        reference_tensor,
+        propagated_tensor,
+        seq_dim: int,
+        expected_seq_len: int,
+        issues: list[dict[str, Any]],
+        metrics: dict[str, Any],
+    ) -> None:
+        torch = import_torch()
+        if reference_tensor is None or propagated_tensor is None:
+            return
+        if not isinstance(reference_tensor, torch.Tensor) or not isinstance(propagated_tensor, torch.Tensor):
+            issues.append({"signal": signal_name, "error": "non_tensor_signal"})
+            return
+        ref_seq_len = int(reference_tensor.shape[seq_dim]) if reference_tensor.ndim > seq_dim else -1
+        prop_seq_len = int(propagated_tensor.shape[seq_dim]) if propagated_tensor.ndim > seq_dim else -1
+        if ref_seq_len != expected_seq_len or prop_seq_len != expected_seq_len:
+            issues.append(
+                {
+                    "signal": signal_name,
+                    "error": "sequence_length_mismatch",
+                    "reference_shape": list(reference_tensor.shape),
+                    "propagated_shape": list(propagated_tensor.shape),
+                    "expected_seq_len": expected_seq_len,
+                }
+            )
+            return
+
+        abs_floor = self._propagated_integrity_min_absolute_mean_abs()
+        rel_floor = self._propagated_integrity_min_relative_mean_abs()
+        row_ratios: list[float] = []
+        bad_rows: list[dict[str, Any]] = []
+        for row_idx, example in enumerate(batch_examples):
+            ref_value = self._row_content_mean_abs(reference_tensor[row_idx], example, seq_dim=max(0, seq_dim - 1))
+            prop_value = self._row_content_mean_abs(propagated_tensor[row_idx], example, seq_dim=max(0, seq_dim - 1))
+            ratio = prop_value / max(ref_value, 1e-12)
+            row_ratios.append(ratio)
+            if ref_value > abs_floor and (prop_value <= abs_floor or ratio < rel_floor):
+                bad_rows.append(
+                    {
+                        "row_idx": row_idx,
+                        "text_id": example.text_id,
+                        "kind": example.kind,
+                        "dataset_name": example.dataset_name,
+                        "reference_mean_abs": round(ref_value, 8),
+                        "propagated_mean_abs": round(prop_value, 8),
+                        "ratio": round(ratio, 8),
+                    }
+                )
+        metrics[signal_name] = {
+            "checked_rows": len(batch_examples),
+            "bad_rows": len(bad_rows),
+            "min_ratio": round(min(row_ratios), 8) if row_ratios else 0.0,
+            "median_ratio": round(_safe_median(row_ratios), 8) if row_ratios else 0.0,
+        }
+        if bad_rows and len(bad_rows) >= max(1, math.ceil(len(batch_examples) * 0.5)):
+            issues.append(
+                {
+                    "signal": signal_name,
+                    "error": "propagated_magnitude_collapse",
+                    "threshold_ratio": rel_floor,
+                    "threshold_mean_abs": abs_floor,
+                    "bad_rows": bad_rows[:8],
+                }
+            )
+
+    def _verify_propagated_batch_integrity(
+        self,
+        *,
+        dataset_name: str,
+        batch_index: int,
+        batch_examples: list[PromptExample],
+        expected_seq_len: int,
+        pass1_batched: PassCapture,
+        pass2_batched: PassCapture,
+    ) -> None:
+        if not self._propagated_integrity_enabled():
+            return
+        issues: list[dict[str, Any]] = []
+        metrics: dict[str, Any] = {
+            "dataset": dataset_name,
+            "batch_index": int(batch_index),
+            "examples": len(batch_examples),
+            "expected_seq_len": int(expected_seq_len),
+        }
+
+        pass1_final = pass1_batched.shared_tensors.get("final_hidden_state")
+        pass2_final = pass2_batched.shared_tensors.get("final_hidden_state")
+        if pass1_final is None or pass2_final is None:
+            issues.append(
+                {
+                    "signal": "final_hidden_state",
+                    "error": "missing_shared_tensor",
+                    "has_pass1": pass1_final is not None,
+                    "has_pass2": pass2_final is not None,
+                }
+            )
+        else:
+            self._verify_propagated_signal_pair(
+                signal_name="final_hidden_state",
+                batch_examples=batch_examples,
+                reference_tensor=pass1_final,
+                propagated_tensor=pass2_final,
+                seq_dim=1,
+                expected_seq_len=expected_seq_len,
+                issues=issues,
+                metrics=metrics,
+            )
+
+        propagated_captures = {
+            int(capture.layer_idx): capture
+            for capture in pass2_batched.captures_by_condition.get(CaptureCondition.PROPAGATED.value, [])
+        }
+        causal_captures = {
+            int(capture.layer_idx): capture
+            for capture in pass1_batched.captures_by_condition.get(CaptureCondition.CAUSAL.value, [])
+        }
+        for layer_idx, propagated_capture in sorted(propagated_captures.items()):
+            reference_capture = causal_captures.get(layer_idx)
+            if reference_capture is None:
+                continue
+            self._verify_propagated_signal_pair(
+                signal_name=f"layer_{layer_idx}_v_raw",
+                batch_examples=batch_examples,
+                reference_tensor=reference_capture.v_raw,
+                propagated_tensor=propagated_capture.v_raw,
+                seq_dim=2,
+                expected_seq_len=expected_seq_len,
+                issues=issues,
+                metrics=metrics,
+            )
+            self._verify_propagated_signal_pair(
+                signal_name=f"layer_{layer_idx}_attention_output",
+                batch_examples=batch_examples,
+                reference_tensor=reference_capture.z_attn,
+                propagated_tensor=propagated_capture.z_attn,
+                seq_dim=1,
+                expected_seq_len=expected_seq_len,
+                issues=issues,
+                metrics=metrics,
+            )
+
+        logger.info("propagated_integrity_checked %s", json.dumps(metrics, sort_keys=True))
+        if not issues:
+            return
+        payload = {"dataset": dataset_name, "batch_index": batch_index, "issues": issues, "metrics": metrics}
+        message = f"propagated_integrity_failure {json.dumps(payload, sort_keys=True)}"
+        if self._propagated_integrity_is_strict():
+            raise RuntimeError(message)
+        logger.warning(message)
 
     def _project_qkv(self, attention_module, hidden_states, position_embeddings):
         torch = import_torch()
@@ -1729,6 +1949,14 @@ class InstrumentedQwen3MoeExperiment:
                         start_layer=propagate_from_layer,
                         initial_hidden_states=propagate_hidden_states,
                         initial_captures_by_condition=pass2_prefix_captures,
+                    )
+                    self._verify_propagated_batch_integrity(
+                        dataset_name=dataset_name,
+                        batch_index=batch_index,
+                        batch_examples=batch_examples,
+                        expected_seq_len=int(encoded["input_ids"].shape[1]),
+                        pass1_batched=pass1_batched,
+                        pass2_batched=pass2_batched,
                     )
                     logger.info(
                         "batch_pass_done dataset=%s batch_index=%s pass=pass2 seconds=%.3f",

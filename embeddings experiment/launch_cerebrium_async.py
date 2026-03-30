@@ -20,7 +20,7 @@ CPU_CONFIG = ROOT / "cerebrium_analysis.toml"
 DEFAULT_STORAGE_APP = "kv-prepend-l40s-smoke"
 DEFAULT_GPU_APP = "kv-prepend-l40s-smoke"
 DEFAULT_CPU_APP = "kv-prepend-analysis-cpu"
-GPU_FUNCTIONS = {"collect_smoke", "calibration_run", "main_run"}
+GPU_FUNCTIONS = {"collect_smoke", "calibration_run", "main_run", "main_subset_run"}
 LOCAL_GPU_LOCK = ROOT / ".cerebrium_gpu_run_lock.json"
 
 
@@ -187,6 +187,7 @@ def main() -> int:
             "collect_smoke",
             "calibration_run",
             "main_run",
+            "main_subset_run",
             "analyze_latest_calibration",
             "analyze_latest_main",
             "evaluate_latest_main",
@@ -202,6 +203,7 @@ def main() -> int:
     parser.add_argument("--main-run-id", default=None)
     parser.add_argument("--analysis-run-id", default=None)
     parser.add_argument("--evaluation-run-id", default=None)
+    parser.add_argument("--record-limit", type=int, default=128)
     parser.add_argument("--workers", type=int, default=10)
     parser.add_argument("--skip-deploy", action="store_true")
     parser.add_argument("--detach", action="store_true")
@@ -255,6 +257,18 @@ def main() -> int:
             "status_remote_path": f"{args.storage_app}/main_runs/{function_payload['main_run_id']}/status.json",
             "log_remote_path": f"{args.storage_app}/main_runs/{function_payload['main_run_id']}/artifacts/logs/main_run.log",
             "run_root_remote_path": f"{args.storage_app}/main_runs/{function_payload['main_run_id']}/",
+        }
+    elif args.function == "main_subset_run":
+        app_name = args.gpu_app
+        config_path = GPU_CONFIG
+        function_payload = {
+            "main_run_id": args.run_id or _new_run_id(),
+            "record_limit": args.record_limit,
+        }
+        remote_paths = {
+            "status_remote_path": f"{args.storage_app}/main_subset_runs/{function_payload['main_run_id']}/status.json",
+            "log_remote_path": f"{args.storage_app}/main_subset_runs/{function_payload['main_run_id']}/artifacts/logs/main_subset_run.log",
+            "run_root_remote_path": f"{args.storage_app}/main_subset_runs/{function_payload['main_run_id']}/",
         }
     elif args.function == "analyze_latest_calibration":
         app_name = args.cpu_app

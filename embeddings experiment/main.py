@@ -7,6 +7,7 @@ from cerebrium_main import (
     full_smoke,
     gpu_smoke,
     main_run,
+    main_subset_run,
     model_load_smoke,
     repo_smoke,
     stack_smoke,

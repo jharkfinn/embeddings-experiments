@@ -445,6 +445,50 @@ def _load_nanobeir_records(dataset_names: list[str]) -> list[dict[str, str]]:
     return records
 
 
+def _select_main_subset_records(records: list[dict[str, str]], limit: int) -> list[dict[str, str]]:
+    if limit <= 0 or limit >= len(records):
+        return list(records)
+    grouped: dict[tuple[str, str], list[dict[str, str]]] = {}
+    for record in records:
+        key = (str(record.get("dataset_name", "")), str(record.get("kind", "")))
+        grouped.setdefault(key, []).append(record)
+    for bucket in grouped.values():
+        bucket.sort(key=lambda row: len(str(row.get("text", ""))), reverse=True)
+    ordered_groups = [grouped[key] for key in sorted(grouped)]
+    selected: list[dict[str, str]] = []
+    while ordered_groups and len(selected) < limit:
+        next_groups: list[list[dict[str, str]]] = []
+        for group in ordered_groups:
+            if len(selected) >= limit:
+                break
+            if group:
+                selected.append(group.pop(0))
+            if group:
+                next_groups.append(group)
+        ordered_groups = next_groups
+    return selected
+
+
+@contextmanager
+def _temporary_environ(overrides: dict[str, str | None]):
+    sentinel = object()
+    previous: dict[str, object] = {}
+    for key, value in overrides.items():
+        previous[key] = os.environ.get(key, sentinel)
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = str(value)
+    try:
+        yield
+    finally:
+        for key, previous_value in previous.items():
+            if previous_value is sentinel:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(previous_value)
+
+
 def collect_smoke(smoke_run_id=""):
     from kv_prepend_experiment.collection import InstrumentedQwen3MoeExperiment
     from kv_prepend_experiment.config import load_experiment_spec
@@ -632,13 +676,9 @@ def main_run(main_run_id=""):
     configure_logging(log_path=run_root / "artifacts" / "logs" / "main_run.log", level="INFO")
     LOGGER.info("main_run_setup spec=%s", spec_path.name)
 
-    records = _load_nanobeir_records(["scifact", "fiqa2018", "quoraretrieval"])
-    start = time.perf_counter()
-    LOGGER.info("main_run_records_loaded records=%s", len(records))
     state: dict[str, object] = {
         "run_id": run_root.name,
-        "stage": "setup",
-        "records": len(records),
+        "stage": "load_records",
         "run_root": str(run_root),
         "status_path": str(status_path),
         "started_at": _iso_now(),
@@ -647,6 +687,12 @@ def main_run(main_run_id=""):
     def update_state(**kwargs: object) -> None:
         state.update(kwargs)
         _write_json_atomic(status_path, dict(state, updated_at=_iso_now(), resource_snapshot=_resource_snapshot(run_root)))
+
+    update_state()
+    records = _load_nanobeir_records(["scifact", "fiqa2018", "quoraretrieval"])
+    start = time.perf_counter()
+    LOGGER.info("main_run_records_loaded records=%s", len(records))
+    update_state(records=len(records))
 
     try:
         with _resource_heartbeat("main_run", run_root=run_root), _status_heartbeat(status_path, state, run_root=run_root):
@@ -691,6 +737,107 @@ def main_run(main_run_id=""):
         raise
     finally:
         _best_effort_runtime_cleanup("main_run")
+
+
+def main_subset_run(main_run_id="", record_limit=128):
+    from kv_prepend_experiment.collection import InstrumentedQwen3MoeExperiment
+    from kv_prepend_experiment.config import load_experiment_spec
+    from kv_prepend_experiment.logging_utils import configure_logging
+
+    spec_path = ROOT / "spec_main_hf_teacher_forcing_l40s_3tasks.json"
+    spec = load_experiment_spec(spec_path)
+    spec.model.preflight_max_used_memory_gib = None
+    spec.model.torch_dtype = "auto"
+
+    run_root = _new_persistent_run_root("main_subset_runs", main_run_id or None)
+    status_path = run_root / "status.json"
+    configure_logging(log_path=run_root / "artifacts" / "logs" / "main_subset_run.log", level="INFO")
+    LOGGER.info("main_subset_run_setup spec=%s record_limit=%s", spec_path.name, record_limit)
+    state: dict[str, object] = {
+        "run_id": run_root.name,
+        "stage": "load_records",
+        "record_limit": int(record_limit),
+        "run_root": str(run_root),
+        "status_path": str(status_path),
+        "started_at": _iso_now(),
+    }
+
+    def update_state(**kwargs: object) -> None:
+        state.update(kwargs)
+        _write_json_atomic(status_path, dict(state, updated_at=_iso_now(), resource_snapshot=_resource_snapshot(run_root)))
+
+    update_state()
+    all_records = _load_nanobeir_records(["scifact", "fiqa2018", "quoraretrieval"])
+    selected_records = _select_main_subset_records(all_records, int(record_limit))
+    start = time.perf_counter()
+    LOGGER.info(
+        "main_subset_run_records_loaded total_records=%s selected_records=%s",
+        len(all_records),
+        len(selected_records),
+    )
+    update_state(records=len(selected_records), source_records=len(all_records))
+
+    integrity_overrides = {
+        "KV_PREPEND_PROPAGATED_INTEGRITY": os.environ.get("KV_PREPEND_PROPAGATED_INTEGRITY", "strict"),
+        "KV_PREPEND_PROPAGATED_MIN_RELATIVE_MEAN_ABS": os.environ.get(
+            "KV_PREPEND_PROPAGATED_MIN_RELATIVE_MEAN_ABS",
+            "0.02",
+        ),
+        "KV_PREPEND_PROPAGATED_MIN_ABSOLUTE_MEAN_ABS": os.environ.get(
+            "KV_PREPEND_PROPAGATED_MIN_ABSOLUTE_MEAN_ABS",
+            "1e-4",
+        ),
+    }
+
+    try:
+        with _temporary_environ(integrity_overrides):
+            with _resource_heartbeat("main_subset_run", run_root=run_root), _status_heartbeat(
+                status_path,
+                state,
+                run_root=run_root,
+            ):
+                experiment = InstrumentedQwen3MoeExperiment(spec, run_root)
+                update_state(stage="experiment_load_start")
+                LOGGER.info("main_subset_run_experiment_load_start")
+                experiment.load()
+                update_state(stage="experiment_load_done")
+                LOGGER.info("main_subset_run_experiment_load_done")
+                spec_snapshot = experiment.save_spec_snapshot()
+                update_state(stage="collect_examples")
+                paths, _ = experiment.collect_examples(
+                    selected_records,
+                    dataset_name="nanobeir_3tasks_subset",
+                    retain_bundles=False,
+                )
+                LOGGER.info("main_subset_run_collect_done paths=%s", len(paths))
+                update_state(stage="flush_writes", capture_count=len(paths))
+                experiment.flush_writes()
+                LOGGER.info("main_subset_run_flush_done")
+        total_bytes = 0
+        for path in paths:
+            total_bytes += path.stat().st_size
+        update_state(
+            stage="completed",
+            finished_at=_iso_now(),
+            capture_count=len(paths),
+            output_bytes=total_bytes,
+        )
+        return {
+            "seconds": round(time.perf_counter() - start, 3),
+            "records": len(selected_records),
+            "source_records": len(all_records),
+            "capture_count": len(paths),
+            "capture_bytes": total_bytes,
+            "run_root": str(run_root),
+            "status_path": str(status_path),
+            "spec_snapshot": str(spec_snapshot.relative_to(run_root)),
+            "nvidia_smi_after_collect": _nvidia_smi(),
+        }
+    except BaseException as exc:
+        update_state(stage="failed", finished_at=_iso_now(), error=repr(exc))
+        raise
+    finally:
+        _best_effort_runtime_cleanup("main_subset_run")
 
 
 def analyze_latest_calibration(
